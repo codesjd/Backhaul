@@ -26,11 +26,18 @@ import (
 )
 
 // H2MuxTransport is the server side of the h2mux/h2smux transports: smux
-// multiplexing runs over a duplex HTTP/2 stream instead of a WebSocket
-// connection. Unlike WS, an HTTP/2 request can't be hijacked into a raw
-// net.Conn, so each accepted request's handler goroutine stays blocked for
-// the lifetime of the tunnel it represents instead of handing off a
-// detached connection.
+// multiplexing runs over a pair of HTTP/2 request/response exchanges
+// (a long-lived GET for server->client bytes, short bounded POSTs for
+// client->server bytes - see network.H2SplitConn) instead of a WebSocket
+// connection or a single duplex POST. CDNs/WAFs that buffer an entire
+// request body before forwarding it break a single unbounded duplex POST,
+// but generally pass bounded POSTs and streamed GET responses through
+// untouched, since those match ordinary upload/download traffic.
+//
+// Unlike WS, an HTTP/2 request can't be hijacked into a raw net.Conn, so
+// each GET request's handler goroutine stays blocked for the lifetime of
+// the tunnel it represents, draining queued outbound bytes into the
+// response, instead of handing off a detached connection.
 type H2MuxTransport struct {
 	config         *H2MuxConfig
 	smuxConfig     *smux.Config
@@ -41,7 +48,9 @@ type H2MuxTransport struct {
 	tunnelChannel  chan *smux.Session
 	localChannel   chan LocalTCPConn
 	reqNewConnChan chan struct{}
-	controlChannel *network.H2Conn
+	controlChannel *network.H2SplitConn
+	tunnelConns    map[string]*network.H2SplitConn
+	tunnelConnsMu  sync.Mutex
 	usageMonitor   *web.Usage
 	restartMutex   sync.Mutex
 	streamCounter  int32
@@ -93,6 +102,7 @@ func NewH2MuxServer(parentCtx context.Context, config *H2MuxConfig, logger *logr
 		tunnelChannel:  make(chan *smux.Session, config.ChannelSize),
 		localChannel:   make(chan LocalTCPConn, config.ChannelSize),
 		reqNewConnChan: make(chan struct{}, config.ChannelSize),
+		tunnelConns:    make(map[string]*network.H2SplitConn),
 		streamCounter:  0,
 		sessionCounter: 0,
 		controlChannel: nil, // will be set when a control connection is established
@@ -144,6 +154,9 @@ func (s *H2MuxTransport) Restart() {
 	s.tunnelChannel = make(chan *smux.Session, s.config.ChannelSize)
 	s.localChannel = make(chan LocalTCPConn, s.config.ChannelSize)
 	s.reqNewConnChan = make(chan struct{}, s.config.ChannelSize)
+	s.tunnelConnsMu.Lock()
+	s.tunnelConns = make(map[string]*network.H2SplitConn)
+	s.tunnelConnsMu.Unlock()
 	s.controlChannel = nil
 	s.usageMonitor = web.NewDataStore(fmt.Sprintf(":%v", s.config.WebPort), ctx, s.config.SnifferLog, s.config.Sniffer, &s.config.TunnelStatus, s.logger)
 	s.config.TunnelStatus = ""
@@ -248,14 +261,8 @@ func (s *H2MuxTransport) tunnelListener() {
 			return
 		}
 
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
-			return
-		}
-
 		switch {
-		case r.URL.Path == channelPath:
+		case r.URL.Path == channelPath && r.Method == http.MethodGet:
 			if s.controlChannel != nil {
 				s.logger.Warn("new control channel requested.")
 				s.controlChannel.Close()
@@ -263,10 +270,17 @@ func (s *H2MuxTransport) tunnelListener() {
 				return
 			}
 
+			flusher, ok := w.(http.Flusher)
+			if !ok {
+				http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+				return
+			}
+
+			conn := network.NewH2SplitConn()
+			s.controlChannel = conn
+
 			w.WriteHeader(http.StatusOK)
 			flusher.Flush()
-			conn := network.NewH2Conn(r.Body, w, flusher.Flush, r.Body.Close)
-			s.controlChannel = conn
 
 			s.logger.Info("control channel established successfully")
 
@@ -276,6 +290,7 @@ func (s *H2MuxTransport) tunnelListener() {
 			}
 
 			go s.parsePortMappings()
+			go s.channelHandler()
 
 			s.logger.Infof("starting %d handle loops on each CPU thread", numCPU)
 
@@ -285,19 +300,43 @@ func (s *H2MuxTransport) tunnelListener() {
 
 			s.config.TunnelStatus = fmt.Sprintf("Connected (%s)", s.config.Mode)
 
-			// Blocks for as long as the control channel is alive, which is
-			// what keeps this HTTP/2 stream open (no hijack is possible here).
-			s.channelHandler()
+			// Blocks draining outbound bytes into the GET response for as
+			// long as the control channel is alive, which is what keeps
+			// this HTTP/2 stream open (no hijack is possible here).
+			s.drainOutbound(conn, w, flusher, r)
 
-		case strings.HasPrefix(r.URL.Path, tunnelPathPrefix):
+		case r.URL.Path == channelPath && r.Method == http.MethodPost:
+			if s.controlChannel == nil {
+				http.Error(w, "no control channel", http.StatusGone)
+				return
+			}
+			body, err := io.ReadAll(io.LimitReader(r.Body, 4096)) // control signals are tiny
+			if err != nil {
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			s.controlChannel.PushInbound(body)
 			w.WriteHeader(http.StatusOK)
-			flusher.Flush()
-			conn := network.NewH2Conn(r.Body, w, flusher.Flush, r.Body.Close)
+
+		case strings.HasPrefix(r.URL.Path, tunnelPathPrefix) && r.Method == http.MethodGet:
+			id := r.URL.Path
+
+			flusher, ok := w.(http.Flusher)
+			if !ok {
+				http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+				return
+			}
+
+			conn := network.NewH2SplitConn()
+			s.tunnelConnsMu.Lock()
+			s.tunnelConns[id] = conn
+			s.tunnelConnsMu.Unlock()
 
 			session, err := smux.Client(conn, s.smuxConfig)
 			if err != nil {
 				s.logger.Errorf("failed to create MUX session for connection %s: %v", r.RemoteAddr, err)
 				conn.Close()
+				s.removeTunnelConn(id)
 				return
 			}
 			select {
@@ -305,12 +344,38 @@ func (s *H2MuxTransport) tunnelListener() {
 			default:
 				s.logger.Warnf("tunnel listener channel is full, discarding connection from %s", r.RemoteAddr)
 				conn.Close()
+				session.Close()
+				s.removeTunnelConn(id)
 				return
 			}
 
-			// Block until the session (created above, consumed by
-			// handleSession in another goroutine) closes this conn.
-			<-conn.Done()
+			w.WriteHeader(http.StatusOK)
+			flusher.Flush()
+
+			s.drainOutbound(conn, w, flusher, r)
+			s.removeTunnelConn(id)
+
+		case strings.HasPrefix(r.URL.Path, tunnelPathPrefix) && r.Method == http.MethodPost:
+			id := r.URL.Path
+
+			s.tunnelConnsMu.Lock()
+			conn, ok := s.tunnelConns[id]
+			s.tunnelConnsMu.Unlock()
+			if !ok {
+				http.Error(w, "unknown tunnel", http.StatusGone)
+				return
+			}
+
+			body, err := io.ReadAll(io.LimitReader(r.Body, int64(s.config.MaxFrameSize)+4096))
+			if err != nil {
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			if !conn.PushInbound(body) {
+				http.Error(w, "closed", http.StatusGone)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
 
 		default:
 			http.NotFound(w, r)
@@ -363,10 +428,42 @@ func (s *H2MuxTransport) tunnelListener() {
 		s.controlChannel.Close()
 	}
 
+	s.tunnelConnsMu.Lock()
+	for _, conn := range s.tunnelConns {
+		conn.Close()
+	}
+	s.tunnelConnsMu.Unlock()
+
 	s.logger.Infof("shutting down the h2 server on %s", addr)
 	if err := server.Shutdown(context.Background()); err != nil {
 		s.logger.Errorf("Failed to gracefully shutdown the server: %v", err)
 	}
+}
+
+// drainOutbound blocks writing queued outbound bytes (queued via conn's
+// Write, called from elsewhere - e.g. channelHandler or a smux session) to
+// the GET response as they arrive, until the connection closes or the
+// request's context is cancelled (client disconnected). Since HTTP/2
+// requests can't be hijacked, this is what keeps the response stream open
+// for the connection's lifetime.
+func (s *H2MuxTransport) drainOutbound(conn *network.H2SplitConn, w http.ResponseWriter, flusher http.Flusher, r *http.Request) {
+	for {
+		chunk, ok := conn.NextOutbound(r.Context().Done())
+		if !ok {
+			return
+		}
+		if _, err := w.Write(chunk); err != nil {
+			conn.Close()
+			return
+		}
+		flusher.Flush()
+	}
+}
+
+func (s *H2MuxTransport) removeTunnelConn(id string) {
+	s.tunnelConnsMu.Lock()
+	delete(s.tunnelConns, id)
+	s.tunnelConnsMu.Unlock()
 }
 
 func (s *H2MuxTransport) parsePortMappings() {

@@ -20,8 +20,11 @@ import (
 )
 
 // H2MuxTransport is the client side of the h2mux/h2smux transports: smux
-// multiplexing runs over a duplex HTTP/2 stream (opened via network.H2Dialer)
-// instead of a WebSocket connection.
+// multiplexing runs over a pair of HTTP/2 request/response exchanges (a
+// long-lived GET for server->client bytes, short bounded POSTs for
+// client->server bytes, opened via network.H2SplitDialer) instead of a
+// WebSocket connection or a single duplex POST - see network.H2SplitConn
+// for why.
 type H2MuxTransport struct {
 	config          *H2MuxConfig
 	smuxConfig      *smux.Config
@@ -29,7 +32,7 @@ type H2MuxTransport struct {
 	ctx             context.Context
 	cancel          context.CancelFunc
 	logger          *logrus.Logger
-	controlChannel  *network.H2Conn
+	controlChannel  io.ReadWriteCloser
 	usageMonitor    *web.Usage
 	restartMutex    sync.Mutex
 	poolConnections int32
@@ -139,11 +142,11 @@ func (c *H2MuxTransport) Restart() {
 	go c.Start()
 }
 
-func (c *H2MuxTransport) dialerConfig(path string, soRcvBuf, soSndBuf int) network.H2DialerConfig {
-	return network.H2DialerConfig{
+func (c *H2MuxTransport) dialerConfig(soRcvBuf, soSndBuf int) network.H2SplitDialerConfig {
+	return network.H2SplitDialerConfig{
 		Addr:               c.config.RemoteAddr,
 		EdgeIP:             c.config.EdgeIP,
-		Path:               network.NormalizeBasePath(c.config.Path) + path,
+		Path:               network.NormalizeBasePath(c.config.Path),
 		Token:              c.config.Token,
 		TLS:                c.config.Mode == config.H2SMUX,
 		InsecureSkipVerify: true,
@@ -163,7 +166,8 @@ func (c *H2MuxTransport) channelDialer() {
 		case <-c.ctx.Done():
 			return
 		default:
-			tunnelConn, err := network.H2Dialer(c.ctx, c.dialerConfig("/channel", 0, 0), 3)
+			channelPath := network.NormalizeBasePath(c.config.Path) + "/channel"
+			tunnelConn, err := network.H2SplitDialer(c.ctx, c.dialerConfig(0, 0), channelPath, 3)
 			if err != nil {
 				c.logger.Errorf("control channel dialer: %v", err)
 				time.Sleep(c.config.RetryInterval)
@@ -318,7 +322,8 @@ func (c *H2MuxTransport) tunnelDialer() {
 	c.logger.Debugf("initiating new %s tunnel connection to address %s", c.config.Mode, c.config.RemoteAddr)
 
 	// Dial to the tunnel server
-	tunnelConn, err := network.H2Dialer(c.ctx, c.dialerConfig("/tunnel", 2*1024*1024, 2*1024*1024), 3)
+	tunnelPath := network.H2SplitTunnelPath(network.NormalizeBasePath(c.config.Path))
+	tunnelConn, err := network.H2SplitDialer(c.ctx, c.dialerConfig(2*1024*1024, 2*1024*1024), tunnelPath, 3)
 	if err != nil {
 		c.logger.Errorf("tunnel server dialer: %v", err)
 
@@ -331,7 +336,7 @@ func (c *H2MuxTransport) tunnelDialer() {
 	c.handleSession(tunnelConn)
 }
 
-func (c *H2MuxTransport) handleSession(tunnelConn *network.H2Conn) {
+func (c *H2MuxTransport) handleSession(tunnelConn io.ReadWriteCloser) {
 	defer func() {
 		atomic.AddInt32(&c.poolConnections, -1)
 	}()
