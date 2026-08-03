@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"runtime"
@@ -19,12 +20,19 @@ import (
 	"github.com/musix/backhaul/internal/web"
 	"github.com/xtaci/smux"
 
-	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
-type WsMuxTransport struct {
-	config         *WsMuxConfig
+// H2MuxTransport is the server side of the h2mux/h2smux transports: smux
+// multiplexing runs over a duplex HTTP/2 stream instead of a WebSocket
+// connection. Unlike WS, an HTTP/2 request can't be hijacked into a raw
+// net.Conn, so each accepted request's handler goroutine stays blocked for
+// the lifetime of the tunnel it represents instead of handing off a
+// detached connection.
+type H2MuxTransport struct {
+	config         *H2MuxConfig
 	smuxConfig     *smux.Config
 	parentctx      context.Context
 	ctx            context.Context
@@ -33,14 +41,14 @@ type WsMuxTransport struct {
 	tunnelChannel  chan *smux.Session
 	localChannel   chan LocalTCPConn
 	reqNewConnChan chan struct{}
-	controlChannel *websocket.Conn
+	controlChannel *network.H2Conn
 	usageMonitor   *web.Usage
 	restartMutex   sync.Mutex
 	streamCounter  int32
 	sessionCounter int32
 }
 
-type WsMuxConfig struct {
+type H2MuxConfig struct {
 	BindAddr         string
 	Token            string
 	SnifferLog       string
@@ -59,17 +67,16 @@ type WsMuxConfig struct {
 	MaxReceiveBuffer int
 	MaxStreamBuffer  int
 	WebPort          int
-	Mode             config.TransportType // ws or wss
+	Mode             config.TransportType // h2mux or h2smux
 	ProxyProtocol    bool
 	Path             string
 }
 
-func NewWSMuxServer(parentCtx context.Context, config *WsMuxConfig, logger *logrus.Logger) *WsMuxTransport {
+func NewH2MuxServer(parentCtx context.Context, config *H2MuxConfig, logger *logrus.Logger) *H2MuxTransport {
 	// Create a derived context from the parent context
 	ctx, cancel := context.WithCancel(parentCtx)
 
-	// Initialize the TcpTransport struct
-	server := &WsMuxTransport{
+	server := &H2MuxTransport{
 		smuxConfig: &smux.Config{
 			Version:           config.MuxVersion,
 			KeepAliveInterval: 20 * time.Second,
@@ -95,8 +102,7 @@ func NewWSMuxServer(parentCtx context.Context, config *WsMuxConfig, logger *logr
 	return server
 }
 
-func (s *WsMuxTransport) Start() {
-	// for  webui
+func (s *H2MuxTransport) Start() {
 	if s.config.WebPort > 0 {
 		go s.usageMonitor.Monitor()
 	}
@@ -104,10 +110,9 @@ func (s *WsMuxTransport) Start() {
 	s.config.TunnelStatus = fmt.Sprintf("Disconnected (%s)", s.config.Mode)
 
 	go s.tunnelListener()
-
 }
 
-func (s *WsMuxTransport) Restart() {
+func (s *H2MuxTransport) Restart() {
 	if !s.restartMutex.TryLock() {
 		s.logger.Warn("server restart already in progress, skipping restart attempt")
 		return
@@ -151,31 +156,35 @@ func (s *WsMuxTransport) Restart() {
 	go s.Start()
 }
 
-func (s *WsMuxTransport) channelHandler() {
+// channelHandler owns the control channel's HTTP/2 stream for its entire
+// lifetime: it blocks until the stream should end, which is what keeps the
+// underlying HTTP handler (and thus the h2 stream) from returning early.
+func (s *H2MuxTransport) channelHandler() {
 	ticker := time.NewTicker(s.config.Heartbeat)
 	defer ticker.Stop()
 
 	// Channel to receive the message or error
 	messageChan := make(chan byte, 10)
 
-	// Separate goroutine to continuously listen for messages
+	// Separate goroutine to continuously listen for messages. Control
+	// signals are always exactly one byte (see internal/utils/signals.go),
+	// so a raw single-byte read is an unambiguous message boundary.
 	go func() {
+		buf := make([]byte, 1)
 		for {
 			select {
 			case <-s.ctx.Done():
 				return
 
 			default:
-				_, msg, err := s.controlChannel.ReadMessage()
-				// Exit if there's an error
-				if err != nil {
+				if _, err := io.ReadFull(s.controlChannel, buf); err != nil {
 					if s.cancel != nil {
 						s.logger.Error("failed to read from channel connection. ", err)
 						go s.Restart()
 					}
 					return
 				}
-				messageChan <- msg[0]
+				messageChan <- buf[0]
 			}
 		}
 	}()
@@ -183,19 +192,17 @@ func (s *WsMuxTransport) channelHandler() {
 	for {
 		select {
 		case <-s.ctx.Done():
-			_ = s.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_Closed})
+			_, _ = s.controlChannel.Write([]byte{utils.SG_Closed})
 			return
 		case <-s.reqNewConnChan:
-			err := s.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_Chan})
-			if err != nil {
+			if _, err := s.controlChannel.Write([]byte{utils.SG_Chan}); err != nil {
 				s.logger.Error("failed to send request new connection signal. ", err)
 				go s.Restart()
 				return
 			}
 
 		case <-ticker.C:
-			err := s.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_HB})
-			if err != nil {
+			if _, err := s.controlChannel.Write([]byte{utils.SG_HB}); err != nil {
 				s.logger.Errorf("failed to send heartbeat signal. Error: %v.", err)
 				go s.Restart()
 				return
@@ -204,7 +211,7 @@ func (s *WsMuxTransport) channelHandler() {
 
 		case msg, ok := <-messageChan:
 			if !ok {
-				s.logger.Error("channel closed, likely due to an error in WebSocket read")
+				s.logger.Error("channel closed, likely due to an error in h2 read")
 				return
 			}
 			switch msg {
@@ -221,93 +228,109 @@ func (s *WsMuxTransport) channelHandler() {
 				go s.Restart()
 				return
 			}
-
 		}
 	}
 }
 
-func (s *WsMuxTransport) tunnelListener() {
+func (s *H2MuxTransport) tunnelListener() {
 	addr := s.config.BindAddr
 	basePath := network.NormalizeBasePath(s.config.Path)
 	channelPath := basePath + "/channel"
 	tunnelPathPrefix := basePath + "/tunnel"
-	upgrader := websocket.Upgrader{
-		ReadBufferSize:   64 * 1024,
-		WriteBufferSize:  64 * 1024,
-		HandshakeTimeout: 45 * time.Second,
-		CheckOrigin: func(r *http.Request) bool {
-			return true
-		},
-	}
 
-	// Create an HTTP server
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.logger.Tracef("received http request from %s", r.RemoteAddr)
+
+		authHeader := r.Header.Get("Authorization")
+		if authHeader != fmt.Sprintf("Bearer %v", s.config.Token) {
+			s.logger.Warnf("unauthorized request from %s, closing connection", r.RemoteAddr)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+
+		switch {
+		case r.URL.Path == channelPath:
+			if s.controlChannel != nil {
+				s.logger.Warn("new control channel requested.")
+				s.controlChannel.Close()
+				go s.Restart()
+				return
+			}
+
+			w.WriteHeader(http.StatusOK)
+			flusher.Flush()
+			conn := network.NewH2Conn(r.Body, w, flusher.Flush, r.Body.Close)
+			s.controlChannel = conn
+
+			s.logger.Info("control channel established successfully")
+
+			numCPU := runtime.NumCPU()
+			if numCPU > 4 {
+				numCPU = 4 // Max allowed handler is 4
+			}
+
+			go s.parsePortMappings()
+
+			s.logger.Infof("starting %d handle loops on each CPU thread", numCPU)
+
+			for i := 0; i < numCPU; i++ {
+				go s.handleLoop()
+			}
+
+			s.config.TunnelStatus = fmt.Sprintf("Connected (%s)", s.config.Mode)
+
+			// Blocks for as long as the control channel is alive, which is
+			// what keeps this HTTP/2 stream open (no hijack is possible here).
+			s.channelHandler()
+
+		case strings.HasPrefix(r.URL.Path, tunnelPathPrefix):
+			w.WriteHeader(http.StatusOK)
+			flusher.Flush()
+			conn := network.NewH2Conn(r.Body, w, flusher.Flush, r.Body.Close)
+
+			session, err := smux.Client(conn, s.smuxConfig)
+			if err != nil {
+				s.logger.Errorf("failed to create MUX session for connection %s: %v", r.RemoteAddr, err)
+				conn.Close()
+				return
+			}
+			select {
+			case s.tunnelChannel <- session: // ok
+			default:
+				s.logger.Warnf("tunnel listener channel is full, discarding connection from %s", r.RemoteAddr)
+				conn.Close()
+				return
+			}
+
+			// Block until the session (created above, consumed by
+			// handleSession in another goroutine) closes this conn.
+			<-conn.Done()
+
+		default:
+			http.NotFound(w, r)
+		}
+	})
+
+	h2s := &http2.Server{}
+
+	var finalHandler http.Handler = handler
 	server := &http.Server{
 		Addr:        addr,
 		IdleTimeout: -1,
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			s.logger.Tracef("received http request from %s", r.RemoteAddr)
-
-			// Read the "Authorization" header
-			authHeader := r.Header.Get("Authorization")
-			if authHeader != fmt.Sprintf("Bearer %v", s.config.Token) {
-				s.logger.Warnf("unauthorized request from %s, closing connection", r.RemoteAddr)
-				http.Error(w, "unauthorized", http.StatusUnauthorized) // Send 401 Unauthorized response
-				return
-			}
-
-			conn, err := upgrader.Upgrade(w, r, nil)
-			if err != nil {
-				s.logger.Errorf("failed to upgrade connection from %s: %v", r.RemoteAddr, err)
-				return
-			}
-
-			if r.URL.Path == channelPath {
-				if s.controlChannel != nil {
-					s.logger.Warn("new control channel requested.")
-					s.controlChannel.Close()
-					conn.Close()
-					go s.Restart()
-					return
-				}
-
-				s.controlChannel = conn
-
-				s.logger.Info("control channel established successfully")
-
-				numCPU := runtime.NumCPU()
-				if numCPU > 4 {
-					numCPU = 4 // Max allowed handler is 4
-				}
-
-				go s.channelHandler()
-				go s.parsePortMappings()
-
-				s.logger.Infof("starting %d handle loops on each CPU thread", numCPU)
-
-				for i := 0; i < numCPU; i++ {
-					go s.handleLoop()
-				}
-
-				s.config.TunnelStatus = fmt.Sprintf("Connected (%s)", s.config.Mode)
-
-			} else if strings.HasPrefix(r.URL.Path, tunnelPathPrefix) {
-				session, err := smux.Client(conn.NetConn(), s.smuxConfig)
-				if err != nil {
-					s.logger.Errorf("failed to create MUX session for connection %s: %v", conn.RemoteAddr().String(), err)
-					conn.Close()
-					return
-				}
-				select {
-				case s.tunnelChannel <- session: // ok
-				default:
-					s.logger.Warnf("tunnel listener channel is full, discarding TCP connection from %s", conn.LocalAddr().String())
-					conn.Close()
-				}
-			}
-		}),
 	}
 
-	if s.config.Mode == config.WSMUX {
+	if s.config.Mode == config.H2MUX {
+		// Cleartext h2c, with a graceful fallback to plain HTTP/1.1 framing
+		// for intermediaries (e.g. a reverse proxy) that don't speak h2c.
+		finalHandler = h2c.NewHandler(handler, h2s)
+		server.Handler = finalHandler
+
 		go func() {
 			s.logger.Infof("%s server starting, listening on %s", s.config.Mode, addr)
 			if s.controlChannel == nil {
@@ -318,6 +341,11 @@ func (s *WsMuxTransport) tunnelListener() {
 			}
 		}()
 	} else {
+		server.Handler = finalHandler
+		if err := http2.ConfigureServer(server, h2s); err != nil {
+			s.logger.Fatalf("failed to configure h2 server: %v", err)
+		}
+
 		go func() {
 			s.logger.Infof("%s server starting, listening on %s", s.config.Mode, addr)
 			if s.controlChannel == nil {
@@ -331,19 +359,17 @@ func (s *WsMuxTransport) tunnelListener() {
 
 	<-s.ctx.Done()
 
-	// close connection
 	if s.controlChannel != nil {
 		s.controlChannel.Close()
 	}
 
-	// Gracefully shutdown the server
-	s.logger.Infof("shutting down the websocket server on %s", addr)
+	s.logger.Infof("shutting down the h2 server on %s", addr)
 	if err := server.Shutdown(context.Background()); err != nil {
 		s.logger.Errorf("Failed to gracefully shutdown the server: %v", err)
 	}
 }
 
-func (s *WsMuxTransport) parsePortMappings() {
+func (s *H2MuxTransport) parsePortMappings() {
 	for _, portMapping := range s.config.Ports {
 		parts := strings.Split(portMapping, "=")
 
@@ -434,7 +460,7 @@ func (s *WsMuxTransport) parsePortMappings() {
 	}
 }
 
-func (s *WsMuxTransport) localListener(localAddr string, remoteAddr string) {
+func (s *H2MuxTransport) localListener(localAddr string, remoteAddr string) {
 	listener, err := net.Listen("tcp", localAddr)
 	if err != nil {
 		s.logger.Fatalf("failed to start listener on %s: %v", localAddr, err)
@@ -451,7 +477,7 @@ func (s *WsMuxTransport) localListener(localAddr string, remoteAddr string) {
 	<-s.ctx.Done()
 }
 
-func (s *WsMuxTransport) acceptLocalConn(listener net.Listener, remoteAddr string) {
+func (s *H2MuxTransport) acceptLocalConn(listener net.Listener, remoteAddr string) {
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -517,7 +543,7 @@ func (s *WsMuxTransport) acceptLocalConn(listener net.Listener, remoteAddr strin
 
 }
 
-func (s *WsMuxTransport) handleLoop() {
+func (s *H2MuxTransport) handleLoop() {
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -532,7 +558,7 @@ func (s *WsMuxTransport) handleLoop() {
 	}
 }
 
-func (s *WsMuxTransport) handleSession(session *smux.Session) {
+func (s *H2MuxTransport) handleSession(session *smux.Session) {
 	counter := make(chan struct{}, s.config.MuxCon)
 	defer session.Close()
 	defer close(counter)
@@ -580,7 +606,7 @@ func (s *WsMuxTransport) handleSession(session *smux.Session) {
 	}
 }
 
-func (s *WsMuxTransport) handleSessionError(incomingConn *LocalTCPConn, err error) {
+func (s *H2MuxTransport) handleSessionError(incomingConn *LocalTCPConn, err error) {
 	s.logger.Tracef("failed to handle session: %v", err)
 
 	// decrease session value

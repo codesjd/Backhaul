@@ -103,6 +103,7 @@ func (s *Server) Start() {
 			Mode:        s.config.Transport,
 			TLSCertFile: s.config.TLSCertFile,
 			TLSKeyFile:  s.config.TLSKeyFile,
+			Path:        s.config.Path,
 		}
 
 		wsServer := transport.NewWSServer(s.ctx, wsConfig, s.logger)
@@ -129,10 +130,38 @@ func (s *Server) Start() {
 			TLSCertFile:      s.config.TLSCertFile,
 			TLSKeyFile:       s.config.TLSKeyFile,
 			ProxyProtocol:    s.config.ProxyProtocol,
+			Path:             s.config.Path,
 		}
 
 		wsMuxServer := transport.NewWSMuxServer(s.ctx, wsMuxConfig, s.logger)
 		go wsMuxServer.Start()
+
+	case config.H2MUX, config.H2SMUX:
+		h2MuxConfig := &transport.H2MuxConfig{
+			BindAddr:         s.config.BindAddr,
+			Nodelay:          s.config.Nodelay,
+			KeepAlive:        time.Duration(s.config.Keepalive) * time.Second,
+			Heartbeat:        time.Duration(s.config.Heartbeat) * time.Second,
+			Token:            s.config.Token,
+			ChannelSize:      s.config.ChannelSize,
+			Ports:            s.config.Ports,
+			MuxCon:           s.config.MuxCon,
+			MuxVersion:       s.config.MuxVersion,
+			MaxFrameSize:     s.config.MaxFrameSize,
+			MaxReceiveBuffer: s.config.MaxReceiveBuffer,
+			MaxStreamBuffer:  s.config.MaxStreamBuffer,
+			Sniffer:          s.config.Sniffer,
+			WebPort:          s.config.WebPort,
+			SnifferLog:       s.config.SnifferLog,
+			Mode:             s.config.Transport,
+			TLSCertFile:      s.config.TLSCertFile,
+			TLSKeyFile:       s.config.TLSKeyFile,
+			ProxyProtocol:    s.config.ProxyProtocol,
+			Path:             s.config.Path,
+		}
+
+		h2MuxServer := transport.NewH2MuxServer(s.ctx, h2MuxConfig, s.logger)
+		go h2MuxServer.Start()
 
 	case config.UDP:
 		udpConfig := &transport.UdpConfig{

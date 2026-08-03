@@ -1,0 +1,60 @@
+package network
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"time"
+
+	utls "github.com/refraction-networking/utls"
+)
+
+// UtlsDialTLS dials a TCP connection (with the same tuning knobs as TcpDialer)
+// and performs the TLS handshake using uTLS with a Chrome ClientHello, so the
+// outbound TLS fingerprint (JA3/JA4) blends in with real browser traffic
+// instead of standing out as Go's crypto/tls default, which is a known DPI
+// signal distinct from the CDN's usual traffic.
+func UtlsDialTLS(ctx context.Context, dialAddr string, serverName string, insecureSkipVerify bool, nextProtos []string, timeout time.Duration, keepAlive time.Duration, nodelay bool, SO_RCVBUF int, SO_SNDBUF int) (net.Conn, error) {
+	rawConn, err := TcpDialer(ctx, dialAddr, "", timeout, keepAlive, nodelay, 1, SO_RCVBUF, SO_SNDBUF, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	uConfig := &utls.Config{
+		ServerName:         serverName,
+		InsecureSkipVerify: insecureSkipVerify,
+		NextProtos:         nextProtos,
+	}
+
+	// The Chrome preset's canned spec carries its own hardcoded ALPN
+	// extension (real Chrome always offers ["h2", "http/1.1"]), which
+	// overrides Config.NextProtos when the preset is applied as-is. That's
+	// fine for h2smux, but wss/wssmux ride gorilla/websocket, which only
+	// understands HTTP/1.1 - if the server picks "h2" off that hardcoded
+	// list, gorilla's plain HTTP/1.1 Upgrade request lands on an HTTP/2
+	// connection and fails. Building the spec explicitly and overwriting
+	// its ALPN extension keeps every other part of the Chrome fingerprint
+	// intact while constraining negotiation to what the caller asked for.
+	spec, err := utls.UTLSIdToSpec(utls.HelloChrome_Auto)
+	if err != nil {
+		rawConn.Close()
+		return nil, fmt.Errorf("utls spec generation failed: %w", err)
+	}
+	for _, ext := range spec.Extensions {
+		if alpn, ok := ext.(*utls.ALPNExtension); ok {
+			alpn.AlpnProtocols = nextProtos
+		}
+	}
+
+	uConn := utls.UClient(rawConn, uConfig, utls.HelloCustom)
+	if err := uConn.ApplyPreset(&spec); err != nil {
+		rawConn.Close()
+		return nil, fmt.Errorf("utls preset application failed: %w", err)
+	}
+	if err := uConn.HandshakeContext(ctx); err != nil {
+		rawConn.Close()
+		return nil, fmt.Errorf("utls handshake failed: %w", err)
+	}
+
+	return uConn, nil
+}

@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,25 +16,28 @@ import (
 	"github.com/musix/backhaul/internal/web"
 	"github.com/xtaci/smux"
 
-	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
 )
 
-type WsMuxTransport struct {
-	config          *WsMuxConfig
+// H2MuxTransport is the client side of the h2mux/h2smux transports: smux
+// multiplexing runs over a duplex HTTP/2 stream (opened via network.H2Dialer)
+// instead of a WebSocket connection.
+type H2MuxTransport struct {
+	config          *H2MuxConfig
 	smuxConfig      *smux.Config
 	parentctx       context.Context
 	ctx             context.Context
 	cancel          context.CancelFunc
 	logger          *logrus.Logger
-	controlChannel  *websocket.Conn
+	controlChannel  *network.H2Conn
 	usageMonitor    *web.Usage
 	restartMutex    sync.Mutex
 	poolConnections int32
 	loadConnections int32
 	controlFlow     chan struct{}
 }
-type WsMuxConfig struct {
+
+type H2MuxConfig struct {
 	RemoteAddr       string
 	Token            string
 	SnifferLog       string
@@ -49,18 +53,17 @@ type WsMuxConfig struct {
 	MaxStreamBuffer  int
 	ConnPoolSize     int
 	WebPort          int
-	Mode             config.TransportType
+	Mode             config.TransportType // h2mux or h2smux
 	AggressivePool   bool
 	EdgeIP           string
 	Path             string
 }
 
-func NewWSMuxClient(parentCtx context.Context, config *WsMuxConfig, logger *logrus.Logger) *WsMuxTransport {
+func NewH2MuxClient(parentCtx context.Context, config *H2MuxConfig, logger *logrus.Logger) *H2MuxTransport {
 	// Create a derived context from the parent context
 	ctx, cancel := context.WithCancel(parentCtx)
 
-	// Initialize the TcpTransport struct
-	client := &WsMuxTransport{
+	client := &H2MuxTransport{
 		smuxConfig: &smux.Config{
 			Version:           config.MuxVersion,
 			KeepAliveInterval: 20 * time.Second,
@@ -84,7 +87,7 @@ func NewWSMuxClient(parentCtx context.Context, config *WsMuxConfig, logger *logr
 	return client
 }
 
-func (c *WsMuxTransport) Start() {
+func (c *H2MuxTransport) Start() {
 	if c.config.WebPort > 0 {
 		go c.usageMonitor.Monitor()
 	}
@@ -94,7 +97,7 @@ func (c *WsMuxTransport) Start() {
 	go c.channelDialer()
 }
 
-func (c *WsMuxTransport) Restart() {
+func (c *H2MuxTransport) Restart() {
 	if !c.restartMutex.TryLock() {
 		c.logger.Warn("client is already restarting")
 		return
@@ -136,7 +139,23 @@ func (c *WsMuxTransport) Restart() {
 	go c.Start()
 }
 
-func (c *WsMuxTransport) channelDialer() {
+func (c *H2MuxTransport) dialerConfig(path string, soRcvBuf, soSndBuf int) network.H2DialerConfig {
+	return network.H2DialerConfig{
+		Addr:               c.config.RemoteAddr,
+		EdgeIP:             c.config.EdgeIP,
+		Path:               network.NormalizeBasePath(c.config.Path) + path,
+		Token:              c.config.Token,
+		TLS:                c.config.Mode == config.H2SMUX,
+		InsecureSkipVerify: true,
+		Timeout:            c.config.DialTimeOut,
+		KeepAlive:          c.config.KeepAlive,
+		Nodelay:            c.config.Nodelay,
+		SO_RCVBUF:          soRcvBuf,
+		SO_SNDBUF:          soSndBuf,
+	}
+}
+
+func (c *H2MuxTransport) channelDialer() {
 	c.logger.Infof("attempting to establish a new %s control channel connection", c.config.Mode)
 
 	for {
@@ -144,14 +163,13 @@ func (c *WsMuxTransport) channelDialer() {
 		case <-c.ctx.Done():
 			return
 		default:
-
-			tunnelWSConn, err := network.WebSocketDialer(c.ctx, c.config.RemoteAddr, c.config.EdgeIP, network.NormalizeBasePath(c.config.Path)+"/channel", c.config.DialTimeOut, c.config.KeepAlive, true, c.config.Token, c.config.Mode, 3, 0, 0)
+			tunnelConn, err := network.H2Dialer(c.ctx, c.dialerConfig("/channel", 0, 0), 3)
 			if err != nil {
 				c.logger.Errorf("control channel dialer: %v", err)
 				time.Sleep(c.config.RetryInterval)
 				continue
 			}
-			c.controlChannel = tunnelWSConn
+			c.controlChannel = tunnelConn
 			c.logger.Info("control channel established successfully")
 
 			c.config.TunnelStatus = fmt.Sprintf("Connected (%s)", c.config.Mode)
@@ -164,7 +182,7 @@ func (c *WsMuxTransport) channelDialer() {
 	}
 }
 
-func (c *WsMuxTransport) poolMaintainer() {
+func (c *H2MuxTransport) poolMaintainer() {
 	for i := 0; i < c.config.ConnPoolSize; i++ { //initial pool filling
 		go c.tunnelDialer()
 	}
@@ -229,26 +247,27 @@ func (c *WsMuxTransport) poolMaintainer() {
 
 }
 
-func (c *WsMuxTransport) channelHandler() {
+func (c *H2MuxTransport) channelHandler() {
 	msgChan := make(chan byte, 1000)
 
-	// Goroutine to handle the blocking ReceiveBinaryString
+	// Goroutine to handle the blocking read. Control signals are always
+	// exactly one byte (see internal/utils/signals.go).
 	go func() {
+		buf := make([]byte, 1)
 		for {
 			select {
 			case <-c.ctx.Done():
 				return
 
 			default:
-				_, msg, err := c.controlChannel.ReadMessage()
-				if err != nil {
+				if _, err := io.ReadFull(c.controlChannel, buf); err != nil {
 					if c.cancel != nil {
 						c.logger.Error("failed to read from channel connection. ", err)
 						go c.Restart()
 					}
 					return
 				}
-				msgChan <- msg[0]
+				msgChan <- buf[0]
 			}
 		}
 	}()
@@ -256,7 +275,7 @@ func (c *WsMuxTransport) channelHandler() {
 	for {
 		select {
 		case <-c.ctx.Done():
-			_ = c.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_Closed})
+			_, _ = c.controlChannel.Write([]byte{utils.SG_Closed})
 			return
 
 		case msg := <-msgChan:
@@ -273,9 +292,8 @@ func (c *WsMuxTransport) channelHandler() {
 
 			case utils.SG_HB:
 				c.logger.Debug("heartbeat received successfully")
-				err := c.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_HB})
-				if err != nil {
-					c.logger.Errorf("failed to send heartbeat: %v", msg)
+				if _, err := c.controlChannel.Write([]byte{utils.SG_HB}); err != nil {
+					c.logger.Errorf("failed to send heartbeat: %v", err)
 					go c.Restart()
 					return
 				}
@@ -296,11 +314,11 @@ func (c *WsMuxTransport) channelHandler() {
 	}
 }
 
-func (c *WsMuxTransport) tunnelDialer() {
+func (c *H2MuxTransport) tunnelDialer() {
 	c.logger.Debugf("initiating new %s tunnel connection to address %s", c.config.Mode, c.config.RemoteAddr)
 
 	// Dial to the tunnel server
-	tunnelWSConn, err := network.WebSocketDialer(c.ctx, c.config.RemoteAddr, c.config.EdgeIP, network.NormalizeBasePath(c.config.Path)+"/tunnel", c.config.DialTimeOut, c.config.KeepAlive, c.config.Nodelay, c.config.Token, c.config.Mode, 3, 2*1024*1024, 2*1024*1024)
+	tunnelConn, err := network.H2Dialer(c.ctx, c.dialerConfig("/tunnel", 2*1024*1024, 2*1024*1024), 3)
 	if err != nil {
 		c.logger.Errorf("tunnel server dialer: %v", err)
 
@@ -310,16 +328,16 @@ func (c *WsMuxTransport) tunnelDialer() {
 	// Increment active connections counter
 	atomic.AddInt32(&c.poolConnections, 1)
 
-	c.handleSession(tunnelWSConn)
+	c.handleSession(tunnelConn)
 }
 
-func (c *WsMuxTransport) handleSession(tunnelConn *websocket.Conn) {
+func (c *H2MuxTransport) handleSession(tunnelConn *network.H2Conn) {
 	defer func() {
 		atomic.AddInt32(&c.poolConnections, -1)
 	}()
 
 	// SMUX server
-	session, err := smux.Server(tunnelConn.NetConn(), c.smuxConfig)
+	session, err := smux.Server(tunnelConn, c.smuxConfig)
 	if err != nil {
 		c.logger.Errorf("failed to create mux session: %v", err)
 		return
@@ -339,7 +357,7 @@ func (c *WsMuxTransport) handleSession(tunnelConn *websocket.Conn) {
 
 			remoteAddr, err := utils.ReceiveBinaryString(stream)
 			if err != nil {
-				c.logger.Errorf("unable to get port from stream connection %s: %v", tunnelConn.RemoteAddr().String(), err)
+				c.logger.Errorf("unable to get port from stream connection to %s: %v", c.config.RemoteAddr, err)
 				stream.Close()
 				continue
 			}
@@ -349,7 +367,7 @@ func (c *WsMuxTransport) handleSession(tunnelConn *websocket.Conn) {
 	}
 }
 
-func (c *WsMuxTransport) localDialer(stream *smux.Stream, remoteAddr string) {
+func (c *H2MuxTransport) localDialer(stream *smux.Stream, remoteAddr string) {
 	// Extract the port from the received address
 	port, resolvedAddr, err := network.ResolveRemoteAddr(remoteAddr)
 	if err != nil {

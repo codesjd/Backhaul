@@ -84,7 +84,7 @@ To start using the solution, you'll need to configure both server and client com
     ```toml
     [server]# Local, IRAN
     bind_addr = "0.0.0.0:3080"    # Address and port for the server to listen on (mandatory).
-    transport = "tcp"             # Protocol to use ("tcp", "tcpmux", "ws", "wss", "wsmux", "wssmux". mandatory).
+    transport = "tcp"             # Protocol to use ("tcp", "tcpmux", "ws", "wss", "wsmux", "wssmux", "h2mux", "h2smux". mandatory).
     accept_udp = false             # Enable transferring UDP connections over TCP transport. (optional, default: false)
     token = "your_token"          # Authentication token for secure communication (optional).
     keepalive_period = 75         # Interval in seconds to send keep-alive packets.(optional, default: 75s)
@@ -99,8 +99,9 @@ To start using the solution, you'll need to configure both server and client com
     sniffer = false               # Enable or disable network sniffing for monitoring data. (optional, default false)
     web_port = 2060               # Port number for the web interface or monitoring interface. (optional, set to 0 to disable).
     sniffer_log ="/root/log.json" # Filename used to store network traffic and usage data logs. (optional, default backhaul.json)
-    tls_cert = "/root/server.crt" # Path to the TLS certificate file for wss/wssmux. (mandatory).
-    tls_key = "/root/server.key"  # Path to the TLS private key file for wss/wssmux. (mandatory).
+    tls_cert = "/root/server.crt" # Path to the TLS certificate file for wss/wssmux/h2smux. (mandatory).
+    tls_key = "/root/server.key"  # Path to the TLS private key file for wss/wssmux/h2smux. (mandatory).
+    path = ""                     # Custom base path prepended to the /channel and /tunnel endpoints, for ws/wss/wsmux/wssmux/h2mux/h2smux. (optional, default: none)
     log_level = "info"            # Log level ("panic", "fatal", "error", "warn", "info", "debug", "trace", optional, default: "info").
     skip_optz = true              # Skip optimizations performed by Backhaul (default: false)
     mss = 1360                    # TCP/TCPMux: Maximum Segment Size in bytes; controls max TCP payload size to avoid fragmentation. (default: system-defined)
@@ -133,8 +134,9 @@ To start using the solution, you'll need to configure both server and client com
    ```toml
    [client]  # Behind NAT, firewall-blocked
    remote_addr = "0.0.0.0:3080"  # Server address and port (mandatory).
-   edge_ip = "188.114.96.0"      # Edge IP used for CDN connection, specifically for WebSocket-based transports.(Optional, default none)
-   transport = "tcp"             # Protocol to use ("tcp", "tcpmux", "ws", "wss", "wsmux", "wssmux". mandatory).
+   edge_ip = "188.114.96.0"      # Edge IP used for CDN connection, specifically for WebSocket/H2-based transports.(Optional, default none)
+   path = ""                     # Custom base path prepended to the /channel and /tunnel endpoints, for ws/wss/wsmux/wssmux/h2mux/h2smux. Must match the server. (optional, default: none)
+   transport = "tcp"             # Protocol to use ("tcp", "tcpmux", "ws", "wss", "wsmux", "wssmux", "h2mux", "h2smux". mandatory).
    token = "your_token"          # Authentication token for secure communication (optional).
    connection_pool = 8           # Number of pre-established connections.(optional, default: 8).
    aggressive_pool = false       # Enables aggressive connection pool management.(optional, default: false).
@@ -483,6 +485,85 @@ To start using the solution, you'll need to configure both server and client com
    log_level = "info"
    ```
 
+#### H2 Multiplexing Configuration
+
+Smux multiplexing over a duplex HTTP/2 stream instead of a WebSocket connection. `h2mux` is cleartext HTTP/2 (h2c), for when TLS is terminated in front of the server (e.g. by a CDN/nginx); `h2smux` negotiates TLS+ALPN "h2" itself, using a uTLS Chrome ClientHello so the fingerprint blends in with ordinary browser traffic. Both are plain HTTP/2 semantically, which tends to be more CDN-friendly than a long-lived WebSocket connection.
+
+* **Server** (`h2mux`, cleartext):
+
+   ```toml
+   [server]
+   bind_addr = "0.0.0.0:3080"
+   transport = "h2mux"
+   token = "your_token"
+   keepalive_period = 75
+   nodelay = true
+   heartbeat = 40
+   channel_size = 2048
+   mux_con = 8
+   mux_version = 1
+   mux_framesize = 32768
+   mux_recievebuffer = 4194304
+   mux_streambuffer = 65536
+   path = ""
+   sniffer = false
+   web_port = 2060
+   sniffer_log = "/root/backhaul.json"
+   log_level = "info"
+   ports = []
+   ```
+
+* **Server** (`h2smux`, TLS):
+
+   ```toml
+   [server]
+   bind_addr = "0.0.0.0:443"
+   transport = "h2smux"
+   token = "your_token"
+   keepalive_period = 75
+   nodelay = true
+   heartbeat = 40
+   channel_size = 2048
+   mux_con = 8
+   mux_version = 1
+   mux_framesize = 32768
+   mux_recievebuffer = 4194304
+   mux_streambuffer = 65536
+   tls_cert = "/root/server.crt"
+   tls_key = "/root/server.key"
+   path = ""
+   sniffer = false
+   web_port = 2060
+   sniffer_log = "/root/backhaul.json"
+   log_level = "info"
+   ports = []
+   ```
+
+* **Client** (matches either `h2mux` or `h2smux` on the server):
+
+   ```toml
+   [client]
+   remote_addr = "0.0.0.0:443"
+   edge_ip = ""
+   path = ""
+   transport = "h2smux"
+   token = "your_token"
+   keepalive_period = 75
+   dial_timeout = 10
+   nodelay = true
+   retry_interval = 3
+   connection_pool = 8
+   aggressive_pool = false
+   mux_version = 1
+   mux_framesize = 32768
+   mux_recievebuffer = 4194304
+   mux_streambuffer = 65536
+   sniffer = false
+   web_port = 2060
+   sniffer_log = "/root/backhaul.json"
+   log_level = "info"
+   ```
+
 
 
 ## Generating a Self-Signed TLS Certificate with OpenSSL
@@ -579,6 +660,7 @@ journalctl -u backhaul.service -e -f
 * `tcpmux`: Use if you need to handle multiple sessions over a single connection.
 * `ws`: Use if you need to traverse HTTP-based firewalls or proxies.
 * `wss`: Use this for secure WebSocket connections that need to traverse HTTP-based firewalls or proxies. It encrypts data for added security, similar to WS but with encryption.
+* `h2mux`/`h2smux`: Use behind a CDN when you want ordinary HTTP/2 semantics instead of a long-lived WebSocket connection. `h2smux`'s TLS ClientHello is generated with uTLS to mimic Chrome, for CDN edges/DPI that fingerprint the TLS handshake itself.
 
 
 ## Benchmark
