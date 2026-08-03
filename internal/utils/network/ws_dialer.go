@@ -121,6 +121,8 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 		dialer = websocket.Dialer{
 			EnableCompression: true,
 			HandshakeTimeout:  45 * time.Second, // default handshake timeout
+			ReadBufferSize:    64 * 1024,        // match server upgrader; avoids falling back to gorilla's 4KB default
+			WriteBufferSize:   64 * 1024,        // ditto, reduces syscall/copy overhead for large mux frames
 			NetDial: func(_, addr string) (net.Conn, error) {
 				conn, err := TcpDialer(ctx, edgeIP, "", timeout, keepalive, nodelay, 1, SO_RCVBUF, SO_SNDBUF, 0)
 				if err != nil {
@@ -141,6 +143,8 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 			EnableCompression: true,
 			TLSClientConfig:   tlsConfig,        // Pass the insecure TLS config here
 			HandshakeTimeout:  45 * time.Second, // default handshake timeout
+			ReadBufferSize:    64 * 1024,        // match server upgrader; avoids falling back to gorilla's 4KB default
+			WriteBufferSize:   64 * 1024,        // ditto, reduces syscall/copy overhead for large mux frames
 			NetDial: func(_, addr string) (net.Conn, error) {
 				conn, err := TcpDialer(ctx, edgeIP, "", timeout, keepalive, nodelay, 1, SO_RCVBUF, SO_SNDBUF, 0)
 				if err != nil {

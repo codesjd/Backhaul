@@ -203,8 +203,8 @@ func (s *WsTransport) channelHandler() {
 func (s *WsTransport) tunnelListener() {
 	addr := s.config.BindAddr
 	upgrader := websocket.Upgrader{
-		ReadBufferSize:   16 * 1024,
-		WriteBufferSize:  16 * 1024,
+		ReadBufferSize:   64 * 1024,
+		WriteBufferSize:  64 * 1024,
 		HandshakeTimeout: 45 * time.Second,
 		CheckOrigin: func(r *http.Request) bool {
 			return true
