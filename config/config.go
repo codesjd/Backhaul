@@ -11,8 +11,6 @@ const (
 	WSMUX  TransportType = "wsmux"
 	WSSMUX TransportType = "wssmux"
 	UDP    TransportType = "udp"
-	H2MUX  TransportType = "h2mux"
-	H2SMUX TransportType = "h2smux"
 )
 
 // ServerConfig represents the configuration for the server.

@@ -135,30 +135,6 @@ func (c *Client) Start() {
 		wsMuxClient := transport.NewWSMuxClient(c.ctx, wsMuxConfig, c.logger)
 		go wsMuxClient.Start()
 
-	case config.H2MUX, config.H2SMUX:
-		h2MuxConfig := &transport.H2MuxConfig{
-			RemoteAddr:       c.config.RemoteAddr,
-			Nodelay:          c.config.Nodelay,
-			KeepAlive:        time.Duration(c.config.Keepalive) * time.Second,
-			RetryInterval:    time.Duration(c.config.RetryInterval) * time.Second,
-			DialTimeOut:      time.Duration(c.config.DialTimeout) * time.Second,
-			ConnPoolSize:     c.config.ConnectionPool,
-			Token:            c.config.Token,
-			MuxVersion:       c.config.MuxVersion,
-			MaxFrameSize:     c.config.MaxFrameSize,
-			MaxReceiveBuffer: c.config.MaxReceiveBuffer,
-			MaxStreamBuffer:  c.config.MaxStreamBuffer,
-			Sniffer:          c.config.Sniffer,
-			WebPort:          c.config.WebPort,
-			SnifferLog:       c.config.SnifferLog,
-			Mode:             c.config.Transport,
-			AggressivePool:   c.config.AggressivePool,
-			EdgeIP:           c.config.EdgeIP,
-			Path:             c.config.Path,
-		}
-		h2MuxClient := transport.NewH2MuxClient(c.ctx, h2MuxConfig, c.logger)
-		go h2MuxClient.Start()
-
 	case config.UDP:
 		udpConfig := &transport.UdpConfig{
 			RemoteAddr:     c.config.RemoteAddr,
