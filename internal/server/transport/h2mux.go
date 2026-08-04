@@ -279,6 +279,7 @@ func (s *H2MuxTransport) tunnelListener() {
 			conn := network.NewH2SplitConn()
 			s.controlChannel = conn
 
+			setNoBufferHeaders(w)
 			w.WriteHeader(http.StatusOK)
 			flusher.Flush()
 
@@ -349,6 +350,7 @@ func (s *H2MuxTransport) tunnelListener() {
 				return
 			}
 
+			setNoBufferHeaders(w)
 			w.WriteHeader(http.StatusOK)
 			flusher.Flush()
 
@@ -438,6 +440,21 @@ func (s *H2MuxTransport) tunnelListener() {
 	if err := server.Shutdown(context.Background()); err != nil {
 		s.logger.Errorf("Failed to gracefully shutdown the server: %v", err)
 	}
+}
+
+// setNoBufferHeaders tells intermediaries not to cache or buffer this GET
+// response. A plain streamed GET (no Upgrade header, no chunked/SSE
+// signaling) looks like ordinary cacheable content to a CDN/reverse proxy
+// by default, which either serves a cached response instead of reaching
+// origin, or buffers the response until it decides whether to cache it -
+// either way breaking the "server writes over time" streaming this relies
+// on. X-Accel-Buffering is nginx-specific; Cache-Control/Pragma cover the
+// CDN edge and any other intermediary.
+func setNoBufferHeaders(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, private")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("Content-Type", "application/octet-stream")
 }
 
 // drainOutbound blocks writing queued outbound bytes (queued via conn's
