@@ -256,7 +256,7 @@ func (c *WsMuxTransport) channelHandler() {
 	for {
 		select {
 		case <-c.ctx.Done():
-			_ = c.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_Closed})
+			_ = utils.WriteControlSignal(c.controlChannel, utils.SG_Closed)
 			return
 
 		case msg := <-msgChan:
@@ -273,7 +273,7 @@ func (c *WsMuxTransport) channelHandler() {
 
 			case utils.SG_HB:
 				c.logger.Debug("heartbeat received successfully")
-				err := c.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_HB})
+				err := utils.WriteControlSignal(c.controlChannel, utils.SG_HB)
 				if err != nil {
 					c.logger.Errorf("failed to send heartbeat: %v", msg)
 					go c.Restart()

@@ -152,8 +152,11 @@ func (s *WsMuxTransport) Restart() {
 }
 
 func (s *WsMuxTransport) channelHandler() {
-	ticker := time.NewTicker(s.config.Heartbeat)
-	defer ticker.Stop()
+	// A jittered timer (instead of a fixed-period ticker) so the heartbeat
+	// cadence isn't perfectly periodic, which is an easy fingerprint for
+	// traffic-pattern based DPI.
+	heartbeatTimer := time.NewTimer(utils.JitterDuration(s.config.Heartbeat))
+	defer heartbeatTimer.Stop()
 
 	// Channel to receive the message or error
 	messageChan := make(chan byte, 10)
@@ -183,24 +186,25 @@ func (s *WsMuxTransport) channelHandler() {
 	for {
 		select {
 		case <-s.ctx.Done():
-			_ = s.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_Closed})
+			_ = utils.WriteControlSignal(s.controlChannel, utils.SG_Closed)
 			return
 		case <-s.reqNewConnChan:
-			err := s.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_Chan})
+			err := utils.WriteControlSignal(s.controlChannel, utils.SG_Chan)
 			if err != nil {
 				s.logger.Error("failed to send request new connection signal. ", err)
 				go s.Restart()
 				return
 			}
 
-		case <-ticker.C:
-			err := s.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_HB})
+		case <-heartbeatTimer.C:
+			err := utils.WriteControlSignal(s.controlChannel, utils.SG_HB)
 			if err != nil {
 				s.logger.Errorf("failed to send heartbeat signal. Error: %v.", err)
 				go s.Restart()
 				return
 			}
 			s.logger.Debug("heartbeat signal sent successfully")
+			heartbeatTimer.Reset(utils.JitterDuration(s.config.Heartbeat))
 
 		case msg, ok := <-messageChan:
 			if !ok {
