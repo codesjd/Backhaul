@@ -41,27 +41,28 @@ type WsMuxTransport struct {
 }
 
 type WsMuxConfig struct {
-	BindAddr         string
-	Token            string
-	SnifferLog       string
-	TLSCertFile      string // Path to the TLS certificate file
-	TLSKeyFile       string // Path to the TLS key file
-	TunnelStatus     string
-	Ports            []string
-	Nodelay          bool
-	Sniffer          bool
-	KeepAlive        time.Duration
-	Heartbeat        time.Duration // in seconds
-	ChannelSize      int
-	MuxCon           int
-	MuxVersion       int
-	MaxFrameSize     int
-	MaxReceiveBuffer int
-	MaxStreamBuffer  int
-	WebPort          int
-	Mode             config.TransportType // ws or wss
-	ProxyProtocol    bool
-	Path             string
+	BindAddr             string
+	Token                string
+	SnifferLog           string
+	TLSCertFile          string // Path to the TLS certificate file
+	TLSKeyFile           string // Path to the TLS key file
+	TunnelStatus         string
+	Ports                []string
+	Nodelay              bool
+	Sniffer              bool
+	KeepAlive            time.Duration
+	Heartbeat            time.Duration // in seconds
+	ChannelSize          int
+	MuxCon               int
+	MuxVersion           int
+	MaxFrameSize         int
+	MaxReceiveBuffer     int
+	MaxStreamBuffer      int
+	WebPort              int
+	Mode                 config.TransportType // ws or wss
+	ProxyProtocol        bool
+	Path                 string
+	MuxKeepaliveDisabled bool
 }
 
 func NewWSMuxServer(parentCtx context.Context, config *WsMuxConfig, logger *logrus.Logger) *WsMuxTransport {
@@ -72,6 +73,7 @@ func NewWSMuxServer(parentCtx context.Context, config *WsMuxConfig, logger *logr
 	server := &WsMuxTransport{
 		smuxConfig: &smux.Config{
 			Version:           config.MuxVersion,
+			KeepAliveDisabled: config.MuxKeepaliveDisabled,
 			KeepAliveInterval: 20 * time.Second,
 			KeepAliveTimeout:  40 * time.Second,
 			MaxFrameSize:      config.MaxFrameSize,

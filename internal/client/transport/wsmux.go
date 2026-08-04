@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,27 +33,32 @@ type WsMuxTransport struct {
 	poolConnections int32
 	loadConnections int32
 	controlFlow     chan struct{}
+	// userAgent is picked once per process instead of per dial, so a single
+	// client identity doesn't show up with a different browser signature on
+	// every pool connection/reconnect - a pattern no real browser produces.
+	userAgent string
 }
 type WsMuxConfig struct {
-	RemoteAddr       string
-	Token            string
-	SnifferLog       string
-	TunnelStatus     string
-	Nodelay          bool
-	Sniffer          bool
-	KeepAlive        time.Duration
-	RetryInterval    time.Duration
-	DialTimeOut      time.Duration
-	MuxVersion       int
-	MaxFrameSize     int
-	MaxReceiveBuffer int
-	MaxStreamBuffer  int
-	ConnPoolSize     int
-	WebPort          int
-	Mode             config.TransportType
-	AggressivePool   bool
-	EdgeIP           string
-	Path             string
+	RemoteAddr           string
+	Token                string
+	SnifferLog           string
+	TunnelStatus         string
+	Nodelay              bool
+	Sniffer              bool
+	KeepAlive            time.Duration
+	RetryInterval        time.Duration
+	DialTimeOut          time.Duration
+	MuxVersion           int
+	MaxFrameSize         int
+	MaxReceiveBuffer     int
+	MaxStreamBuffer      int
+	ConnPoolSize         int
+	WebPort              int
+	Mode                 config.TransportType
+	AggressivePool       bool
+	EdgeIP               string
+	Path                 string
+	MuxKeepaliveDisabled bool
 }
 
 func NewWSMuxClient(parentCtx context.Context, config *WsMuxConfig, logger *logrus.Logger) *WsMuxTransport {
@@ -63,6 +69,7 @@ func NewWSMuxClient(parentCtx context.Context, config *WsMuxConfig, logger *logr
 	client := &WsMuxTransport{
 		smuxConfig: &smux.Config{
 			Version:           config.MuxVersion,
+			KeepAliveDisabled: config.MuxKeepaliveDisabled,
 			KeepAliveInterval: 20 * time.Second,
 			KeepAliveTimeout:  40 * time.Second,
 			MaxFrameSize:      config.MaxFrameSize,
@@ -79,6 +86,7 @@ func NewWSMuxClient(parentCtx context.Context, config *WsMuxConfig, logger *logr
 		poolConnections: 0,
 		loadConnections: 0,
 		controlFlow:     make(chan struct{}, 100),
+		userAgent:       network.RandomUserAgent(),
 	}
 
 	return client
@@ -145,7 +153,7 @@ func (c *WsMuxTransport) channelDialer() {
 			return
 		default:
 
-			tunnelWSConn, err := network.WebSocketDialer(c.ctx, c.config.RemoteAddr, c.config.EdgeIP, network.NormalizeBasePath(c.config.Path)+"/channel", c.config.DialTimeOut, c.config.KeepAlive, true, c.config.Token, c.config.Mode, 3, 0, 0)
+			tunnelWSConn, err := network.WebSocketDialer(c.ctx, c.config.RemoteAddr, c.config.EdgeIP, network.NormalizeBasePath(c.config.Path)+"/channel", c.config.DialTimeOut, c.config.KeepAlive, true, c.config.Token, c.userAgent, c.config.Mode, 3, 0, 0)
 			if err != nil {
 				c.logger.Errorf("control channel dialer: %v", err)
 				time.Sleep(c.config.RetryInterval)
@@ -165,8 +173,19 @@ func (c *WsMuxTransport) channelDialer() {
 }
 
 func (c *WsMuxTransport) poolMaintainer() {
+	// Stagger the initial pool fill instead of firing every dial at once -
+	// a burst of ConnPoolSize near-simultaneous TLS handshakes to the same
+	// host is a distinctive connection pattern real browser traffic doesn't
+	// produce.
 	for i := 0; i < c.config.ConnPoolSize; i++ { //initial pool filling
 		go c.tunnelDialer()
+		if i < c.config.ConnPoolSize-1 {
+			select {
+			case <-c.ctx.Done():
+				return
+			case <-time.After(time.Duration(50+rand.Intn(200)) * time.Millisecond):
+			}
+		}
 	}
 
 	// factors
@@ -300,7 +319,7 @@ func (c *WsMuxTransport) tunnelDialer() {
 	c.logger.Debugf("initiating new %s tunnel connection to address %s", c.config.Mode, c.config.RemoteAddr)
 
 	// Dial to the tunnel server
-	tunnelWSConn, err := network.WebSocketDialer(c.ctx, c.config.RemoteAddr, c.config.EdgeIP, network.NormalizeBasePath(c.config.Path)+"/tunnel", c.config.DialTimeOut, c.config.KeepAlive, c.config.Nodelay, c.config.Token, c.config.Mode, 3, 2*1024*1024, 2*1024*1024)
+	tunnelWSConn, err := network.WebSocketDialer(c.ctx, c.config.RemoteAddr, c.config.EdgeIP, network.NormalizeBasePath(c.config.Path)+"/tunnel", c.config.DialTimeOut, c.config.KeepAlive, c.config.Nodelay, c.config.Token, c.userAgent, c.config.Mode, 3, 2*1024*1024, 2*1024*1024)
 	if err != nil {
 		c.logger.Errorf("tunnel server dialer: %v", err)
 
