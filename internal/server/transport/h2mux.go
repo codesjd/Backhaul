@@ -316,7 +316,12 @@ func (s *H2MuxTransport) tunnelListener() {
 				http.Error(w, "bad request", http.StatusBadRequest)
 				return
 			}
-			s.controlChannel.PushInbound(body)
+			seq, payload, ok := network.ParseH2SplitFrame(body)
+			if !ok {
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			s.controlChannel.PushInbound(seq, payload)
 			w.WriteHeader(http.StatusOK)
 
 		case strings.HasPrefix(r.URL.Path, tunnelPathPrefix) && r.Method == http.MethodGet:
@@ -373,7 +378,12 @@ func (s *H2MuxTransport) tunnelListener() {
 				http.Error(w, "bad request", http.StatusBadRequest)
 				return
 			}
-			if !conn.PushInbound(body) {
+			seq, payload, ok := network.ParseH2SplitFrame(body)
+			if !ok {
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			if !conn.PushInbound(seq, payload) {
 				http.Error(w, "closed", http.StatusGone)
 				return
 			}

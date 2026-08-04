@@ -4,15 +4,27 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"math/rand"
 	"net"
 	"net/http"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/http2"
 )
+
+// h2SplitMaxInFlight bounds how many upload POSTs a single h2mux/h2smux
+// connection keeps concurrently in flight. Each POST costs about one RTT
+// before smux would otherwise be able to consider the frame "sent"; without
+// concurrency, a chatty protocol carried over the tunnel (e.g. a TLS
+// handshake) pays that RTT on every single frame, serialized, which is
+// what made real application traffic fail even though bulk throughput
+// tests looked fine.
+const h2SplitMaxInFlight = 8
 
 // H2SplitDialerConfig carries what's needed to open one h2mux/h2smux
 // "connection": a long-lived GET for the download direction, plus a
@@ -33,8 +45,12 @@ type H2SplitDialerConfig struct {
 }
 
 // h2SplitClientConn is the client-side io.ReadWriteCloser: Read pulls from
-// the long-lived GET response body, Write issues a new bounded POST per
-// call over the same (connection-reusing) *http2.Transport.
+// the long-lived GET response body. Write hands data off to a bounded pool
+// of concurrent POSTs instead of blocking the caller (smux has one writer
+// goroutine per session, so a blocking Write would serialize every frame
+// of every multiplexed stream behind a full request/response round trip).
+// Each POST is tagged with a monotonic sequence number so the server can
+// restore the original order even if responses complete out of order.
 type h2SplitClientConn struct {
 	body   io.ReadCloser
 	tr     *http2.Transport
@@ -42,6 +58,13 @@ type h2SplitClientConn struct {
 	token  string
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	seq atomic.Uint64
+	sem chan struct{}
+	wg  sync.WaitGroup
+
+	errOnce sync.Once
+	err     atomic.Pointer[error]
 }
 
 func (c *h2SplitClientConn) Read(p []byte) (int, error) {
@@ -49,23 +72,55 @@ func (c *h2SplitClientConn) Read(p []byte) (int, error) {
 }
 
 func (c *h2SplitClientConn) Write(p []byte) (int, error) {
-	req, err := http.NewRequestWithContext(c.ctx, http.MethodPost, c.url, bytes.NewReader(p))
-	if err != nil {
-		return 0, err
+	if errPtr := c.err.Load(); errPtr != nil {
+		return 0, *errPtr
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.ContentLength = int64(len(p))
 
-	resp, err := c.tr.RoundTrip(req)
-	if err != nil {
-		return 0, err
+	seq := c.seq.Add(1) - 1
+	buf := make([]byte, 8+len(p))
+	binary.BigEndian.PutUint64(buf[:8], seq)
+	copy(buf[8:], p)
+
+	select {
+	case c.sem <- struct{}{}:
+	case <-c.ctx.Done():
+		return 0, c.ctx.Err()
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("unexpected status from h2 upload: %s", resp.Status)
-	}
-	io.Copy(io.Discard, resp.Body)
+
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		defer func() { <-c.sem }()
+
+		req, err := http.NewRequestWithContext(c.ctx, http.MethodPost, c.url, bytes.NewReader(buf))
+		if err != nil {
+			c.setErr(err)
+			return
+		}
+		req.Header.Set("Authorization", "Bearer "+c.token)
+		req.ContentLength = int64(len(buf))
+
+		resp, err := c.tr.RoundTrip(req)
+		if err != nil {
+			c.setErr(err)
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			c.setErr(fmt.Errorf("unexpected status from h2 upload: %s", resp.Status))
+			return
+		}
+		io.Copy(io.Discard, resp.Body)
+	}()
+
 	return len(p), nil
+}
+
+func (c *h2SplitClientConn) setErr(err error) {
+	c.errOnce.Do(func() {
+		c.err.Store(&err)
+		c.cancel()
+	})
 }
 
 func (c *h2SplitClientConn) Close() error {
@@ -161,6 +216,7 @@ func attemptH2SplitDial(ctx context.Context, cfg H2SplitDialerConfig, path strin
 		token:  cfg.Token,
 		ctx:    connCtx,
 		cancel: cancel,
+		sem:    make(chan struct{}, h2SplitMaxInFlight),
 	}, nil
 }
 
