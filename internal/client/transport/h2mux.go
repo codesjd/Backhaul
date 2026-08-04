@@ -155,6 +155,7 @@ func (c *H2MuxTransport) dialerConfig(soRcvBuf, soSndBuf int) network.H2SplitDia
 		Nodelay:            c.config.Nodelay,
 		SO_RCVBUF:          soRcvBuf,
 		SO_SNDBUF:          soSndBuf,
+		MaxFrameSize:       c.config.MaxFrameSize,
 	}
 }
 
