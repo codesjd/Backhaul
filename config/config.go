@@ -42,6 +42,7 @@ type ServerConfig struct {
 	SO_RCVBUF        int           `toml:"so_rcvbuf"`
 	SO_SNDBUF        int           `toml:"so_sndbuf"`
 	ProxyProtocol    bool          `toml:"proxy_protocol"`
+	Path             string        `toml:"path"`
 }
 
 // ClientConfig represents the configuration for the client.
@@ -70,6 +71,7 @@ type ClientConfig struct {
 	MSS              int           `toml:"mss"`
 	SO_RCVBUF        int           `toml:"so_rcvbuf"`
 	SO_SNDBUF        int           `toml:"so_sndbuf"`
+	Path             string        `toml:"path"`
 }
 
 // Config represents the complete configuration, including both server and client settings.

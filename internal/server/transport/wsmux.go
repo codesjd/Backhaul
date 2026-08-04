@@ -15,6 +15,7 @@ import (
 	"github.com/musix/backhaul/config" // for mode
 	"github.com/musix/backhaul/internal/utils"
 	"github.com/musix/backhaul/internal/utils/handlers"
+	"github.com/musix/backhaul/internal/utils/network"
 	"github.com/musix/backhaul/internal/web"
 	"github.com/xtaci/smux"
 
@@ -60,6 +61,7 @@ type WsMuxConfig struct {
 	WebPort          int
 	Mode             config.TransportType // ws or wss
 	ProxyProtocol    bool
+	Path             string
 }
 
 func NewWSMuxServer(parentCtx context.Context, config *WsMuxConfig, logger *logrus.Logger) *WsMuxTransport {
@@ -226,9 +228,12 @@ func (s *WsMuxTransport) channelHandler() {
 
 func (s *WsMuxTransport) tunnelListener() {
 	addr := s.config.BindAddr
+	basePath := network.NormalizeBasePath(s.config.Path)
+	channelPath := basePath + "/channel"
+	tunnelPathPrefix := basePath + "/tunnel"
 	upgrader := websocket.Upgrader{
-		ReadBufferSize:   16 * 1024,
-		WriteBufferSize:  16 * 1024,
+		ReadBufferSize:   64 * 1024,
+		WriteBufferSize:  64 * 1024,
 		HandshakeTimeout: 45 * time.Second,
 		CheckOrigin: func(r *http.Request) bool {
 			return true
@@ -256,7 +261,7 @@ func (s *WsMuxTransport) tunnelListener() {
 				return
 			}
 
-			if r.URL.Path == "/channel" {
+			if r.URL.Path == channelPath {
 				if s.controlChannel != nil {
 					s.logger.Warn("new control channel requested.")
 					s.controlChannel.Close()
@@ -285,7 +290,7 @@ func (s *WsMuxTransport) tunnelListener() {
 
 				s.config.TunnelStatus = fmt.Sprintf("Connected (%s)", s.config.Mode)
 
-			} else if strings.HasPrefix(r.URL.Path, "/tunnel") {
+			} else if strings.HasPrefix(r.URL.Path, tunnelPathPrefix) {
 				session, err := smux.Client(conn.NetConn(), s.smuxConfig)
 				if err != nil {
 					s.logger.Errorf("failed to create MUX session for connection %s: %v", conn.RemoteAddr().String(), err)

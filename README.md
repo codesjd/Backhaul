@@ -101,6 +101,7 @@ To start using the solution, you'll need to configure both server and client com
     sniffer_log ="/root/log.json" # Filename used to store network traffic and usage data logs. (optional, default backhaul.json)
     tls_cert = "/root/server.crt" # Path to the TLS certificate file for wss/wssmux. (mandatory).
     tls_key = "/root/server.key"  # Path to the TLS private key file for wss/wssmux. (mandatory).
+    path = ""                     # Custom base path prepended to the /channel and /tunnel endpoints, for ws/wss/wsmux/wssmux. (optional, default: none)
     log_level = "info"            # Log level ("panic", "fatal", "error", "warn", "info", "debug", "trace", optional, default: "info").
     skip_optz = true              # Skip optimizations performed by Backhaul (default: false)
     mss = 1360                    # TCP/TCPMux: Maximum Segment Size in bytes; controls max TCP payload size to avoid fragmentation. (default: system-defined)
@@ -134,6 +135,7 @@ To start using the solution, you'll need to configure both server and client com
    [client]  # Behind NAT, firewall-blocked
    remote_addr = "0.0.0.0:3080"  # Server address and port (mandatory).
    edge_ip = "188.114.96.0"      # Edge IP used for CDN connection, specifically for WebSocket-based transports.(Optional, default none)
+   path = ""                     # Custom base path prepended to the /channel and /tunnel endpoints, for ws/wss/wsmux/wssmux. Must match the server. (optional, default: none)
    transport = "tcp"             # Protocol to use ("tcp", "tcpmux", "ws", "wss", "wsmux", "wssmux". mandatory).
    token = "your_token"          # Authentication token for secure communication (optional).
    connection_pool = 8           # Number of pre-established connections.(optional, default: 8).
@@ -483,8 +485,6 @@ To start using the solution, you'll need to configure both server and client com
    log_level = "info"
    ```
 
-
-
 ## Generating a Self-Signed TLS Certificate with OpenSSL
 
 To generate a TLS certificate and key, you can use tools like OpenSSL. Here’s a step-by-step guide on how to create a self-signed certificate and key using OpenSSL:
@@ -578,7 +578,7 @@ journalctl -u backhaul.service -e -f
 * `tcp`: Use if you need straightforward TCP connections.
 * `tcpmux`: Use if you need to handle multiple sessions over a single connection.
 * `ws`: Use if you need to traverse HTTP-based firewalls or proxies.
-* `wss`: Use this for secure WebSocket connections that need to traverse HTTP-based firewalls or proxies. It encrypts data for added security, similar to WS but with encryption.
+* `wss`: Use this for secure WebSocket connections that need to traverse HTTP-based firewalls or proxies. It encrypts data for added security, similar to WS but with encryption. Its TLS ClientHello is generated with uTLS to mimic Chrome, for CDN edges/DPI that fingerprint the TLS handshake itself.
 
 
 ## Benchmark

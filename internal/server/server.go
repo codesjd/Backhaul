@@ -103,6 +103,7 @@ func (s *Server) Start() {
 			Mode:        s.config.Transport,
 			TLSCertFile: s.config.TLSCertFile,
 			TLSKeyFile:  s.config.TLSKeyFile,
+			Path:        s.config.Path,
 		}
 
 		wsServer := transport.NewWSServer(s.ctx, wsConfig, s.logger)
@@ -129,6 +130,7 @@ func (s *Server) Start() {
 			TLSCertFile:      s.config.TLSCertFile,
 			TLSKeyFile:       s.config.TLSKeyFile,
 			ProxyProtocol:    s.config.ProxyProtocol,
+			Path:             s.config.Path,
 		}
 
 		wsMuxServer := transport.NewWSMuxServer(s.ctx, wsMuxConfig, s.logger)
