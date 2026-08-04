@@ -18,13 +18,18 @@ import (
 )
 
 // h2SplitMaxInFlight bounds how many upload POSTs a single h2mux/h2smux
-// connection keeps concurrently in flight. Each POST costs about one RTT
-// before smux would otherwise be able to consider the frame "sent"; without
-// concurrency, a chatty protocol carried over the tunnel (e.g. a TLS
-// handshake) pays that RTT on every single frame, serialized, which is
-// what made real application traffic fail even though bulk throughput
-// tests looked fine.
-const h2SplitMaxInFlight = 8
+// connection keeps concurrently in flight. Each POST completes in roughly
+// one RTT regardless of concurrency, so the effective upload throughput
+// for small, frequent frames (protocol handshakes, interactive traffic -
+// as opposed to a handful of large bulk-transfer frames) is bounded by
+// roughly (h2SplitMaxInFlight * average frame size) / RTT. At 8 and a
+// ~100 byte average frame over a 100ms RTT link, that ceiling is only
+// ~8KB/s - fine for a bulk transfer dominated by big frames, but far too
+// low for a chatty protocol, which is what made real application traffic
+// (as opposed to the bulk-transfer tests this was first verified with)
+// look like it "connects but is unusably slow". Raised well above what
+// bulk transfers need so small-frame-heavy traffic isn't RTT-starved.
+const h2SplitMaxInFlight = 64
 
 // H2SplitDialerConfig carries what's needed to open one h2mux/h2smux
 // "connection": a long-lived GET for the download direction, plus a

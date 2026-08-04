@@ -42,8 +42,11 @@ type H2SplitConn struct {
 
 func NewH2SplitConn() *H2SplitConn {
 	return &H2SplitConn{
-		inbound:  make(chan []byte, 64),
-		outbound: make(chan []byte, 64),
+		// Sized to comfortably hold h2SplitMaxInFlight concurrent upload
+		// POSTs without the channel send in PushInbound applying backpressure
+		// before Read has a chance to drain it.
+		inbound:  make(chan []byte, 128),
+		outbound: make(chan []byte, 128),
 		closed:   make(chan struct{}),
 		pending:  make(map[uint64][]byte),
 	}
