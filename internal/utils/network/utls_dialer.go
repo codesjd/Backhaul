@@ -34,6 +34,12 @@ func UtlsDialTLS(ctx context.Context, dialAddr string, serverName string, insecu
 		InsecureSkipVerify: insecureSkipVerify,
 		NextProtos:         nextProtos,
 		ClientSessionCache: sessionCache,
+		// HelloChrome_Auto's canned spec doesn't carry a PSK/session-ticket
+		// extension, so uTLS has nowhere to place resumption data even
+		// though ClientSessionCache is set. Without this, uTLS panics
+		// instead of just falling back to a full handshake - resumption
+		// still kicks in on specs that do carry the extension.
+		PreferSkipResumptionOnNilExtension: true,
 	}
 
 	// The Chrome preset's canned spec carries its own hardcoded ALPN
