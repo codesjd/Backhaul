@@ -126,6 +126,8 @@ func (c *Client) Start() {
 			MaxStreamBuffer:      c.config.MaxStreamBuffer,
 			MuxKeepaliveDisabled: c.config.MuxKeepaliveDisabled,
 			StripeFactor:         c.config.StripeFactor,
+			SO_RCVBUF:            c.config.SO_RCVBUF,
+			SO_SNDBUF:            c.config.SO_SNDBUF,
 			Sniffer:              c.config.Sniffer,
 			WebPort:              c.config.WebPort,
 			SnifferLog:           c.config.SnifferLog,
