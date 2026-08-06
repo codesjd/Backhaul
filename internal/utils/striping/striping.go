@@ -7,11 +7,19 @@
 // a leg that stops responding gets detected and torn down instead of
 // hanging the whole connection forever.
 //
-// Both of those are handled here:
+// Three things are handled here:
 //   - Writes are handed to whichever leg is free next (a work-stealing
 //     queue), not round-robined blindly - a congested leg naturally gets
 //     fewer chunks instead of stalling the reorder buffer on the receiving
 //     end waiting for its share.
+//   - A congestionScheduler (scheduler.go) paces how many legs may be
+//     sending at once, backing off when per-chunk latency rises. Legs
+//     pooled through one CDN connection usually don't have independent
+//     capacity - they share one real bottleneck - and blindly driving all
+//     of them at once just adds contention/loss on that shared link
+//     instead of throughput. This lets the ensemble behave like fewer,
+//     better-behaved flows when that's what the link actually calls for,
+//     while still using full parallelism when there's genuine headroom.
 //   - Every leg write carries a deadline, and Read gives up waiting for a
 //     missing sequence number after stallTimeout. Either one closes the
 //     whole Conn (all legs), which unblocks the other direction's I/O too,
@@ -64,6 +72,7 @@ type Conn struct {
 	wmu        sync.Mutex // guards writeSeq only; queueing itself is lock-free via the channel
 	writeSeq   uint32
 	writeQueue chan writeJob
+	sched      *congestionScheduler
 
 	// rmu guards only the reassembly state below (nextSeq/pending/readBuf)
 	// and is held for as long as Read blocks waiting on the network. permErr
@@ -101,8 +110,10 @@ func New(legs []net.Conn, chunkSize int) *Conn {
 		chunkCh:      make(chan chunk, len(legs)*4),
 		errCh:        make(chan error, len(legs)),
 		writeQueue:   make(chan writeJob, len(legs)*2),
+		sched:        newCongestionScheduler(len(legs)),
 		closed:       make(chan struct{}),
 	}
+	go c.sched.run(c.closed)
 	for _, leg := range legs {
 		go c.readLeg(leg)
 		go c.writeLeg(leg)
@@ -141,6 +152,12 @@ func (c *Conn) readLeg(leg net.Conn) {
 // comes back for more sooner, so faster/less congested legs naturally end
 // up carrying more of the flow instead of every leg getting a fixed,
 // round-robined share regardless of how quickly it can move it.
+//
+// Before actually sending, it waits for a slot from sched: on a link where
+// the legs are truly independent, cwnd stays maxed out and this never
+// blocks meaningfully. On a shared bottleneck, sched throttles how many
+// legs are allowed to be pushing at once, based on observed latency,
+// instead of letting all of them race the same queue unthrottled.
 func (c *Conn) writeLeg(leg net.Conn) {
 	header := make([]byte, headerSize)
 	for {
@@ -151,7 +168,13 @@ func (c *Conn) writeLeg(leg net.Conn) {
 			return
 		}
 
+		if !c.sched.acquire(c.closed) {
+			return // Conn is closing
+		}
+
+		start := time.Now()
 		if err := leg.SetWriteDeadline(time.Now().Add(c.stallTimeout)); err != nil {
+			c.sched.release(c.stallTimeout)
 			c.fail(err)
 			return
 		}
@@ -160,15 +183,18 @@ func (c *Conn) writeLeg(leg net.Conn) {
 		binary.BigEndian.PutUint32(header[4:8], uint32(len(job.data)))
 
 		if _, err := leg.Write(header); err != nil {
+			c.sched.release(time.Since(start))
 			c.fail(err)
 			return
 		}
 		if len(job.data) > 0 {
 			if _, err := leg.Write(job.data); err != nil {
+				c.sched.release(time.Since(start))
 				c.fail(err)
 				return
 			}
 		}
+		c.sched.release(time.Since(start))
 	}
 }
 
@@ -321,6 +347,7 @@ func (c *Conn) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
 		close(c.closed)
+		c.sched.stop()
 		for _, leg := range c.legs {
 			if e := leg.Close(); e != nil {
 				err = e

@@ -229,3 +229,112 @@ func TestStripedUnevenLegSpeeds(t *testing.T) {
 		t.Fatalf("reassembled payload mismatch under uneven leg speeds (got %d bytes, want %d)", len(got), len(payload))
 	}
 }
+
+// sharedLimiter is a token bucket shared across several wrapped conns, so
+// their combined write rate - not each one individually - is capped. This
+// is what actually distinguishes "N legs with independent capacity" from
+// "N legs contending for one real bottleneck": with independent per-leg
+// limiters every leg would just proceed at its own pace; a *shared* limiter
+// is the only way to reproduce legs genuinely competing for one pipe.
+type sharedLimiter struct {
+	mu          sync.Mutex
+	bytesPerSec float64
+	tokens      float64
+	last        time.Time
+}
+
+func newSharedLimiter(bytesPerSec float64) *sharedLimiter {
+	return &sharedLimiter{bytesPerSec: bytesPerSec, tokens: bytesPerSec, last: time.Now()}
+}
+
+func (l *sharedLimiter) wait(n int) {
+	l.mu.Lock()
+	now := time.Now()
+	l.tokens += now.Sub(l.last).Seconds() * l.bytesPerSec
+	l.last = now
+	if l.tokens > l.bytesPerSec {
+		l.tokens = l.bytesPerSec // cap burst to ~1s worth
+	}
+
+	need := float64(n) - l.tokens
+	if need <= 0 {
+		l.tokens -= float64(n)
+		l.mu.Unlock()
+		return
+	}
+	wait := time.Duration(need / l.bytesPerSec * float64(time.Second))
+	l.tokens = 0
+	// Fast-forward the token clock to the point where this deficit will
+	// have naturally been paid off. Without this, l.last stays stamped at
+	// the *start* of this wait, so the next call's elapsed-time credit
+	// double-counts the interval this call already spent sleeping to earn
+	// it - which doubles the effective rate instead of enforcing it.
+	l.last = l.last.Add(wait)
+	l.mu.Unlock()
+	time.Sleep(wait)
+}
+
+type limitedConn struct {
+	net.Conn
+	limiter *sharedLimiter
+}
+
+func (lc *limitedConn) Write(p []byte) (int, error) {
+	lc.limiter.wait(len(p))
+	return lc.Conn.Write(p)
+}
+
+// TestStripedSharedBottleneck exercises the actual scenario the congestion
+// scheduler exists for: legs that don't have independent capacity, but all
+// contend for one real shared link. It doesn't assert a throughput number
+// (that's exactly the kind of thing that's flaky in CI) - it asserts what
+// actually matters: the transfer still completes correctly, and it does so
+// within a sane bound instead of the scheduler mismanaging itself into a
+// stall under contention.
+func TestStripedSharedBottleneck(t *testing.T) {
+	const legCount = 4
+	clientLegs, serverLegs := pipePair(legCount)
+
+	limiter := newSharedLimiter(300 * 1024) // ~300 KB/s combined, however many legs pull from it
+	for i := range clientLegs {
+		clientLegs[i] = &limitedConn{Conn: clientLegs[i], limiter: limiter}
+	}
+
+	client := New(clientLegs, 8*1024)
+	server := New(serverLegs, 8*1024)
+	defer client.Close()
+	defer server.Close()
+
+	payload := make([]byte, 512*1024)
+	rand.Read(payload)
+
+	writeErrCh := make(chan error, 1)
+	go func() {
+		_, err := client.Write(payload)
+		writeErrCh <- err
+	}()
+
+	readDone := make(chan struct{})
+	var got []byte
+	var readErr error
+	go func() {
+		got, readErr = io.ReadAll(io.LimitReader(server, int64(len(payload))))
+		close(readDone)
+	}()
+
+	select {
+	case <-readDone:
+	case <-time.After(15 * time.Second):
+		t.Fatal("transfer over a shared, rate-limited bottleneck did not complete in time")
+	}
+
+	if readErr != nil {
+		t.Fatalf("read: %v", readErr)
+	}
+	if err := <-writeErrCh; err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("reassembled payload mismatch over shared bottleneck (got %d bytes, want %d)", len(got), len(payload))
+	}
+}
