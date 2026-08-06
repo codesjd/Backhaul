@@ -124,6 +124,7 @@ func (s *Server) Start() {
 			MaxReceiveBuffer:     s.config.MaxReceiveBuffer,
 			MaxStreamBuffer:      s.config.MaxStreamBuffer,
 			MuxKeepaliveDisabled: s.config.MuxKeepaliveDisabled,
+			StripeFactor:         s.config.StripeFactor,
 			Sniffer:              s.config.Sniffer,
 			WebPort:              s.config.WebPort,
 			SnifferLog:           s.config.SnifferLog,

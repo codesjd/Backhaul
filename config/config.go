@@ -30,6 +30,7 @@ type ServerConfig struct {
 	MaxReceiveBuffer     int           `toml:"mux_recievebuffer"`
 	MaxStreamBuffer      int           `toml:"mux_streambuffer"`
 	MuxKeepaliveDisabled bool          `toml:"mux_keepalive_disabled"`
+	StripeFactor         int           `toml:"mux_stripe"`
 	Sniffer              bool          `toml:"sniffer"`
 	WebPort              int           `toml:"web_port"`
 	SnifferLog           string        `toml:"sniffer_log"`
@@ -63,6 +64,7 @@ type ClientConfig struct {
 	MaxReceiveBuffer     int           `toml:"mux_recievebuffer"`
 	MaxStreamBuffer      int           `toml:"mux_streambuffer"`
 	MuxKeepaliveDisabled bool          `toml:"mux_keepalive_disabled"`
+	StripeFactor         int           `toml:"mux_stripe"`
 	Sniffer              bool          `toml:"sniffer"`
 	WebPort              int           `toml:"web_port"`
 	SnifferLog           string        `toml:"sniffer_log"`

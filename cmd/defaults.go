@@ -23,6 +23,7 @@ const ( // Default values
 	defaultMaxStreamBuffer  = 65536   // 256KB
 	defaultSnifferLog       = "backhaul.json"
 	defaultMuxCon           = 8
+	defaultMuxStripe        = 1 // 1 disables striping - one flow, one connection
 )
 
 func applyDefaults(cfg *config.Config) {
@@ -128,5 +129,15 @@ func applyDefaults(cfg *config.Config) {
 	// Mux concurrancy
 	if cfg.Server.MuxCon < 1 {
 		cfg.Server.MuxCon = defaultMuxCon
+	}
+
+	// Stripe factor - how many pooled connections a single flow is split
+	// across. 1 (the default) leaves the original one-flow-one-connection
+	// behavior untouched.
+	if cfg.Server.StripeFactor < 1 {
+		cfg.Server.StripeFactor = defaultMuxStripe
+	}
+	if cfg.Client.StripeFactor < 1 {
+		cfg.Client.StripeFactor = defaultMuxStripe
 	}
 }

@@ -145,6 +145,50 @@ func ReceiveBinaryTransportString(conn interface{}) (string, byte, error) {
 	return string(messageBuf), transport, nil
 }
 
+// SendStripeHeader identifies which striped group a freshly opened stream
+// belongs to: groupID correlates legs opened for the same logical
+// connection, index/total let the receiver know how many legs to wait for
+// before it can assemble them, and remoteAddr is carried once per leg since
+// every leg is otherwise indistinguishable from a plain tunnel stream.
+func SendStripeHeader(conn net.Conn, groupID uint32, index, total uint8, remoteAddr string) error {
+	const headerSize = 4 + 1 + 1 + 2 // groupID + index + total + addr length
+	buf := make([]byte, headerSize+len(remoteAddr))
+
+	binary.BigEndian.PutUint32(buf[0:4], groupID)
+	buf[4] = index
+	buf[5] = total
+	binary.BigEndian.PutUint16(buf[6:8], uint16(len(remoteAddr)))
+	copy(buf[8:], remoteAddr)
+
+	if _, err := conn.Write(buf); err != nil {
+		return fmt.Errorf("failed to send stripe header: %w", err)
+	}
+	return nil
+}
+
+// ReceiveStripeHeader reads a header written by SendStripeHeader.
+func ReceiveStripeHeader(conn net.Conn) (groupID uint32, index, total uint8, remoteAddr string, err error) {
+	const headerSize = 4 + 1 + 1 + 2
+	head := make([]byte, headerSize)
+	if _, err = io.ReadFull(conn, head); err != nil {
+		return 0, 0, 0, "", fmt.Errorf("failed to read stripe header: %w", err)
+	}
+
+	groupID = binary.BigEndian.Uint32(head[0:4])
+	index = head[4]
+	total = head[5]
+	addrLen := binary.BigEndian.Uint16(head[6:8])
+
+	addrBuf := make([]byte, addrLen)
+	if addrLen > 0 {
+		if _, err = io.ReadFull(conn, addrBuf); err != nil {
+			return 0, 0, 0, "", fmt.Errorf("failed to read stripe header address: %w", err)
+		}
+	}
+
+	return groupID, index, total, string(addrBuf), nil
+}
+
 // SendPort sends the port number as a 2-byte big-endian unsigned integer.
 func SendBinaryInt(conn net.Conn, port uint16) error {
 	// Create a 2-byte slice to hold the port number

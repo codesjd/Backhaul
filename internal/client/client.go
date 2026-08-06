@@ -125,6 +125,7 @@ func (c *Client) Start() {
 			MaxReceiveBuffer:     c.config.MaxReceiveBuffer,
 			MaxStreamBuffer:      c.config.MaxStreamBuffer,
 			MuxKeepaliveDisabled: c.config.MuxKeepaliveDisabled,
+			StripeFactor:         c.config.StripeFactor,
 			Sniffer:              c.config.Sniffer,
 			WebPort:              c.config.WebPort,
 			SnifferLog:           c.config.SnifferLog,
