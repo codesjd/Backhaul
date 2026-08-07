@@ -53,6 +53,7 @@ type WsConfig struct {
 	Mode         config.TransportType // ws or wss
 	Path         string
 	Fallback     string // decoy backend for non-tunnel requests (host:port), optional
+	TLSEngine    string // "go" (default) or "openssl" for wss TLS termination
 }
 
 func NewWSServer(parentCtx context.Context, config *WsConfig, logger *logrus.Logger) *WsTransport {
@@ -315,11 +316,19 @@ func (s *WsTransport) tunnelListener() {
 		}()
 	} else {
 		go func() {
-			s.logger.Infof("wss server starting, listening on %s", addr)
+			engine := s.config.TLSEngine
+			if engine == "" {
+				engine = network.TLSEngineGo
+			}
+			s.logger.Infof("wss server starting, listening on %s (tls engine: %s)", addr, engine)
 			if s.controlChannel == nil {
 				s.logger.Info("waiting for wss control channel connection")
 			}
-			if err := server.ListenAndServeTLS(s.config.TLSCertFile, s.config.TLSKeyFile); err != nil && err != http.ErrServerClosed {
+			ln, err := network.NewTLSListener(s.config.TLSEngine, addr, s.config.TLSCertFile, s.config.TLSKeyFile)
+			if err != nil {
+				s.logger.Fatalf("failed to create tls listener on %s: %v", addr, err)
+			}
+			if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
 				s.logger.Fatalf("failed to listen on %s: %v", addr, err)
 			}
 		}()

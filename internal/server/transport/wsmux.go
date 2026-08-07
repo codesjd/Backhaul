@@ -77,6 +77,7 @@ type WsMuxConfig struct {
 	MuxKeepaliveDisabled bool
 	StripeFactor         int
 	Fallback             string // decoy backend for non-tunnel requests (host:port), optional
+	TLSEngine            string // "go" (default) or "openssl" for wssmux TLS termination
 }
 
 func NewWSMuxServer(parentCtx context.Context, config *WsMuxConfig, logger *logrus.Logger) *WsMuxTransport {
@@ -366,11 +367,19 @@ func (s *WsMuxTransport) tunnelListener() {
 		}()
 	} else {
 		go func() {
-			s.logger.Infof("%s server starting, listening on %s", s.config.Mode, addr)
+			engine := s.config.TLSEngine
+			if engine == "" {
+				engine = network.TLSEngineGo
+			}
+			s.logger.Infof("%s server starting, listening on %s (tls engine: %s)", s.config.Mode, addr, engine)
 			if s.controlChannel == nil {
 				s.logger.Infof("waiting for %s control channel connection", s.config.Mode)
 			}
-			if err := server.ListenAndServeTLS(s.config.TLSCertFile, s.config.TLSKeyFile); err != nil && err != http.ErrServerClosed {
+			ln, err := network.NewTLSListener(s.config.TLSEngine, addr, s.config.TLSCertFile, s.config.TLSKeyFile)
+			if err != nil {
+				s.logger.Fatalf("failed to create tls listener on %s: %v", addr, err)
+			}
+			if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
 				s.logger.Fatalf("failed to listen on %s: %v", addr, err)
 			}
 		}()

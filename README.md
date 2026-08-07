@@ -105,6 +105,7 @@ To start using the solution, you'll need to configure both server and client com
     tls_key = "/root/server.key"  # Path to the TLS private key file for wss/wssmux. (mandatory).
     path = ""                     # Custom base path prepended to the /channel and /tunnel endpoints, for ws/wss/wsmux/wssmux. (optional, default: none)
     fallback = ""                 # ws/wss/wsmux/wssmux: host:port of a decoy web backend. Requests that aren't valid tunnel traffic (wrong/absent token, or any non-tunnel path such as "/") are reverse-proxied here instead of getting a 401, so a single backhaul origin can carry the tunnel under a secret path AND look like an ordinary website to probes - no separate nginx needed in the data path. e.g. "127.0.0.1:8080". (optional, default: none)
+    tls_engine = "go"             # wss/wssmux: TLS stack that terminates the connection. "go" (default) uses Go's crypto/tls and keeps the pure-Go static binary. "openssl" terminates with the system OpenSSL so the server's TLS handshake fingerprint matches a same-version nginx (Go's stack e.g. always picks AES-128-GCM for TLS 1.3 where nginx/OpenSSL picks AES-256-GCM). "openssl" ONLY works in a binary built with `-tags openssl` (CGO_ENABLED=1); see the OpenSSL build note. Use it when the origin IP is directly reachable and could be fingerprinted. (optional, default: "go")
     log_level = "info"            # Log level ("panic", "fatal", "error", "warn", "info", "debug", "trace", optional, default: "info").
     skip_optz = true              # Skip optimizations performed by Backhaul (default: false)
     mss = 1360                    # TCP/TCPMux: Maximum Segment Size in bytes; controls max TCP payload size to avoid fragmentation. (default: system-defined)
@@ -621,6 +622,31 @@ Run your decoy web server on `127.0.0.1:8080` (a tiny static site is fine). Now:
 * A probe/crawler/browser hitting `/` (or any other path, or without the token) is reverse-proxied to the decoy and sees a normal website - the same camouflage nginx gave you, minus the 401 tell.
 
 Because the tunnel bytes now flow **straight through backhaul** instead of being copied by an extra nginx hop, this is the change that most directly frees a CPU core on a low-core box. The decoy traffic still passes through a local server, but that's a negligible trickle - the 1Gbps of tunnel traffic no longer touches it. (Path-based camouflage inherently needs an L7/TLS-terminating router; `fallback` just makes backhaul be that router instead of a separate nginx.)
+
+**Q: If backhaul terminates TLS itself, doesn't its handshake fingerprint differ from nginx's - and give it away to a censor probing my origin directly?**
+
+Yes - and that's a real limitation of the default build, worth being precise about. When backhaul terminates `wss`/`wssmux` with Go's `crypto/tls`, its ServerHello differs from nginx's: most concretely, for TLS 1.3 Go's stack always selects `AES-128-GCM` when AES-NI is present and does not expose TLS 1.3 ciphersuite ordering, whereas nginx (OpenSSL) selects `AES-256-GCM`. A censor who can reach your origin IP directly (e.g. because it also serves users on another port) can fingerprint that difference.
+
+Two things determine whether it matters:
+
+* **If your origin is only reachable through a CDN** (its real IP isn't exposed), the censor sees the CDN's TLS, not backhaul's - so the default Go engine is fine and none of the below is needed.
+* **If your origin IP is directly reachable**, use the OpenSSL TLS engine: set `tls_engine = "openssl"` and run a binary built with OpenSSL. Because it terminates with the *same* OpenSSL library nginx links, the ServerHello - cipher selection and extension order - matches nginx's. (`internal/utils/network` ships a test that asserts the OpenSSL engine negotiates `TLS_AES_256_GCM_SHA384` exactly like nginx while the Go engine negotiates `TLS_AES_128_GCM_SHA256`.)
+
+Honest caveats for the OpenSSL engine:
+
+* It requires cgo, so the binary is **no longer a pure-Go static one**: build with `CGO_ENABLED=1 go build -tags openssl`, and the target servers need a compatible `libssl` installed. Build against and run on the **same OpenSSL major version** your nginx uses for the closest match.
+* nginx's `http2` directive also advertises `h2` in ALPN; this listener speaks HTTP/1.1 only (the WebSocket tunnel needs it), so for tightest parity drop `http2` from any nginx you compare against.
+* It closes the biggest, directly-observable gap (the TLS 1.3 cipher), but "byte-identical to nginx in every respect" is not a claim to lean on - verify your own setup with a fingerprinting tool (e.g. JARM) against a real nginx before relying on it.
+
+Building the OpenSSL variant:
+
+```bash
+# needs a C toolchain and libssl headers, e.g. on Debian/Ubuntu:
+#   apt-get install -y gcc libssl-dev
+CGO_ENABLED=1 go build -tags openssl -o backhaul .
+```
+
+The default `go build` (and the released binaries) remain pure-Go and static; `tls_engine = "openssl"` in one of those exits with a clear error rather than silently downgrading.
 
 **Q: My link is high-latency / intercontinental and throughput stalls well below the line rate even though CPU is fine. What helps?**
 
