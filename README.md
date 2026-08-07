@@ -157,7 +157,7 @@ To start using the solution, you'll need to configure both server and client com
    sniffer_log ="/root/log.json" # Filename used to store network traffic and usage data logs. (optional, default backhaul.json)
    log_level = "info"            # Log level ("panic", "fatal", "error", "warn", "info", "debug", "trace", optional, default: "info").
    skip_optz = true              # Skip optimizations performed by Backhaul (default: false)
-   mss = 1360                    # TCP/TCPMux: Maximum Segment Size in bytes; controls max TCP payload size to avoid fragmentation. (default: system-defined)
+   mss = 1360                    # TCP/TCPMux/WS/WSS/WSMux/WSSMux (client): Maximum Segment Size in bytes; controls max TCP payload size to avoid fragmentation. Previously silently ignored for ws/wss/wsmux/wssmux - now respected the same as TCP/TCPMux. (default: system-defined)
    so_rcvbuf = 1048576           # TCP/TCPMux/WS/WSS/WSMux/WSSMux (client): Socket receive buffer size (bytes) for the pool/tunnel connections; larger buffer allows higher throughput on receive side. Previously silently ignored for ws/wss/wsmux/wssmux, which always used a fixed 1MB or 2MB regardless of this setting - now respected the same as TCP/TCPMux. (default: system-defined)
    so_sndbuf = 4194304           # TCP/TCPMux/WS/WSS/WSMux/WSSMux (client): Socket send buffer size (bytes) for the pool/tunnel connections; controls send queue size to manage outgoing data flow. Same ws/wss/wsmux/wssmux caveat as so_rcvbuf above. (default: system-defined)
    ```
