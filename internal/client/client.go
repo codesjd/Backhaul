@@ -109,6 +109,7 @@ func (c *Client) Start() {
 			Path:           c.config.Path,
 			SO_RCVBUF:      c.config.SO_RCVBUF,
 			SO_SNDBUF:      c.config.SO_SNDBUF,
+			MSS:            c.config.MSS,
 		}
 		WsClient := transport.NewWSClient(c.ctx, WsConfig, c.logger)
 		go WsClient.Start()
@@ -130,6 +131,7 @@ func (c *Client) Start() {
 			StripeFactor:         c.config.StripeFactor,
 			SO_RCVBUF:            c.config.SO_RCVBUF,
 			SO_SNDBUF:            c.config.SO_SNDBUF,
+			MSS:                  c.config.MSS,
 			Sniffer:              c.config.Sniffer,
 			WebPort:              c.config.WebPort,
 			SnifferLog:           c.config.SnifferLog,

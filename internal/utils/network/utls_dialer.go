@@ -23,8 +23,8 @@ var sessionCache = utls.NewLRUClientSessionCache(128)
 // outbound TLS fingerprint (JA3/JA4) blends in with real browser traffic
 // instead of standing out as Go's crypto/tls default, which is a known DPI
 // signal distinct from the CDN's usual traffic.
-func UtlsDialTLS(ctx context.Context, dialAddr string, serverName string, insecureSkipVerify bool, nextProtos []string, timeout time.Duration, keepAlive time.Duration, nodelay bool, SO_RCVBUF int, SO_SNDBUF int) (net.Conn, error) {
-	rawConn, err := TcpDialer(ctx, dialAddr, "", timeout, keepAlive, nodelay, 1, SO_RCVBUF, SO_SNDBUF, 0)
+func UtlsDialTLS(ctx context.Context, dialAddr string, serverName string, insecureSkipVerify bool, nextProtos []string, timeout time.Duration, keepAlive time.Duration, nodelay bool, SO_RCVBUF int, SO_SNDBUF int, mss int) (net.Conn, error) {
+	rawConn, err := TcpDialer(ctx, dialAddr, "", timeout, keepAlive, nodelay, 1, SO_RCVBUF, SO_SNDBUF, mss)
 	if err != nil {
 		return nil, err
 	}
