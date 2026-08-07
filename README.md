@@ -584,13 +584,19 @@ journalctl -u backhaul.service -e -f
 * `ws`: Use if you need to traverse HTTP-based firewalls or proxies.
 * `wss`: Use this for secure WebSocket connections that need to traverse HTTP-based firewalls or proxies. It encrypts data for added security, similar to WS but with encryption. Its TLS ClientHello is generated with uTLS to mimic Chrome, for CDN edges/DPI that fingerprint the TLS handshake itself.
 
-**Q: My CPU saturates (~95%) on a low-core box and I can't reach line rate (e.g. 1Gbps), especially when combined with nginx / another proxy in front. Why?**
+**Q: My CPU saturates (~95%) on a low-core box and I can't reach line rate (e.g. 1Gbps). Why, and what actually helps?**
 
-On these boxes the CPU cost is almost entirely **encryption**, not moving bytes - and it is easy to encrypt the same bytes two or three times without realizing it:
+On these boxes the per-byte CPU cost is almost entirely **TLS/AES**, not moving bytes. The right fix depends on whether you're free to choose the transport or locked into WebSocket-over-TLS by a CDN.
 
-* If the payload carried through the tunnel is **already encrypted** by whatever runs on top of it (e.g. an xray/VLESS/Reality inbound, or nginx terminating TLS), then running the backhaul tunnel itself as `wss`/`wssmux` wraps that ciphertext in **another** TLS layer. That second (or third) AES pass is what pins the CPU. It adds CPU cost but no additional confidentiality.
-* Prefer `tcp` or `tcpmux` for the tunnel when the payload is already encrypted end-to-end. With `tcp`/`tcpmux` both ends of each forwarded connection are raw `*net.TCPConn`, so the data pump routes straight to `splice(2)` on Linux - bytes move kernel-side without ever entering this process, so backhaul's own per-byte CPU cost is effectively zero. `wss`/`wssmux` cannot take that path (one end is always a TLS/WebSocket/smux stream).
-* If nginx is only in front for TLS/camouflage that the upstream (e.g. Reality) already provides, put it in **L4 passthrough** mode (`stream {}` with `proxy_pass`, no `ssl` termination) or drop it from the hot path - a TLS-terminating nginx is a full extra AES pass per byte.
+*If you control both ends and don't need a CDN/HTTP front:* prefer `tcp` or `tcpmux`. With those, both ends of each forwarded connection are raw `*net.TCPConn`, so the data pump routes straight to `splice(2)` on Linux - bytes move kernel-side without ever entering this process, so backhaul's own per-byte CPU cost is effectively zero (`ws`/`wss`/`wsmux`/`wssmux` cannot take that path). And don't wrap already-encrypted traffic (e.g. an xray/VLESS/Reality payload) in a second TLS layer - that extra AES pass costs CPU without adding confidentiality.
+
+*If you're behind a CDN (Cloudflare, etc.) and must use `ws`/`wss`/`wsmux`/`wssmux` for obfuscation:* `tcp` and `splice` are off the table, so the levers are:
+
+* **Check AES-NI first:** `grep -m1 -o aes /proc/cpuinfo`. Cheap VPS instances often don't expose it to the guest, and without it TLS termination is several times more expensive - frequently the entire reason a 2-core box stalls below 1Gbps. If it's present, make sure the negotiated cipher is AES-GCM (hardware-accelerated) rather than ChaCha20.
+* **Don't terminate TLS twice on your own box.** If an `nginx` in front already terminates the CDN-origin TLS and then proxies plaintext to backhaul, run backhaul as `ws`/`wsmux` (not `wss`/`wssmux`) so backhaul doesn't re-encrypt. That's already one TLS pass, on nginx, which is correct. To remove even that pass, let backhaul terminate `wss`/`wssmux` directly as the CDN origin and drop nginx from the tunnel path - at the cost of any decoy site nginx was serving on the same port for camouflage.
+* **Trim nginx waste on the tunnel vhost:** `access_log off;`, `gzip off;`, `ssl_protocols TLSv1.2 TLSv1.3;` only, and `worker_cpu_affinity auto;` so workers spread across every core. Keep `proxy_buffering off;` - that's correct for a streamed tunnel.
+* **`mux_*` settings only apply to the mux transports.** On plain `ws`/`wss` (and `tcp`), `mux_con`, `mux_framesize`, `mux_recievebuffer`, `mux_streambuffer` and `mux_stripe` are silently ignored - each forwarded connection is its own WebSocket. If you set large mux buffers expecting them to take effect, switch the transport to `wsmux`/`wssmux` (still just WebSocket-over-TLS, so it passes through a CDN exactly like `ws`/`wss`).
+* **If one core is pinned while the other is idle** (a single big flow bottlenecked on one connection's copy/decrypt), the mux transports' `mux_stripe = N` splits that one flow across N pooled connections so it can use more than one core. If *both* cores are already saturated (aggregate-bound), striping won't help - you're out of CPU, so reduce per-byte cost with the points above instead.
 
 **Q: My link is high-latency / intercontinental and throughput stalls well below the line rate even though CPU is fine. What helps?**
 
