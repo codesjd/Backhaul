@@ -104,6 +104,7 @@ To start using the solution, you'll need to configure both server and client com
     tls_cert = "/root/server.crt" # Path to the TLS certificate file for wss/wssmux. (mandatory).
     tls_key = "/root/server.key"  # Path to the TLS private key file for wss/wssmux. (mandatory).
     path = ""                     # Custom base path prepended to the /channel and /tunnel endpoints, for ws/wss/wsmux/wssmux. (optional, default: none)
+    fallback = ""                 # ws/wss/wsmux/wssmux: host:port of a decoy web backend. Requests that aren't valid tunnel traffic (wrong/absent token, or any non-tunnel path such as "/") are reverse-proxied here instead of getting a 401, so a single backhaul origin can carry the tunnel under a secret path AND look like an ordinary website to probes - no separate nginx needed in the data path. e.g. "127.0.0.1:8080". (optional, default: none)
     log_level = "info"            # Log level ("panic", "fatal", "error", "warn", "info", "debug", "trace", optional, default: "info").
     skip_optz = true              # Skip optimizations performed by Backhaul (default: false)
     mss = 1360                    # TCP/TCPMux: Maximum Segment Size in bytes; controls max TCP payload size to avoid fragmentation. (default: system-defined)
@@ -593,10 +594,33 @@ On these boxes the per-byte CPU cost is almost entirely **TLS/AES**, not moving 
 *If you're behind a CDN (Cloudflare, etc.) and must use `ws`/`wss`/`wsmux`/`wssmux` for obfuscation:* `tcp` and `splice` are off the table, so the levers are:
 
 * **Check AES-NI first:** `grep -m1 -o aes /proc/cpuinfo`. Cheap VPS instances often don't expose it to the guest, and without it TLS termination is several times more expensive - frequently the entire reason a 2-core box stalls below 1Gbps. If it's present, make sure the negotiated cipher is AES-GCM (hardware-accelerated) rather than ChaCha20.
-* **Don't terminate TLS twice on your own box.** If an `nginx` in front already terminates the CDN-origin TLS and then proxies plaintext to backhaul, run backhaul as `ws`/`wsmux` (not `wss`/`wssmux`) so backhaul doesn't re-encrypt. That's already one TLS pass, on nginx, which is correct. To remove even that pass, let backhaul terminate `wss`/`wssmux` directly as the CDN origin and drop nginx from the tunnel path - at the cost of any decoy site nginx was serving on the same port for camouflage.
+* **Get nginx out of the tunnel's data path** - it's usually the real bottleneck. When nginx fronts the tunnel to serve a decoy site under the same hostname (path-based camouflage), it must terminate TLS and reverse-proxy the WebSocket, and it has **no zero-copy path for a proxied WebSocket** - it copies every byte in userspace, burning roughly a core per Gbps. On a 2-core box, a single ~1Gbps flow then eats one core in nginx and another in backhaul, saturating both. Point the CDN/origin **straight at backhaul** (`transport = "wss"`/`"wssmux"`, backhaul terminates the origin TLS itself) and let the `fallback` option (below) preserve the decoy - so the camouflage stays but nginx no longer copies the tunnel's bytes.
 * **Trim nginx waste on the tunnel vhost:** `access_log off;`, `gzip off;`, `ssl_protocols TLSv1.2 TLSv1.3;` only, and `worker_cpu_affinity auto;` so workers spread across every core. Keep `proxy_buffering off;` - that's correct for a streamed tunnel.
 * **`mux_*` settings only apply to the mux transports.** On plain `ws`/`wss` (and `tcp`), `mux_con`, `mux_framesize`, `mux_recievebuffer`, `mux_streambuffer` and `mux_stripe` are silently ignored - each forwarded connection is its own WebSocket. If you set large mux buffers expecting them to take effect, switch the transport to `wsmux`/`wssmux` (still just WebSocket-over-TLS, so it passes through a CDN exactly like `ws`/`wss`).
 * **If one core is pinned while the other is idle** (a single big flow bottlenecked on one connection's copy/decrypt), the mux transports' `mux_stripe = N` splits that one flow across N pooled connections so it can use more than one core. If *both* cores are already saturated (aggregate-bound), striping won't help - you're out of CPU, so reduce per-byte cost with the points above instead.
+
+**Q: But I need the decoy site for obfuscation - that's why nginx is there. How do I drop it without losing camouflage?**
+
+Use the server's `fallback` option so backhaul itself is the CDN origin and plays both roles:
+
+```toml
+[server]
+bind_addr = "0.0.0.0:443"          # backhaul is the origin, terminates TLS itself
+transport = "wss"                  # or "wssmux"
+tls_cert = "/root/certs/site.crt"  # reuse the cert nginx was using
+tls_key  = "/root/certs/site.key"
+path = "/your-secret-path"         # tunnel lives here
+fallback = "127.0.0.1:8080"        # everything else -> your decoy site
+token = "..."
+ports = ["..."]
+```
+
+Run your decoy web server on `127.0.0.1:8080` (a tiny static site is fine). Now:
+
+* A real WebSocket client with the token, hitting `path`, gets the tunnel.
+* A probe/crawler/browser hitting `/` (or any other path, or without the token) is reverse-proxied to the decoy and sees a normal website - the same camouflage nginx gave you, minus the 401 tell.
+
+Because the tunnel bytes now flow **straight through backhaul** instead of being copied by an extra nginx hop, this is the change that most directly frees a CPU core on a low-core box. The decoy traffic still passes through a local server, but that's a negligible trickle - the 1Gbps of tunnel traffic no longer touches it. (Path-based camouflage inherently needs an L7/TLS-terminating router; `fallback` just makes backhaul be that router instead of a separate nginx.)
 
 **Q: My link is high-latency / intercontinental and throughput stalls well below the line rate even though CPU is fine. What helps?**
 

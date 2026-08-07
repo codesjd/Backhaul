@@ -45,6 +45,7 @@ type ServerConfig struct {
 	SO_SNDBUF            int           `toml:"so_sndbuf"`
 	ProxyProtocol        bool          `toml:"proxy_protocol"`
 	Path                 string        `toml:"path"`
+	Fallback             string        `toml:"fallback"`
 }
 
 // ClientConfig represents the configuration for the client.

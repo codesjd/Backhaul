@@ -48,6 +48,8 @@ type WsMuxTransport struct {
 	sessions       []*smux.Session
 	stripeRotation uint32
 	stripeGroupID  uint32
+
+	fallbackProxy http.Handler
 }
 
 type WsMuxConfig struct {
@@ -74,11 +76,19 @@ type WsMuxConfig struct {
 	Path                 string
 	MuxKeepaliveDisabled bool
 	StripeFactor         int
+	Fallback             string // decoy backend for non-tunnel requests (host:port), optional
 }
 
 func NewWSMuxServer(parentCtx context.Context, config *WsMuxConfig, logger *logrus.Logger) *WsMuxTransport {
 	// Create a derived context from the parent context
 	ctx, cancel := context.WithCancel(parentCtx)
+
+	// Build the decoy fallback proxy once, if configured. A bad address is
+	// fatal here rather than silently disabling camouflage at runtime.
+	fallbackProxy, err := network.NewFallbackProxy(config.Fallback)
+	if err != nil {
+		logger.Fatalf("invalid fallback address %q: %v", config.Fallback, err)
+	}
 
 	// Initialize the TcpTransport struct
 	server := &WsMuxTransport{
@@ -103,6 +113,7 @@ func NewWSMuxServer(parentCtx context.Context, config *WsMuxConfig, logger *logr
 		sessionCounter: 0,
 		controlChannel: nil, // will be set when a control connection is established
 		usageMonitor:   web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), ctx, config.SnifferLog, config.Sniffer, &config.TunnelStatus, logger),
+		fallbackProxy:  fallbackProxy,
 	}
 
 	return server
@@ -268,9 +279,20 @@ func (s *WsMuxTransport) tunnelListener() {
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			s.logger.Tracef("received http request from %s", r.RemoteAddr)
 
-			// Read the "Authorization" header
+			// A request is legitimate tunnel traffic only if it carries the
+			// token AND targets the control or a tunnel path. Anything else -
+			// a wrong/absent token, or a probe hitting "/" - is not upgraded:
+			// if a decoy fallback is configured it is reverse-proxied there so
+			// the origin looks like an ordinary website, otherwise it is
+			// rejected as before.
+			isTunnelPath := r.URL.Path == channelPath || strings.HasPrefix(r.URL.Path, tunnelPathPrefix)
 			authHeader := r.Header.Get("Authorization")
-			if authHeader != fmt.Sprintf("Bearer %v", s.config.Token) {
+			if authHeader != fmt.Sprintf("Bearer %v", s.config.Token) || !isTunnelPath {
+				if s.fallbackProxy != nil {
+					s.logger.Debugf("serving fallback for %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
+					s.fallbackProxy.ServeHTTP(w, r)
+					return
+				}
 				s.logger.Warnf("unauthorized request from %s, closing connection", r.RemoteAddr)
 				http.Error(w, "unauthorized", http.StatusUnauthorized) // Send 401 Unauthorized response
 				return
