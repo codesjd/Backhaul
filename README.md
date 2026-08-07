@@ -96,6 +96,8 @@ To start using the solution, you'll need to configure both server and client com
     mux_framesize = 32768         # 32 KB. The maximum size of a frame that can be sent over a connection. (optional)
     mux_recievebuffer = 4194304   # 4 MB. The maximum buffer size for incoming data per connection. (optional)
     mux_streambuffer = 65536      # 256 KB. The maximum buffer size per individual stream within a connection. (optional)
+    mux_keepalive_disabled = false # wsmux/wssmux: disable smux's built-in per-connection keepalive ping. Every pool connection pings on the same fixed interval, which is a traffic-pattern signal; disabling it relies on TCP keepalive instead. (optional, default: false)
+    mux_stripe = 1                 # wsmux/wssmux (prototype): split a single flow's data across this many pool connections instead of pinning it to one, so one flow isn't capped by a single connection's congestion window/RTT. Must match on both server and client. 1 disables it (default). No leg-failure recovery yet - only use with links where pool connections don't drop mid-transfer. (optional, default: 1)
     sniffer = false               # Enable or disable network sniffing for monitoring data. (optional, default false)
     web_port = 2060               # Port number for the web interface or monitoring interface. (optional, set to 0 to disable).
     sniffer_log ="/root/log.json" # Filename used to store network traffic and usage data logs. (optional, default backhaul.json)
@@ -148,14 +150,16 @@ To start using the solution, you'll need to configure both server and client com
    mux_framesize = 32768         # 32 KB. The maximum size of a frame that can be sent over a connection. (optional)
    mux_recievebuffer = 4194304   # 4 MB. The maximum buffer size for incoming data per connection. (optional)
    mux_streambuffer = 65536      # 256 KB. The maximum buffer size per individual stream within a connection. (optional)
+   mux_keepalive_disabled = false # wsmux/wssmux: disable smux's built-in per-connection keepalive ping (see server config for details). (optional, default: false)
+   mux_stripe = 1                 # wsmux/wssmux (prototype): split a single flow's data across this many pool connections (see server config for details). Must match the server. (optional, default: 1)
    sniffer = false               # Enable or disable network sniffing for monitoring data. (optional, default false)
    web_port = 2060               # Port number for the web interface or monitoring interface. (optional, set to 0 to disable).
    sniffer_log ="/root/log.json" # Filename used to store network traffic and usage data logs. (optional, default backhaul.json)
    log_level = "info"            # Log level ("panic", "fatal", "error", "warn", "info", "debug", "trace", optional, default: "info").
    skip_optz = true              # Skip optimizations performed by Backhaul (default: false)
    mss = 1360                    # TCP/TCPMux: Maximum Segment Size in bytes; controls max TCP payload size to avoid fragmentation. (default: system-defined)
-   so_rcvbuf = 1048576           # TCP/TCPMux: Socket receive buffer size (bytes); larger buffer allows higher throughput on receive side. (default: system-defined)
-   so_sndbuf = 4194304           # TCP/TCPMux: Socket send buffer size (bytes); controls send queue size to manage outgoing data flow. (default: system-defined)
+   so_rcvbuf = 1048576           # TCP/TCPMux/WS/WSS/WSMux/WSSMux (client): Socket receive buffer size (bytes) for the pool/tunnel connections; larger buffer allows higher throughput on receive side. Previously silently ignored for ws/wss/wsmux/wssmux, which always used a fixed 1MB or 2MB regardless of this setting - now respected the same as TCP/TCPMux. (default: system-defined)
+   so_sndbuf = 4194304           # TCP/TCPMux/WS/WSS/WSMux/WSSMux (client): Socket send buffer size (bytes) for the pool/tunnel connections; controls send queue size to manage outgoing data flow. Same ws/wss/wsmux/wssmux caveat as so_rcvbuf above. (default: system-defined)
    ```
 
    To start the `client`:

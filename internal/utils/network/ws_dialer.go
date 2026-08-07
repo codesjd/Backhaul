@@ -14,7 +14,7 @@ import (
 	"github.com/musix/backhaul/config"
 )
 
-func WebSocketDialer(ctx context.Context, addr string, edgeIP string, path string, timeout time.Duration, keepalive time.Duration, nodelay bool, token string, mode config.TransportType, retry int, SO_RCVBUF int, SO_SNDBUF int) (*websocket.Conn, error) {
+func WebSocketDialer(ctx context.Context, addr string, edgeIP string, path string, timeout time.Duration, keepalive time.Duration, nodelay bool, token string, userAgent string, mode config.TransportType, retry int, SO_RCVBUF int, SO_SNDBUF int) (*websocket.Conn, error) {
 	var tunnelWSConn *websocket.Conn
 	var err error
 
@@ -23,7 +23,7 @@ func WebSocketDialer(ctx context.Context, addr string, edgeIP string, path strin
 
 	for i := 0; i < retries; i++ {
 		// Attempt to dial the WebSocket
-		tunnelWSConn, err = attemptDialWebSocket(ctx, addr, edgeIP, path, timeout, keepalive, nodelay, token, mode, SO_RCVBUF, SO_SNDBUF)
+		tunnelWSConn, err = attemptDialWebSocket(ctx, addr, edgeIP, path, timeout, keepalive, nodelay, token, userAgent, mode, SO_RCVBUF, SO_SNDBUF)
 		if err == nil {
 			// If successful, return the connection
 			return tunnelWSConn, nil
@@ -42,18 +42,15 @@ func WebSocketDialer(ctx context.Context, addr string, edgeIP string, path strin
 	return nil, err
 }
 
-func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path string, timeout time.Duration, keepalive time.Duration, nodelay bool, token string, mode config.TransportType, SO_RCVBUF int, SO_SNDBUF int) (*websocket.Conn, error) {
+func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path string, timeout time.Duration, keepalive time.Duration, nodelay bool, token string, userAgent string, mode config.TransportType, SO_RCVBUF int, SO_SNDBUF int) (*websocket.Conn, error) {
 	// Generate a random X-user-id
 	randomUserID := rand.Int31() // Generate a random int64 number
-
-	// Pick a random User-Agent
-	randomUserAgent := RandomUserAgent()
 
 	// Setup headers with authorization and X-user-id
 	headers := http.Header{}
 	headers.Add("Authorization", fmt.Sprintf("Bearer %v", token))
 	headers.Add("X-User-Id", fmt.Sprintf("%d", randomUserID))
-	headers.Add("User-Agent", randomUserAgent)
+	headers.Add("User-Agent", userAgent)
 
 	var wsURL string
 	dialer := websocket.Dialer{}

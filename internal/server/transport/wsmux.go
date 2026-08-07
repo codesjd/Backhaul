@@ -16,6 +16,7 @@ import (
 	"github.com/musix/backhaul/internal/utils"
 	"github.com/musix/backhaul/internal/utils/handlers"
 	"github.com/musix/backhaul/internal/utils/network"
+	"github.com/musix/backhaul/internal/utils/striping"
 	"github.com/musix/backhaul/internal/web"
 	"github.com/xtaci/smux"
 
@@ -38,30 +39,41 @@ type WsMuxTransport struct {
 	restartMutex   sync.Mutex
 	streamCounter  int32
 	sessionCounter int32
+
+	// sessions is a live registry of pool sessions, used only when
+	// StripeFactor > 1 so the striped dispatcher can pick several sessions
+	// to open legs of the same logical connection on. The non-striped path
+	// (StripeFactor <= 1, the default) never touches this.
+	sessionsMu     sync.Mutex
+	sessions       []*smux.Session
+	stripeRotation uint32
+	stripeGroupID  uint32
 }
 
 type WsMuxConfig struct {
-	BindAddr         string
-	Token            string
-	SnifferLog       string
-	TLSCertFile      string // Path to the TLS certificate file
-	TLSKeyFile       string // Path to the TLS key file
-	TunnelStatus     string
-	Ports            []string
-	Nodelay          bool
-	Sniffer          bool
-	KeepAlive        time.Duration
-	Heartbeat        time.Duration // in seconds
-	ChannelSize      int
-	MuxCon           int
-	MuxVersion       int
-	MaxFrameSize     int
-	MaxReceiveBuffer int
-	MaxStreamBuffer  int
-	WebPort          int
-	Mode             config.TransportType // ws or wss
-	ProxyProtocol    bool
-	Path             string
+	BindAddr             string
+	Token                string
+	SnifferLog           string
+	TLSCertFile          string // Path to the TLS certificate file
+	TLSKeyFile           string // Path to the TLS key file
+	TunnelStatus         string
+	Ports                []string
+	Nodelay              bool
+	Sniffer              bool
+	KeepAlive            time.Duration
+	Heartbeat            time.Duration // in seconds
+	ChannelSize          int
+	MuxCon               int
+	MuxVersion           int
+	MaxFrameSize         int
+	MaxReceiveBuffer     int
+	MaxStreamBuffer      int
+	WebPort              int
+	Mode                 config.TransportType // ws or wss
+	ProxyProtocol        bool
+	Path                 string
+	MuxKeepaliveDisabled bool
+	StripeFactor         int
 }
 
 func NewWSMuxServer(parentCtx context.Context, config *WsMuxConfig, logger *logrus.Logger) *WsMuxTransport {
@@ -72,6 +84,7 @@ func NewWSMuxServer(parentCtx context.Context, config *WsMuxConfig, logger *logr
 	server := &WsMuxTransport{
 		smuxConfig: &smux.Config{
 			Version:           config.MuxVersion,
+			KeepAliveDisabled: config.MuxKeepaliveDisabled,
 			KeepAliveInterval: 20 * time.Second,
 			KeepAliveTimeout:  40 * time.Second,
 			MaxFrameSize:      config.MaxFrameSize,
@@ -145,6 +158,10 @@ func (s *WsMuxTransport) Restart() {
 	s.streamCounter = 0
 	s.sessionCounter = 0
 
+	s.sessionsMu.Lock()
+	s.sessions = nil
+	s.sessionsMu.Unlock()
+
 	// set the log level again
 	s.logger.SetLevel(level)
 
@@ -152,8 +169,11 @@ func (s *WsMuxTransport) Restart() {
 }
 
 func (s *WsMuxTransport) channelHandler() {
-	ticker := time.NewTicker(s.config.Heartbeat)
-	defer ticker.Stop()
+	// A jittered timer (instead of a fixed-period ticker) so the heartbeat
+	// cadence isn't perfectly periodic, which is an easy fingerprint for
+	// traffic-pattern based DPI.
+	heartbeatTimer := time.NewTimer(utils.JitterDuration(s.config.Heartbeat))
+	defer heartbeatTimer.Stop()
 
 	// Channel to receive the message or error
 	messageChan := make(chan byte, 10)
@@ -183,24 +203,25 @@ func (s *WsMuxTransport) channelHandler() {
 	for {
 		select {
 		case <-s.ctx.Done():
-			_ = s.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_Closed})
+			_ = utils.WriteControlSignal(s.controlChannel, utils.SG_Closed)
 			return
 		case <-s.reqNewConnChan:
-			err := s.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_Chan})
+			err := utils.WriteControlSignal(s.controlChannel, utils.SG_Chan)
 			if err != nil {
 				s.logger.Error("failed to send request new connection signal. ", err)
 				go s.Restart()
 				return
 			}
 
-		case <-ticker.C:
-			err := s.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_HB})
+		case <-heartbeatTimer.C:
+			err := utils.WriteControlSignal(s.controlChannel, utils.SG_HB)
 			if err != nil {
 				s.logger.Errorf("failed to send heartbeat signal. Error: %v.", err)
 				go s.Restart()
 				return
 			}
 			s.logger.Debug("heartbeat signal sent successfully")
+			heartbeatTimer.Reset(utils.JitterDuration(s.config.Heartbeat))
 
 		case msg, ok := <-messageChan:
 			if !ok {
@@ -286,6 +307,10 @@ func (s *WsMuxTransport) tunnelListener() {
 
 				for i := 0; i < numCPU; i++ {
 					go s.handleLoop()
+				}
+
+				if s.config.StripeFactor > 1 {
+					go s.stripedDispatchLoop()
 				}
 
 				s.config.TunnelStatus = fmt.Sprintf("Connected (%s)", s.config.Mode)
@@ -527,7 +552,135 @@ func (s *WsMuxTransport) handleLoop() {
 			// +1 for session counter
 			atomic.AddInt32(&s.sessionCounter, 1)
 
+			if s.config.StripeFactor > 1 {
+				s.registerSession(session)
+				go func(sess *smux.Session) {
+					<-sess.CloseChan()
+					s.unregisterSession(sess)
+					atomic.AddInt32(&s.sessionCounter, -1)
+				}(session)
+				continue
+			}
+
 			go s.handleSession(session)
+		}
+	}
+}
+
+// registerSession/unregisterSession maintain the live-session pool the
+// striped dispatcher picks legs from. Only used when StripeFactor > 1.
+func (s *WsMuxTransport) registerSession(session *smux.Session) {
+	s.sessionsMu.Lock()
+	s.sessions = append(s.sessions, session)
+	s.sessionsMu.Unlock()
+}
+
+func (s *WsMuxTransport) unregisterSession(session *smux.Session) {
+	s.sessionsMu.Lock()
+	for i, sess := range s.sessions {
+		if sess == session {
+			s.sessions = append(s.sessions[:i], s.sessions[i+1:]...)
+			break
+		}
+	}
+	s.sessionsMu.Unlock()
+}
+
+// openStripedLegs opens one stream on each of up to n distinct live
+// sessions, rotating the starting point on every call so legs aren't always
+// pulled from the same first few sessions.
+func (s *WsMuxTransport) openStripedLegs(n int) ([]*smux.Stream, error) {
+	s.sessionsMu.Lock()
+	avail := make([]*smux.Session, len(s.sessions))
+	copy(avail, s.sessions)
+	s.sessionsMu.Unlock()
+
+	if len(avail) == 0 {
+		return nil, fmt.Errorf("no active pool sessions available for striping")
+	}
+	if n > len(avail) {
+		n = len(avail)
+	}
+
+	start := int(atomic.AddUint32(&s.stripeRotation, 1))
+	streams := make([]*smux.Stream, 0, n)
+	for i := 0; i < n; i++ {
+		sess := avail[(start+i)%len(avail)]
+		stream, err := sess.OpenStream()
+		if err != nil {
+			for _, st := range streams {
+				st.Close()
+			}
+			return nil, fmt.Errorf("failed to open stripe leg: %w", err)
+		}
+		streams = append(streams, stream)
+	}
+	return streams, nil
+}
+
+// stripedDispatchLoop replaces the per-session handleSession loop when
+// StripeFactor > 1: for each incoming local connection it grabs one stream
+// from several distinct pool sessions instead of one stream from one
+// session, so the flow isn't pinned to a single underlying TCP connection.
+func (s *WsMuxTransport) stripedDispatchLoop() {
+	sem := make(chan struct{}, s.config.MuxCon)
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+
+		case incomingConn := <-s.localChannel:
+			if time.Now().UnixMilli()-incomingConn.timeCreated > 3000 { // 3000ms
+				s.logger.Debugf("timeouted local connection: %d ms", time.Now().UnixMilli()-incomingConn.timeCreated)
+				incomingConn.conn.Close()
+				continue
+			}
+
+			legs, err := s.openStripedLegs(s.config.StripeFactor)
+			if err != nil {
+				s.logger.Tracef("striped dispatch: %v, retrying shortly", err)
+				time.Sleep(100 * time.Millisecond)
+				select {
+				case s.localChannel <- incomingConn:
+				default:
+					incomingConn.conn.Close()
+				}
+				continue
+			}
+
+			gid := atomic.AddUint32(&s.stripeGroupID, 1)
+			headerErr := false
+			for i, stream := range legs {
+				if err := utils.SendStripeHeader(stream, gid, uint8(i), uint8(len(legs)), incomingConn.remoteAddr); err != nil {
+					s.logger.Tracef("failed to send stripe header: %v", err)
+					headerErr = true
+					break
+				}
+			}
+			if headerErr {
+				for _, stream := range legs {
+					stream.Close()
+				}
+				select {
+				case s.localChannel <- incomingConn:
+				default:
+					incomingConn.conn.Close()
+				}
+				continue
+			}
+
+			conns := make([]net.Conn, len(legs))
+			for i, st := range legs {
+				conns[i] = st
+			}
+			stripedConn := striping.New(conns, striping.DefaultChunkSize)
+
+			sem <- struct{}{}
+			go func(local net.Conn, remote net.Conn, port int) {
+				defer func() { <-sem }()
+				handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, local, remote, s.logger, s.usageMonitor, port, s.config.Sniffer)
+			}(incomingConn.conn, stripedConn, incomingConn.conn.LocalAddr().(*net.TCPAddr).Port)
 		}
 	}
 }

@@ -158,6 +158,16 @@ func (m *Usage) statsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// GetPortUsage returns the accumulated byte count recorded for port via
+// AddOrUpdatePort, and whether anything has been recorded for it yet.
+func (m *Usage) GetPortUsage(port int) (uint64, bool) {
+	value, ok := m.dataStore.Load(port)
+	if !ok {
+		return 0, false
+	}
+	return value.(PortUsage).Usage, true
+}
+
 func (m *Usage) AddOrUpdatePort(port int, usage uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

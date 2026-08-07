@@ -3,6 +3,8 @@ package transport
 import (
 	"context"
 	"fmt"
+	"math/rand"
+	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -12,6 +14,7 @@ import (
 	"github.com/musix/backhaul/internal/utils"
 	"github.com/musix/backhaul/internal/utils/handlers"
 	"github.com/musix/backhaul/internal/utils/network"
+	"github.com/musix/backhaul/internal/utils/striping"
 	"github.com/musix/backhaul/internal/web"
 	"github.com/xtaci/smux"
 
@@ -32,27 +35,50 @@ type WsMuxTransport struct {
 	poolConnections int32
 	loadConnections int32
 	controlFlow     chan struct{}
+	// userAgent is picked once per process instead of per dial, so a single
+	// client identity doesn't show up with a different browser signature on
+	// every pool connection/reconnect - a pattern no real browser produces.
+	userAgent string
+
+	// stripeGroups collects legs of a striped flow (see package striping)
+	// until all of them have arrived, keyed by the groupID the server
+	// tagged them with.
+	stripeGroupsMu sync.Mutex
+	stripeGroups   map[uint32]*stripeGroup
+}
+
+// stripeGroup accumulates the legs the server opened for one logical
+// connection (one per stripe.Factor) until all of them have shown up.
+type stripeGroup struct {
+	streams    []*smux.Stream
+	remaining  int
+	remoteAddr string
+	timer      *time.Timer
 }
 type WsMuxConfig struct {
-	RemoteAddr       string
-	Token            string
-	SnifferLog       string
-	TunnelStatus     string
-	Nodelay          bool
-	Sniffer          bool
-	KeepAlive        time.Duration
-	RetryInterval    time.Duration
-	DialTimeOut      time.Duration
-	MuxVersion       int
-	MaxFrameSize     int
-	MaxReceiveBuffer int
-	MaxStreamBuffer  int
-	ConnPoolSize     int
-	WebPort          int
-	Mode             config.TransportType
-	AggressivePool   bool
-	EdgeIP           string
-	Path             string
+	RemoteAddr           string
+	Token                string
+	SnifferLog           string
+	TunnelStatus         string
+	Nodelay              bool
+	Sniffer              bool
+	KeepAlive            time.Duration
+	RetryInterval        time.Duration
+	DialTimeOut          time.Duration
+	MuxVersion           int
+	MaxFrameSize         int
+	MaxReceiveBuffer     int
+	MaxStreamBuffer      int
+	ConnPoolSize         int
+	WebPort              int
+	Mode                 config.TransportType
+	AggressivePool       bool
+	EdgeIP               string
+	Path                 string
+	MuxKeepaliveDisabled bool
+	StripeFactor         int
+	SO_RCVBUF            int
+	SO_SNDBUF            int
 }
 
 func NewWSMuxClient(parentCtx context.Context, config *WsMuxConfig, logger *logrus.Logger) *WsMuxTransport {
@@ -63,6 +89,7 @@ func NewWSMuxClient(parentCtx context.Context, config *WsMuxConfig, logger *logr
 	client := &WsMuxTransport{
 		smuxConfig: &smux.Config{
 			Version:           config.MuxVersion,
+			KeepAliveDisabled: config.MuxKeepaliveDisabled,
 			KeepAliveInterval: 20 * time.Second,
 			KeepAliveTimeout:  40 * time.Second,
 			MaxFrameSize:      config.MaxFrameSize,
@@ -79,6 +106,8 @@ func NewWSMuxClient(parentCtx context.Context, config *WsMuxConfig, logger *logr
 		poolConnections: 0,
 		loadConnections: 0,
 		controlFlow:     make(chan struct{}, 100),
+		userAgent:       network.RandomUserAgent(),
+		stripeGroups:    make(map[uint32]*stripeGroup),
 	}
 
 	return client
@@ -130,6 +159,18 @@ func (c *WsMuxTransport) Restart() {
 	c.loadConnections = 0
 	c.controlFlow = make(chan struct{}, 100)
 
+	c.stripeGroupsMu.Lock()
+	for _, g := range c.stripeGroups {
+		g.timer.Stop()
+		for _, st := range g.streams {
+			if st != nil {
+				st.Close()
+			}
+		}
+	}
+	c.stripeGroups = make(map[uint32]*stripeGroup)
+	c.stripeGroupsMu.Unlock()
+
 	// set the log level again
 	c.logger.SetLevel(level)
 
@@ -145,7 +186,7 @@ func (c *WsMuxTransport) channelDialer() {
 			return
 		default:
 
-			tunnelWSConn, err := network.WebSocketDialer(c.ctx, c.config.RemoteAddr, c.config.EdgeIP, network.NormalizeBasePath(c.config.Path)+"/channel", c.config.DialTimeOut, c.config.KeepAlive, true, c.config.Token, c.config.Mode, 3, 0, 0)
+			tunnelWSConn, err := network.WebSocketDialer(c.ctx, c.config.RemoteAddr, c.config.EdgeIP, network.NormalizeBasePath(c.config.Path)+"/channel", c.config.DialTimeOut, c.config.KeepAlive, true, c.config.Token, c.userAgent, c.config.Mode, 3, 0, 0)
 			if err != nil {
 				c.logger.Errorf("control channel dialer: %v", err)
 				time.Sleep(c.config.RetryInterval)
@@ -165,8 +206,19 @@ func (c *WsMuxTransport) channelDialer() {
 }
 
 func (c *WsMuxTransport) poolMaintainer() {
+	// Stagger the initial pool fill instead of firing every dial at once -
+	// a burst of ConnPoolSize near-simultaneous TLS handshakes to the same
+	// host is a distinctive connection pattern real browser traffic doesn't
+	// produce.
 	for i := 0; i < c.config.ConnPoolSize; i++ { //initial pool filling
 		go c.tunnelDialer()
+		if i < c.config.ConnPoolSize-1 {
+			select {
+			case <-c.ctx.Done():
+				return
+			case <-time.After(time.Duration(50+rand.Intn(200)) * time.Millisecond):
+			}
+		}
 	}
 
 	// factors
@@ -256,7 +308,7 @@ func (c *WsMuxTransport) channelHandler() {
 	for {
 		select {
 		case <-c.ctx.Done():
-			_ = c.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_Closed})
+			_ = utils.WriteControlSignal(c.controlChannel, utils.SG_Closed)
 			return
 
 		case msg := <-msgChan:
@@ -273,7 +325,7 @@ func (c *WsMuxTransport) channelHandler() {
 
 			case utils.SG_HB:
 				c.logger.Debug("heartbeat received successfully")
-				err := c.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_HB})
+				err := utils.WriteControlSignal(c.controlChannel, utils.SG_HB)
 				if err != nil {
 					c.logger.Errorf("failed to send heartbeat: %v", msg)
 					go c.Restart()
@@ -300,7 +352,7 @@ func (c *WsMuxTransport) tunnelDialer() {
 	c.logger.Debugf("initiating new %s tunnel connection to address %s", c.config.Mode, c.config.RemoteAddr)
 
 	// Dial to the tunnel server
-	tunnelWSConn, err := network.WebSocketDialer(c.ctx, c.config.RemoteAddr, c.config.EdgeIP, network.NormalizeBasePath(c.config.Path)+"/tunnel", c.config.DialTimeOut, c.config.KeepAlive, c.config.Nodelay, c.config.Token, c.config.Mode, 3, 2*1024*1024, 2*1024*1024)
+	tunnelWSConn, err := network.WebSocketDialer(c.ctx, c.config.RemoteAddr, c.config.EdgeIP, network.NormalizeBasePath(c.config.Path)+"/tunnel", c.config.DialTimeOut, c.config.KeepAlive, c.config.Nodelay, c.config.Token, c.userAgent, c.config.Mode, 3, c.config.SO_RCVBUF, c.config.SO_SNDBUF)
 	if err != nil {
 		c.logger.Errorf("tunnel server dialer: %v", err)
 
@@ -337,6 +389,11 @@ func (c *WsMuxTransport) handleSession(tunnelConn *websocket.Conn) {
 				return
 			}
 
+			if c.config.StripeFactor > 1 {
+				go c.handleStripedStream(stream)
+				continue
+			}
+
 			remoteAddr, err := utils.ReceiveBinaryString(stream)
 			if err != nil {
 				c.logger.Errorf("unable to get port from stream connection %s: %v", tunnelConn.RemoteAddr().String(), err)
@@ -349,7 +406,87 @@ func (c *WsMuxTransport) handleSession(tunnelConn *websocket.Conn) {
 	}
 }
 
-func (c *WsMuxTransport) localDialer(stream *smux.Stream, remoteAddr string) {
+// handleStripedStream reads the stripe header off a newly accepted stream
+// and files it under its group. Once every leg the server promised (total)
+// has shown up, the group is assembled into a single striping.Conn and
+// handed to localDialer exactly like a plain stream would be.
+func (c *WsMuxTransport) handleStripedStream(stream *smux.Stream) {
+	groupID, index, total, remoteAddr, err := utils.ReceiveStripeHeader(stream)
+	if err != nil {
+		c.logger.Errorf("failed to read stripe header: %v", err)
+		stream.Close()
+		return
+	}
+	if total == 0 || int(index) >= int(total) {
+		c.logger.Errorf("invalid stripe header: index=%d total=%d", index, total)
+		stream.Close()
+		return
+	}
+
+	c.stripeGroupsMu.Lock()
+	g, ok := c.stripeGroups[groupID]
+	if !ok {
+		g = &stripeGroup{
+			streams:    make([]*smux.Stream, total),
+			remaining:  int(total),
+			remoteAddr: remoteAddr,
+		}
+		g.timer = time.AfterFunc(10*time.Second, func() {
+			c.abortStripeGroup(groupID)
+		})
+		c.stripeGroups[groupID] = g
+	}
+
+	var complete bool
+	if g.streams[index] != nil {
+		c.logger.Warnf("duplicate stripe leg %d for group %d, closing", index, groupID)
+		c.stripeGroupsMu.Unlock()
+		stream.Close()
+		return
+	}
+	g.streams[index] = stream
+	g.remaining--
+	complete = g.remaining == 0
+	if complete {
+		delete(c.stripeGroups, groupID)
+	}
+	c.stripeGroupsMu.Unlock()
+
+	if !complete {
+		return
+	}
+
+	g.timer.Stop()
+	conns := make([]net.Conn, len(g.streams))
+	for i, st := range g.streams {
+		conns[i] = st
+	}
+	go c.localDialer(striping.New(conns, striping.DefaultChunkSize), g.remoteAddr)
+}
+
+// abortStripeGroup gives up on a group that never received all of its legs
+// within the timeout (e.g. one pool connection died mid-handshake) and
+// closes whatever legs did arrive.
+func (c *WsMuxTransport) abortStripeGroup(groupID uint32) {
+	c.stripeGroupsMu.Lock()
+	g, ok := c.stripeGroups[groupID]
+	if ok {
+		delete(c.stripeGroups, groupID)
+	}
+	c.stripeGroupsMu.Unlock()
+
+	if !ok {
+		return
+	}
+	c.logger.Warnf("timed out waiting for stripe legs of group %d, aborting", groupID)
+	for _, st := range g.streams {
+		if st != nil {
+			st.Close()
+		}
+	}
+}
+
+func (c *WsMuxTransport) localDialer(stream net.Conn, remoteAddr string) {
 	// Extract the port from the received address
 	port, resolvedAddr, err := network.ResolveRemoteAddr(remoteAddr)
 	if err != nil {

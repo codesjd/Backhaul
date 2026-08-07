@@ -56,7 +56,14 @@ func ApplyTCPTuning() {
 			{"sysctl", "-w", "net.ipv4.tcp_fastopen=3"},                 // Enable TCP Fast Open
 			// {"sysctl", "-w", "net.ipv4.tcp_rmem = 16384 1048576 33554432"}, // Maximum of 1MB of TCP read buffer memory
 			// {"sysctl", "-w", "net.ipv4.tcp_wmem = 16384 1048576 33554432"}, // Maximum of 1MB TCP write buffer memory
-			{"sysctl", "-w", "net.ipv4.tcp_notsent_lowat=32768"}, // Do not allow more than 4096 bytes of unsent data in buffer
+			// tcp_notsent_lowat deliberately left at the OS default (unlimited).
+			// A low value trades throughput for latency by forcing small,
+			// frequent writes - the right tradeoff for many concurrent
+			// short-lived proxied connections, the wrong one for the few
+			// sustained, bulk-throughput connections a tunnel pool actually
+			// carries. It's also a system-wide sysctl, so setting it here was
+			// silently capping every other process on the box too (nginx's
+			// TLS connections included), not just backhaul's own sockets.
 			//{"sysctl", "-w", "net.core.rmem_max=26214400"},       // Set maximum TCP receive buffer size
 			//{"sysctl", "-w", "net.core.wmem_max=26214400"},       // Set maximum TCP send buffer size
 			{"sysctl", "-w", "net.core.rmem_default=1048576"}, // Set default TCP receive buffer size

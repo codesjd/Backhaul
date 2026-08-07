@@ -9,6 +9,15 @@ import (
 	utls "github.com/refraction-networking/utls"
 )
 
+// sessionCache is shared across every uTLS dial in the process so that
+// reconnects and pool connections can resume a prior TLS session instead of
+// always doing a full handshake. Real Chrome does the same for repeat
+// connections to a host - a full handshake on every single reconnect is both
+// slower and one more thing a DPI system watching handshake shape can key
+// on. 128 entries comfortably covers one or a handful of remote hosts plus
+// edge IP rotation.
+var sessionCache = utls.NewLRUClientSessionCache(128)
+
 // UtlsDialTLS dials a TCP connection (with the same tuning knobs as TcpDialer)
 // and performs the TLS handshake using uTLS with a Chrome ClientHello, so the
 // outbound TLS fingerprint (JA3/JA4) blends in with real browser traffic
@@ -24,6 +33,13 @@ func UtlsDialTLS(ctx context.Context, dialAddr string, serverName string, insecu
 		ServerName:         serverName,
 		InsecureSkipVerify: insecureSkipVerify,
 		NextProtos:         nextProtos,
+		ClientSessionCache: sessionCache,
+		// HelloChrome_Auto's canned spec doesn't carry a PSK/session-ticket
+		// extension, so uTLS has nowhere to place resumption data even
+		// though ClientSessionCache is set. Without this, uTLS panics
+		// instead of just falling back to a full handshake - resumption
+		// still kicks in on specs that do carry the extension.
+		PreferSkipResumptionOnNilExtension: true,
 	}
 
 	// The Chrome preset's canned spec carries its own hardcoded ALPN
