@@ -107,6 +107,8 @@ func (c *Client) Start() {
 			AggressivePool: c.config.AggressivePool,
 			EdgeIP:         c.config.EdgeIP,
 			Path:           c.config.Path,
+			SO_RCVBUF:      c.config.SO_RCVBUF,
+			SO_SNDBUF:      c.config.SO_SNDBUF,
 		}
 		WsClient := transport.NewWSClient(c.ctx, WsConfig, c.logger)
 		go WsClient.Start()
