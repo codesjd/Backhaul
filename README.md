@@ -584,6 +584,18 @@ journalctl -u backhaul.service -e -f
 * `ws`: Use if you need to traverse HTTP-based firewalls or proxies.
 * `wss`: Use this for secure WebSocket connections that need to traverse HTTP-based firewalls or proxies. It encrypts data for added security, similar to WS but with encryption. Its TLS ClientHello is generated with uTLS to mimic Chrome, for CDN edges/DPI that fingerprint the TLS handshake itself.
 
+**Q: My CPU saturates (~95%) on a low-core box and I can't reach line rate (e.g. 1Gbps), especially when combined with nginx / another proxy in front. Why?**
+
+On these boxes the CPU cost is almost entirely **encryption**, not moving bytes - and it is easy to encrypt the same bytes two or three times without realizing it:
+
+* If the payload carried through the tunnel is **already encrypted** by whatever runs on top of it (e.g. an xray/VLESS/Reality inbound, or nginx terminating TLS), then running the backhaul tunnel itself as `wss`/`wssmux` wraps that ciphertext in **another** TLS layer. That second (or third) AES pass is what pins the CPU. It adds CPU cost but no additional confidentiality.
+* Prefer `tcp` or `tcpmux` for the tunnel when the payload is already encrypted end-to-end. With `tcp`/`tcpmux` both ends of each forwarded connection are raw `*net.TCPConn`, so the data pump routes straight to `splice(2)` on Linux - bytes move kernel-side without ever entering this process, so backhaul's own per-byte CPU cost is effectively zero. `wss`/`wssmux` cannot take that path (one end is always a TLS/WebSocket/smux stream).
+* If nginx is only in front for TLS/camouflage that the upstream (e.g. Reality) already provides, put it in **L4 passthrough** mode (`stream {}` with `proxy_pass`, no `ssl` termination) or drop it from the hot path - a TLS-terminating nginx is a full extra AES pass per byte.
+
+**Q: My link is high-latency / intercontinental and throughput stalls well below the line rate even though CPU is fine. What helps?**
+
+Enable **BBR** congestion control (`net.ipv4.tcp_congestion_control=bbr` with `net.core.default_qdisc=fq`). On a high-RTT, mildly-lossy path the default cubic/reno collapses its window on every stray loss and never fills the pipe. BBR paces to the measured bottleneck bandwidth instead, at no extra CPU cost. Backhaul enables this automatically at startup unless `skip_optz = true`. Also size `so_rcvbuf`/`so_sndbuf` to the bandwidth-delay product of the link (e.g. ~8MB for 1Gbps at ~40ms RTT) so the window has room to open.
+
 
 ## Benchmark
 
