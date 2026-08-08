@@ -3,32 +3,35 @@
 // (one pooled tunnel connection) caps a flow's throughput at roughly
 // window/RTT; spreading one flow's bytes across N legs gives it N
 // independent congestion windows instead of one - but only if the legs are
-// actually kept busy in proportion to how fast each one drains, and only if
-// a leg that stops responding gets detected and torn down instead of
-// hanging the whole connection forever.
+// actually kept busy in proportion to how fast each one drains, a clean
+// end-of-stream is coordinated across all of them, and a leg that stops
+// responding gets detected and torn down instead of hanging forever.
 //
-// Three things are handled here:
+// How it works:
 //   - Writes are handed to whichever leg is free next (a work-stealing
 //     queue), not round-robined blindly - a congested leg naturally gets
 //     fewer chunks instead of stalling the reorder buffer on the receiving
-//     end waiting for its share.
-//   - A congestionScheduler (scheduler.go) paces how many legs may be
-//     sending at once, backing off when per-chunk latency rises. Legs
-//     pooled through one CDN connection usually don't have independent
-//     capacity - they share one real bottleneck - and blindly driving all
-//     of them at once just adds contention/loss on that shared link
-//     instead of throughput. This lets the ensemble behave like fewer,
-//     better-behaved flows when that's what the link actually calls for,
-//     while still using full parallelism when there's genuine headroom.
+//     end waiting for its share. Pacing is left to each leg's own transport
+//     (smux stream flow control over TCP): a congested leg simply blocks in
+//     Write until its window opens.
+//   - Shutdown is explicit, not inferred from timing. On Close the queued
+//     chunks are flushed to the legs, then an end-of-stream marker carrying
+//     the total chunk count is sent on each leg before the legs are torn
+//     down. The receiver reports a clean io.EOF exactly when it has delivered
+//     that many chunks in order - so the tail of a stream can't slip through
+//     as a short read when a leg's EOF races the last chunks still buffered,
+//     and a genuinely missing chunk surfaces as io.ErrUnexpectedEOF instead
+//     of silent truncation.
 //   - Every leg write carries a deadline, and Read gives up waiting for a
-//     missing sequence number after stallTimeout. Either one closes the
-//     whole Conn (all legs), which unblocks the other direction's I/O too,
-//     instead of leaking goroutines and streams on a silently dead leg.
+//     missing sequence number after stallTimeout. Either one tears the whole
+//     Conn down, which unblocks the other direction's I/O too, instead of
+//     leaking goroutines and streams on a silently dead leg.
 //
-// This still isn't real reliability: a lost/timed-out leg's in-flight byte
-// range can't be recovered, so the stream ends in an error like a dropped
-// TCP connection would - there's no retransmission. What changed is that it
-// now *does* end, promptly, instead of hanging.
+// This still isn't real reliability: if a leg dies mid-stream its in-flight
+// byte range can't be recovered, so Read reports io.ErrUnexpectedEOF like a
+// dropped TCP connection would - there's no retransmission. What's guaranteed
+// is that a *clean* shutdown delivers every byte, and a dirty one ends
+// promptly with an error instead of hanging.
 package striping
 
 import (
@@ -37,6 +40,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -51,6 +55,15 @@ const DefaultChunkSize = 16 * 1024
 const defaultStallTimeout = 20 * time.Second
 
 const headerSize = 8 // 4 bytes sequence number + 4 bytes payload length
+
+// endMarkerLen is a sentinel in a chunk header's length field marking the end
+// of the stream. A real chunk's length is at most chunkSize, nowhere near
+// this, so it's unambiguous. When set, the header's seq field carries the
+// total number of data chunks the sender produced - so the receiver knows
+// exactly when it has the whole stream, completion that doesn't depend on the
+// timing of each leg's EOF (which is what made the tail of a stream
+// occasionally slip through as a short read).
+const endMarkerLen = 0xFFFFFFFF
 
 type chunk struct {
 	seq  uint32
@@ -72,7 +85,9 @@ type Conn struct {
 	wmu        sync.Mutex // guards writeSeq only; queueing itself is lock-free via the channel
 	writeSeq   uint32
 	writeQueue chan writeJob
-	sched      *congestionScheduler
+	writersWG  sync.WaitGroup // write workers, waited on by a graceful Close
+	flush      chan struct{}  // closed by a graceful Close: drain writeQueue, then stop
+	flushOnce  sync.Once
 
 	// rmu guards only the reassembly state below (nextSeq/pending/readBuf)
 	// and is held for as long as Read blocks waiting on the network. permErr
@@ -92,6 +107,14 @@ type Conn struct {
 	chunkCh chan chunk
 	errCh   chan error
 
+	legsActive int32         // read workers still delivering; decremented on each leg's clean EOF
+	legsDone   chan struct{} // closed once every leg has ended cleanly
+
+	total      uint32        // total data-chunk count, announced by the END marker
+	haveTotal  int32         // atomic bool: set once the END marker has been seen
+	totalKnown chan struct{} // closed when the END marker arrives, to wake a blocked Read
+	totalOnce  sync.Once
+
 	closeOnce sync.Once
 	closed    chan struct{}
 }
@@ -110,11 +133,14 @@ func New(legs []net.Conn, chunkSize int) *Conn {
 		chunkCh:      make(chan chunk, len(legs)*4),
 		errCh:        make(chan error, len(legs)),
 		writeQueue:   make(chan writeJob, len(legs)*2),
-		sched:        newCongestionScheduler(len(legs)),
+		flush:        make(chan struct{}),
+		legsActive:   int32(len(legs)),
+		legsDone:     make(chan struct{}),
+		totalKnown:   make(chan struct{}),
 		closed:       make(chan struct{}),
 	}
-	go c.sched.run(c.closed)
 	for _, leg := range legs {
+		c.writersWG.Add(1)
 		go c.readLeg(leg)
 		go c.writeLeg(leg)
 	}
@@ -125,11 +151,26 @@ func (c *Conn) readLeg(leg net.Conn) {
 	header := make([]byte, headerSize)
 	for {
 		if _, err := io.ReadFull(leg, header); err != nil {
-			c.fail(err)
+			// io.EOF exactly at a chunk boundary is this leg finishing
+			// cleanly; anything else (ErrUnexpectedEOF mid-header, a
+			// transport error) is real truncation and fails the whole Conn.
+			if err == io.EOF {
+				c.legDone()
+			} else {
+				c.fail(err)
+			}
 			return
 		}
 		seq := binary.BigEndian.Uint32(header[0:4])
 		length := binary.BigEndian.Uint32(header[4:8])
+
+		if length == endMarkerLen {
+			// End of stream: seq carries the total data-chunk count. No payload
+			// follows; the sender closes this leg next, so the following read
+			// EOFs into legDone.
+			c.setTotal(seq)
+			continue
+		}
 
 		data := make([]byte, length)
 		if length > 0 {
@@ -147,73 +188,126 @@ func (c *Conn) readLeg(leg net.Conn) {
 	}
 }
 
+// setTotal records the announced total chunk count and wakes any blocked Read
+// so it can re-check completion. Idempotent: every leg carries the marker.
+func (c *Conn) setTotal(total uint32) {
+	atomic.StoreUint32(&c.total, total)
+	atomic.StoreInt32(&c.haveTotal, 1)
+	c.totalOnce.Do(func() { close(c.totalKnown) })
+}
+
+// complete reports whether the whole stream has been reassembled: the total is
+// known and every chunk up to it has been delivered in order. Caller holds rmu.
+func (c *Conn) complete() bool {
+	return atomic.LoadInt32(&c.haveTotal) == 1 && c.nextSeq >= atomic.LoadUint32(&c.total)
+}
+
+// legDone records one leg finishing cleanly. When the last one does, every
+// leg's read half has hit EOF - the peer closed the striped Conn - so we both
+// signal Read (via legsDone, so it can report a clean io.EOF once it has
+// drained what's buffered) and tear the Conn down. The teardown matters for
+// the direction that is only ever writing: without a Read call to observe
+// legsDone, its write workers would otherwise sit blocked on an empty queue
+// forever instead of noticing the peer is gone. Teardown only closes the leg
+// sockets and signals closed; the chunks already handed to chunkCh stay in
+// memory for Read to finish reassembling.
+func (c *Conn) legDone() {
+	if atomic.AddInt32(&c.legsActive, -1) == 0 {
+		close(c.legsDone)
+		// Close, not teardown: go through the graceful path so any write
+		// still in flight on the other direction finishes before the legs are
+		// closed. A bare teardown here would close a leg out from under a
+		// writeLeg mid-send, dropping the tail of the stream it was writing.
+		// Run it in its own goroutine so this readLeg doesn't block on the
+		// write workers draining.
+		go c.Close()
+	}
+}
+
 // writeLeg is a worker that pulls the next queued chunk - whichever one is
 // available first - and sends it on this leg. A leg that's draining fast
 // comes back for more sooner, so faster/less congested legs naturally end
 // up carrying more of the flow instead of every leg getting a fixed,
 // round-robined share regardless of how quickly it can move it.
 //
-// Before actually sending, it waits for a slot from sched: on a link where
-// the legs are truly independent, cwnd stays maxed out and this never
-// blocks meaningfully. On a shared bottleneck, sched throttles how many
-// legs are allowed to be pushing at once, based on observed latency,
-// instead of letting all of them race the same queue unthrottled.
+// Pacing is left to each leg's own transport (smux stream flow control over
+// TCP congestion control): a congested leg simply blocks in Write until its
+// window opens, so it takes fewer chunks off the shared queue. An earlier
+// version added a global in-flight cap across all legs on top of this, to
+// keep the ensemble from hammering a shared bottleneck - but with in-order
+// reassembly on the far end it could deadlock: the cap could starve the exact
+// leg carrying the sequence number the reader was blocked on, and that
+// reader's stall was in turn what kept the in-flight slot from freeing.
+// Per-leg backpressure alone can't form that cycle, because every leg can
+// always make progress independently.
 func (c *Conn) writeLeg(leg net.Conn) {
+	defer c.writersWG.Done()
 	header := make([]byte, headerSize)
 	for {
-		var job writeJob
+		// Always prefer to drain a queued chunk before considering exit. This
+		// is what makes a graceful Close lossless even when a teardown races
+		// it: a worker can only stop once writeQueue is genuinely empty, so no
+		// still-queued tail chunk is ever abandoned to the closed/flush signal.
 		select {
-		case job = <-c.writeQueue:
+		case job := <-c.writeQueue:
+			if !c.writeChunk(leg, header, job) {
+				return
+			}
+			continue
+		default:
+		}
+
+		select {
+		case job := <-c.writeQueue:
+			if !c.writeChunk(leg, header, job) {
+				return
+			}
+		case <-c.flush:
+			return // graceful close and the queue is drained
 		case <-c.closed:
 			return
 		}
-
-		if !c.sched.acquire(c.closed) {
-			return // Conn is closing
-		}
-
-		start := time.Now()
-		if err := leg.SetWriteDeadline(time.Now().Add(c.stallTimeout)); err != nil {
-			c.sched.release(c.stallTimeout)
-			c.fail(err)
-			return
-		}
-
-		binary.BigEndian.PutUint32(header[0:4], job.seq)
-		binary.BigEndian.PutUint32(header[4:8], uint32(len(job.data)))
-
-		if _, err := leg.Write(header); err != nil {
-			c.sched.release(time.Since(start))
-			c.fail(err)
-			return
-		}
-		if len(job.data) > 0 {
-			if _, err := leg.Write(job.data); err != nil {
-				c.sched.release(time.Since(start))
-				c.fail(err)
-				return
-			}
-		}
-		c.sched.release(time.Since(start))
 	}
 }
 
+// writeChunk frames and sends one chunk on a leg, returning false (after
+// failing the whole Conn) if the leg errors.
+func (c *Conn) writeChunk(leg net.Conn, header []byte, job writeJob) bool {
+	if err := leg.SetWriteDeadline(time.Now().Add(c.stallTimeout)); err != nil {
+		c.fail(err)
+		return false
+	}
+	binary.BigEndian.PutUint32(header[0:4], job.seq)
+	binary.BigEndian.PutUint32(header[4:8], uint32(len(job.data)))
+	if _, err := leg.Write(header); err != nil {
+		c.fail(err)
+		return false
+	}
+	if len(job.data) > 0 {
+		if _, err := leg.Write(job.data); err != nil {
+			c.fail(err)
+			return false
+		}
+	}
+	return true
+}
+
 // fail records the first error seen (from either direction) and tears the
-// whole striped connection down. Without this, one leg going quietly dead
-// (no error, just never progressing) would leave Read blocked forever and
-// the streams/goroutines behind the other legs never released.
+// whole striped connection down - abruptly, without the graceful write flush
+// Close does, since a leg has already broken. Without this, one leg going
+// quietly dead (no error, just never progressing) would leave Read blocked
+// forever and the streams/goroutines behind the other legs never released.
 //
-// permErr is set here directly rather than only inside Read's error
-// handling: a write-side failure (a leg's write deadline expiring) has to
-// be visible to the *next* Write call even if nothing ever calls Read on
-// this Conn to drain errCh.
+// permErr is set here directly rather than only inside Read's error handling:
+// a write-side failure (a leg's write deadline expiring) has to be visible to
+// the next Write call even if nothing ever calls Read on this Conn.
 func (c *Conn) fail(err error) {
 	c.setPermErr(err)
 	select {
 	case c.errCh <- err:
 	default:
 	}
-	c.Close()
+	c.teardown()
 }
 
 // setPermErr records the first permanent error seen, from either Read or
@@ -237,6 +331,17 @@ func (c *Conn) getPermErr() error {
 func (c *Conn) Write(p []byte) (int, error) {
 	if err := c.getPermErr(); err != nil {
 		return 0, err
+	}
+	// A torn-down Conn (e.g. the peer closed every leg, tripping legDone)
+	// isn't necessarily carrying a permErr, but writes to it must still fail
+	// rather than pile up in a queue no worker will ever drain.
+	select {
+	case <-c.closed:
+		if err := c.getPermErr(); err != nil {
+			return 0, err
+		}
+		return 0, net.ErrClosed
+	default:
 	}
 
 	c.wmu.Lock()
@@ -265,22 +370,69 @@ func (c *Conn) Write(p []byte) (int, error) {
 	return total, nil
 }
 
+// stash files a chunk: if it's the next byte in line it becomes the read
+// buffer, otherwise it waits in pending until its turn comes.
+func (c *Conn) stash(ch chunk) {
+	if ch.seq == c.nextSeq {
+		c.readBuf = ch.data
+		c.nextSeq++
+	} else {
+		c.pending[ch.seq] = ch
+	}
+}
+
+// drainAvailable pulls everything currently sitting in chunkCh into the
+// reassembly state without blocking. Used at end-of-stream and on error to
+// make sure nothing already received is dropped before deciding what to do.
+func (c *Conn) drainAvailable() {
+	for {
+		select {
+		case ch := <-c.chunkCh:
+			c.stash(ch)
+		default:
+			return
+		}
+	}
+}
+
 // Read reassembles chunks arriving out of order across legs into the
-// original in-order byte stream. It gives up - and tears the whole Conn
-// down - if the next sequence number in line doesn't show up within
-// stallTimeout, rather than blocking forever on a leg that's gone silent
-// without actually erroring.
+// original in-order byte stream. It reports a clean io.EOF only once every
+// leg has ended and nothing is left stranded; a gap when the legs end, or a
+// missing sequence number that never arrives within stallTimeout, is an
+// error (io.ErrUnexpectedEOF / stall) - like a dropped connection, since
+// there's no retransmission.
 func (c *Conn) Read(p []byte) (int, error) {
 	c.rmu.Lock()
 	defer c.rmu.Unlock()
 
 	if len(c.readBuf) == 0 {
+		// A completed stream reports EOF even if a leg later errored - every
+		// byte was delivered, so it's a clean end.
+		if c.complete() {
+			return 0, io.EOF
+		}
 		if err := c.getPermErr(); err != nil {
-			return 0, err
+			// Deliver anything already reassembled and contiguously
+			// available before surfacing the sticky error.
+			if ch, ok := c.pending[c.nextSeq]; ok {
+				delete(c.pending, c.nextSeq)
+				c.readBuf = ch.data
+				c.nextSeq++
+			} else {
+				return 0, err
+			}
 		}
 	}
 
 	for len(c.readBuf) == 0 {
+		// Completion is defined by the sender's announced total, not by leg
+		// EOF timing: once every chunk up to the total has been delivered in
+		// order, the stream is done. This is what stops the tail of a stream
+		// slipping through as a short read when a leg's EOF races the last
+		// few chunks still sitting in chunkCh.
+		if c.complete() {
+			return 0, io.EOF
+		}
 		if ch, ok := c.pending[c.nextSeq]; ok {
 			delete(c.pending, c.nextSeq)
 			c.readBuf = ch.data
@@ -292,29 +444,37 @@ func (c *Conn) Read(p []byte) (int, error) {
 		select {
 		case ch := <-c.chunkCh:
 			timer.Stop()
-			if ch.seq == c.nextSeq {
-				c.readBuf = ch.data
-				c.nextSeq++
-			} else {
-				c.pending[ch.seq] = ch
+			c.stash(ch)
+
+		case <-c.totalKnown:
+			timer.Stop()
+			// The total just became known; loop to re-check completion and
+			// drain whatever is buffered.
+			c.drainAvailable()
+
+		case <-c.legsDone:
+			timer.Stop()
+			// Every leg ended. Absorb anything still buffered; if that
+			// completes the stream we'll report EOF on the next loop, otherwise
+			// a byte range no leg carried is genuinely lost.
+			c.drainAvailable()
+			if len(c.readBuf) == 0 && !c.complete() {
+				if _, ok := c.pending[c.nextSeq]; !ok {
+					err := io.ErrUnexpectedEOF
+					c.setPermErr(err)
+					c.teardown()
+					return 0, err
+				}
 			}
 
 		case err := <-c.errCh:
 			timer.Stop()
 			c.setPermErr(err)
-			// A leg erroring doesn't necessarily mean the chunk we're
-			// waiting on is lost - drain whatever is already queued
-			// before giving up.
-			select {
-			case ch := <-c.chunkCh:
-				if ch.seq == c.nextSeq {
-					c.readBuf = ch.data
-					c.nextSeq++
-				} else {
-					c.pending[ch.seq] = ch
-				}
-			default:
-				if len(c.readBuf) == 0 {
+			// A leg erroring doesn't necessarily mean the chunk we're waiting
+			// on is lost - absorb whatever is already queued before giving up.
+			c.drainAvailable()
+			if len(c.readBuf) == 0 && !c.complete() {
+				if _, ok := c.pending[c.nextSeq]; !ok {
 					return 0, c.getPermErr()
 				}
 			}
@@ -322,7 +482,7 @@ func (c *Conn) Read(p []byte) (int, error) {
 		case <-timer.C:
 			stallErr := fmt.Errorf("striping: stalled waiting for sequence %d for %s", c.nextSeq, c.stallTimeout)
 			c.setPermErr(stallErr)
-			c.Close()
+			c.teardown()
 			return 0, stallErr
 		}
 	}
@@ -343,11 +503,52 @@ func (c *Conn) currentErr() error {
 	}
 }
 
+// Close flushes queued writes to the legs before tearing them down, so the
+// tail of the stream isn't dropped when Close follows the last Write. A
+// broken leg takes the abrupt path via fail instead.
 func (c *Conn) Close() error {
+	c.flushOnce.Do(func() {
+		close(c.flush)
+		done := make(chan struct{})
+		go func() {
+			c.writersWG.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(c.stallTimeout):
+		}
+		// All data chunks are now flushed to the legs; announce the total so
+		// the peer knows exactly how many to expect, before teardown sends FIN.
+		c.sendEndMarkers()
+	})
+	return c.teardown()
+}
+
+// sendEndMarkers writes the end-of-stream marker (carrying the total data-chunk
+// count) on every leg. Called after the write workers have exited, so there is
+// no concurrent writer on any leg. Best-effort: a leg that errors is left to
+// teardown, and the peer only needs the marker on one surviving leg.
+func (c *Conn) sendEndMarkers() {
+	c.wmu.Lock()
+	total := c.writeSeq
+	c.wmu.Unlock()
+
+	var header [headerSize]byte
+	binary.BigEndian.PutUint32(header[0:4], total)
+	binary.BigEndian.PutUint32(header[4:8], endMarkerLen)
+	for _, leg := range c.legs {
+		_ = leg.SetWriteDeadline(time.Now().Add(c.stallTimeout))
+		_, _ = leg.Write(header[:])
+	}
+}
+
+// teardown signals every goroutine to stop and closes all legs. Idempotent;
+// shared by Close (after its flush) and fail (immediately).
+func (c *Conn) teardown() error {
 	var err error
 	c.closeOnce.Do(func() {
 		close(c.closed)
-		c.sched.stop()
 		for _, leg := range c.legs {
 			if e := leg.Close(); e != nil {
 				err = e
