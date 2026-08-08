@@ -381,14 +381,23 @@ func (c *Conn) stash(ch chunk) {
 	}
 }
 
-// drainAvailable pulls everything currently sitting in chunkCh into the
-// reassembly state without blocking. Used at end-of-stream and on error to
-// make sure nothing already received is dropped before deciding what to do.
+// drainAvailable moves everything currently sitting in chunkCh into the
+// pending map without blocking. Used at end-of-stream and on error to make
+// sure nothing already received is dropped before deciding what to do.
+//
+// It deliberately files every chunk into pending rather than calling stash:
+// stash promotes a next-in-line chunk straight into readBuf, so draining
+// several contiguous chunks in a row would overwrite readBuf again and again,
+// advancing nextSeq (counting them delivered) while silently discarding all
+// but the last one's bytes. Leaving them in pending lets Read's main loop hand
+// them to the caller one at a time.
 func (c *Conn) drainAvailable() {
 	for {
 		select {
 		case ch := <-c.chunkCh:
-			c.stash(ch)
+			if ch.seq >= c.nextSeq {
+				c.pending[ch.seq] = ch
+			}
 		default:
 			return
 		}

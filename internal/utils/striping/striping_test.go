@@ -338,3 +338,47 @@ func TestStripedSharedBottleneck(t *testing.T) {
 		t.Fatalf("reassembled payload mismatch over shared bottleneck (got %d bytes, want %d)", len(got), len(payload))
 	}
 }
+
+// slowConn wraps a net.Conn and delays reads, simulating a receiver that
+// drains slower than the sender fills - which backs data up in the reassembly
+// path and widens the shutdown race window.
+type slowConn struct {
+	net.Conn
+	delay time.Duration
+}
+
+func (s *slowConn) Read(p []byte) (int, error) {
+	time.Sleep(s.delay)
+	return s.Conn.Read(p)
+}
+
+// TestStripedWriteThenCloseNoLoss is the regression test for the tail-loss:
+// the sender writes a payload and Closes (the real pump's sequence), the
+// receiver reads to EOF. Every byte must arrive - a clean shutdown is
+// lossless. Repeated many times to catch the intermittent teardown race.
+func TestStripedWriteThenCloseNoLoss(t *testing.T) {
+	for iter := 0; iter < 400; iter++ {
+		legs, peers := pipePair(4)
+		client := New(legs, 4096)
+		server := New(peers, 4096)
+
+		payload := make([]byte, 1<<20+123) // ~1MB, not a chunk multiple
+		if _, err := rand.Read(payload); err != nil {
+			t.Fatalf("rand: %v", err)
+		}
+
+		go func() {
+			client.Write(payload)
+			client.Close()
+		}()
+
+		got, err := io.ReadAll(server)
+		if err != nil {
+			t.Fatalf("iter %d: read to EOF failed: %v (got %d/%d bytes)", iter, err, len(got), len(payload))
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("iter %d: short/again read: got %d bytes, want %d", iter, len(got), len(payload))
+		}
+		server.Close()
+	}
+}
