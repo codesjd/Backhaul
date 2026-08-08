@@ -662,9 +662,21 @@ func (s *WsMuxTransport) stripedDispatchLoop() {
 			return
 
 		case incomingConn := <-s.localChannel:
+			// streamCounter was incremented when this connection was accepted
+			// (localListener). It drives pool sizing via the streamCounter >=
+			// sessionCounter*MuxCon check, so it MUST be decremented once for
+			// every connection that leaves this pipeline - whether it is dropped
+			// here or handed to a handler that later finishes. handleSession does
+			// the same for the non-striped path; omitting it here made
+			// streamCounter grow without bound, so the server kept requesting new
+			// tunnel connections and smux sessions piled up until the pool was
+			// exhausted. A connection put *back* on localChannel keeps its count
+			// (it will pass through here again), so only the drop branches below
+			// decrement.
 			if time.Now().UnixMilli()-incomingConn.timeCreated > 3000 { // 3000ms
 				s.logger.Debugf("timeouted local connection: %d ms", time.Now().UnixMilli()-incomingConn.timeCreated)
 				incomingConn.conn.Close()
+				atomic.AddInt32(&s.streamCounter, -1)
 				continue
 			}
 
@@ -676,6 +688,7 @@ func (s *WsMuxTransport) stripedDispatchLoop() {
 				case s.localChannel <- incomingConn:
 				default:
 					incomingConn.conn.Close()
+					atomic.AddInt32(&s.streamCounter, -1)
 				}
 				continue
 			}
@@ -697,6 +710,7 @@ func (s *WsMuxTransport) stripedDispatchLoop() {
 				case s.localChannel <- incomingConn:
 				default:
 					incomingConn.conn.Close()
+					atomic.AddInt32(&s.streamCounter, -1)
 				}
 				continue
 			}
@@ -709,7 +723,10 @@ func (s *WsMuxTransport) stripedDispatchLoop() {
 
 			sem <- struct{}{}
 			go func(local net.Conn, remote net.Conn, port int) {
-				defer func() { <-sem }()
+				defer func() {
+					atomic.AddInt32(&s.streamCounter, -1)
+					<-sem
+				}()
 				handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, local, remote, s.logger, s.usageMonitor, port, s.config.Sniffer)
 			}(incomingConn.conn, stripedConn, incomingConn.conn.LocalAddr().(*net.TCPAddr).Port)
 		}
