@@ -74,6 +74,19 @@ func transferData(from net.Conn, to net.Conn, logger *logrus.Logger, usage *web.
 
 	n, err := io.CopyBuffer(to, from, *bufPtr)
 
+	// A copy that ends on a real transport error - not a clean EOF (err == nil),
+	// and not our own side being closed by the other direction's teardown
+	// (net.ErrClosed) - means the byte stream feeding `to` was truncated at the
+	// source. For a striped destination, tell it so it does not emit the
+	// end-of-stream marker that would certify the partial stream as complete:
+	// the far end's Read then reports io.ErrUnexpectedEOF instead of a clean EOF
+	// that silently hides the lost tail.
+	if err != nil && !errors.Is(err, net.ErrClosed) {
+		if aw, ok := to.(interface{ AbortWrite() }); ok {
+			aw.AbortWrite()
+		}
+	}
+
 	from.Close()
 	to.Close()
 

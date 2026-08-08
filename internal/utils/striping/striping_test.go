@@ -382,3 +382,69 @@ func TestStripedWriteThenCloseNoLoss(t *testing.T) {
 		server.Close()
 	}
 }
+
+// TestStripedAbortWriteIsLoud is the regression test for the silent-truncation
+// bug: when the byte stream feeding a striped sender is cut short by an
+// upstream error, the sender must NOT tell the peer the (partial) stream is
+// complete. In the real proxy this happened when a forwarded connection's
+// source was reset mid-transfer: the sender had queued only some of the bytes,
+// Close announced that partial count as the authoritative total via the
+// end-of-stream marker, and the receiver reported a clean io.EOF at the
+// truncated boundary - silently passing a short read off as the whole stream.
+//
+// With AbortWrite the sender suppresses the end-of-stream marker, so the
+// receiver's Read surfaces io.ErrUnexpectedEOF (a dropped-connection-style
+// error) instead of a clean EOF. Data may be lost when a source is truncated -
+// there is no retransmission - but it must be lost loudly, never silently.
+func TestStripedAbortWriteIsLoud(t *testing.T) {
+	for iter := 0; iter < 100; iter++ {
+		legs, peers := pipePair(3)
+		sender := New(legs, 4096)
+		receiver := New(peers, 4096)
+
+		payload := make([]byte, 80*4096+17) // 80-ish chunks
+		if _, err := rand.Read(payload); err != nil {
+			t.Fatalf("rand: %v", err)
+		}
+
+		go func() {
+			sender.Write(payload)
+			sender.AbortWrite() // the write source was truncated upstream
+			sender.Close()
+		}()
+
+		_, err := io.ReadAll(receiver)
+		if err == nil {
+			t.Fatalf("iter %d: truncated stream reported a clean EOF - silent data loss", iter)
+		}
+		receiver.Close()
+	}
+}
+
+// TestStripedCleanCloseStillEOF guards the other half of the contract: a normal
+// Write+Close (no AbortWrite) must still deliver every byte and end on a clean
+// io.EOF. This makes sure the AbortWrite gate did not make ordinary closes loud.
+func TestStripedCleanCloseStillEOF(t *testing.T) {
+	legs, peers := pipePair(3)
+	sender := New(legs, 4096)
+	receiver := New(peers, 4096)
+	defer receiver.Close()
+
+	payload := make([]byte, 50*4096+9)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+
+	go func() {
+		sender.Write(payload)
+		sender.Close()
+	}()
+
+	got, err := io.ReadAll(receiver)
+	if err != nil {
+		t.Fatalf("clean close should read to a clean EOF, got %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("clean close lost data: got %d bytes, want %d", len(got), len(payload))
+	}
+}
