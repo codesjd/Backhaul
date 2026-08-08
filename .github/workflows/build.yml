@@ -34,3 +34,32 @@ jobs:
         with:
           name: backhaul_linux_amd64
           path: backhaul_linux_amd64
+
+  build-linux-amd64-openssl:
+    name: Build (linux/amd64, openssl)
+    runs-on: ubuntu-latest
+    env:
+      GOOS: linux
+      GOARCH: amd64
+      CGO_ENABLED: 1
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Install libssl headers
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
+      - name: Build
+        run: go build -ldflags="-s -w" -tags openssl -o backhaul_linux_amd64_openssl ./main.go
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backhaul_linux_amd64_openssl
+          path: backhaul_linux_amd64_openssl
