@@ -15,6 +15,20 @@ import (
 func WSConnectionHandler(ctx context.Context, wsConn *websocket.Conn, tcpConn net.Conn, logger *logrus.Logger, usage *web.Usage, remotePort int, sniffer bool) {
 	done := make(chan struct{})
 
+	// Close both ends as soon as the transport context is cancelled (e.g. on a
+	// tunnel restart). The transfer loops below block on a read until the peer
+	// closes, so without this watcher an idle tunnelled connection would linger
+	// long past the restart, leaking sockets that pile up across repeated
+	// restarts. Closing the connections unblocks both directions at once.
+	go func() {
+		select {
+		case <-ctx.Done():
+			wsConn.Close()
+			tcpConn.Close()
+		case <-done:
+		}
+	}()
+
 	go func() {
 		defer close(done)
 		transferWebSocketToTCP(wsConn, tcpConn, logger, usage, remotePort, sniffer)
@@ -22,13 +36,9 @@ func WSConnectionHandler(ctx context.Context, wsConn *websocket.Conn, tcpConn ne
 
 	transferTCPToWebSocket(tcpConn, wsConn, logger, usage, remotePort, sniffer)
 
-	select {
-	case <-ctx.Done():
-		wsConn.Close()
-		tcpConn.Close()
-		return
-	case <-done:
-	}
+	// Wait for the reverse copy to finish; both directions close both ends on
+	// return, so this resolves promptly once either side completes.
+	<-done
 }
 
 // transferWebSocketToTCP transfers data from a WebSocket connection to a TCP connection
