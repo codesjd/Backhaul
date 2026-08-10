@@ -33,6 +33,7 @@ type WsTransport struct {
 	controlChannel *websocket.Conn
 	restartMutex   sync.Mutex
 	usageMonitor   *web.Usage
+	fallbackProxy  http.Handler
 }
 
 type WsConfig struct {
@@ -51,11 +52,20 @@ type WsConfig struct {
 	WebPort      int
 	Mode         config.TransportType // ws or wss
 	Path         string
+	Fallback     string // decoy backend for non-tunnel requests (host:port), optional
+	TLSEngine    string // "go" (default) or "openssl" for wss TLS termination
 }
 
 func NewWSServer(parentCtx context.Context, config *WsConfig, logger *logrus.Logger) *WsTransport {
 	// Create a derived context from the parent context
 	ctx, cancel := context.WithCancel(parentCtx)
+
+	// Build the decoy fallback proxy once, if configured. A bad address is
+	// fatal here rather than silently disabling camouflage at runtime.
+	fallbackProxy, err := network.NewFallbackProxy(config.Fallback)
+	if err != nil {
+		logger.Fatalf("invalid fallback address %q: %v", config.Fallback, err)
+	}
 
 	// Initialize the TcpTransport struct
 	server := &WsTransport{
@@ -69,6 +79,7 @@ func NewWSServer(parentCtx context.Context, config *WsConfig, logger *logrus.Log
 		reqNewConnChan: make(chan struct{}, config.ChannelSize),
 		controlChannel: nil, // will be set when a control connection is established
 		usageMonitor:   web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), ctx, config.SnifferLog, config.Sniffer, &config.TunnelStatus, logger),
+		fallbackProxy:  fallbackProxy,
 	}
 
 	return server
@@ -222,9 +233,20 @@ func (s *WsTransport) tunnelListener() {
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			s.logger.Tracef("received http request from %s", r.RemoteAddr)
 
-			// Read the "Authorization" header
+			// A request is legitimate tunnel traffic only if it carries the
+			// token AND targets the control or a tunnel path. Anything else -
+			// a wrong/absent token, or a probe hitting "/" - is not upgraded:
+			// if a decoy fallback is configured it is reverse-proxied there so
+			// the origin looks like an ordinary website, otherwise it is
+			// rejected as before.
+			isTunnelPath := r.URL.Path == channelPath || strings.HasPrefix(r.URL.Path, tunnelPathPrefix)
 			authHeader := r.Header.Get("Authorization")
-			if authHeader != fmt.Sprintf("Bearer %v", s.config.Token) {
+			if authHeader != fmt.Sprintf("Bearer %v", s.config.Token) || !isTunnelPath {
+				if s.fallbackProxy != nil {
+					s.logger.Debugf("serving fallback for %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
+					s.fallbackProxy.ServeHTTP(w, r)
+					return
+				}
 				s.logger.Warnf("unauthorized request from %s, closing connection", r.RemoteAddr)
 				http.Error(w, "unauthorized", http.StatusUnauthorized) // Send 401 Unauthorized response
 				return
@@ -294,11 +316,19 @@ func (s *WsTransport) tunnelListener() {
 		}()
 	} else {
 		go func() {
-			s.logger.Infof("wss server starting, listening on %s", addr)
+			engine := s.config.TLSEngine
+			if engine == "" {
+				engine = network.TLSEngineGo
+			}
+			s.logger.Infof("wss server starting, listening on %s (tls engine: %s)", addr, engine)
 			if s.controlChannel == nil {
 				s.logger.Info("waiting for wss control channel connection")
 			}
-			if err := server.ListenAndServeTLS(s.config.TLSCertFile, s.config.TLSKeyFile); err != nil && err != http.ErrServerClosed {
+			ln, err := network.NewTLSListener(s.config.TLSEngine, addr, s.config.TLSCertFile, s.config.TLSKeyFile)
+			if err != nil {
+				s.logger.Fatalf("failed to create tls listener on %s: %v", addr, err)
+			}
+			if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
 				s.logger.Fatalf("failed to listen on %s: %v", addr, err)
 			}
 		}()

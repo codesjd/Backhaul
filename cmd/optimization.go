@@ -54,6 +54,19 @@ func ApplyTCPTuning() {
 			{"sysctl", "-w", "net.ipv4.tcp_max_syn_backlog=20480"},      // Increase SYN request backlog
 			{"sysctl", "-w", "net.ipv4.tcp_window_scaling=1"},           // Enable TCP window scaling
 			{"sysctl", "-w", "net.ipv4.tcp_fastopen=3"},                 // Enable TCP Fast Open
+			// BBR congestion control + the fq qdisc it needs. On a
+			// high-RTT, mildly-lossy intercontinental link - the exact
+			// shape of a backhaul tunnel between a censored region and an
+			// exit node - the default (cubic/reno) collapses its window on
+			// every stray packet loss and never fills the pipe, so a 1Gbps
+			// path stalls out well below line rate. BBR paces to the
+			// measured bottleneck bandwidth instead of reacting to loss,
+			// which is the single biggest throughput win on these links and
+			// costs no extra CPU. If the tcp_bbr module isn't loadable the
+			// sysctl just fails and is logged (non-fatal), same as any other
+			// entry here.
+			{"sysctl", "-w", "net.core.default_qdisc=fq"},
+			{"sysctl", "-w", "net.ipv4.tcp_congestion_control=bbr"},
 			// {"sysctl", "-w", "net.ipv4.tcp_rmem = 16384 1048576 33554432"}, // Maximum of 1MB of TCP read buffer memory
 			// {"sysctl", "-w", "net.ipv4.tcp_wmem = 16384 1048576 33554432"}, // Maximum of 1MB TCP write buffer memory
 			// tcp_notsent_lowat deliberately left at the OS default (unlimited).

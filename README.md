@@ -97,13 +97,15 @@ To start using the solution, you'll need to configure both server and client com
     mux_recievebuffer = 4194304   # 4 MB. The maximum buffer size for incoming data per connection. (optional)
     mux_streambuffer = 65536      # 256 KB. The maximum buffer size per individual stream within a connection. (optional)
     mux_keepalive_disabled = false # wsmux/wssmux: disable smux's built-in per-connection keepalive ping. Every pool connection pings on the same fixed interval, which is a traffic-pattern signal; disabling it relies on TCP keepalive instead. (optional, default: false)
-    mux_stripe = 1                 # wsmux/wssmux (prototype): split a single flow's data across this many pool connections instead of pinning it to one, so one flow isn't capped by a single connection's congestion window/RTT. Must match on both server and client. 1 disables it (default). No leg-failure recovery yet - only use with links where pool connections don't drop mid-transfer. (optional, default: 1)
+    mux_stripe = 1                 # wsmux/wssmux: split a single flow's data across this many pool connections instead of pinning it to one, so one flow isn't capped by a single connection's congestion window/RTT (the win on a lossy, high-RTT link). Must match on both server and client. 1 disables it (default). The earlier deadlock and tail data-loss bugs are fixed and covered by tests (incl. -race and a large end-to-end integrity run). Still newer than the single-connection path and has no leg-failure recovery - if a pool connection drops mid-transfer the flow ends (surfacing as a reset, never silent corruption) - so raise it above 1 when you need the single-flow boost on a loss-limited link. (optional, default: 1)
     sniffer = false               # Enable or disable network sniffing for monitoring data. (optional, default false)
     web_port = 2060               # Port number for the web interface or monitoring interface. (optional, set to 0 to disable).
     sniffer_log ="/root/log.json" # Filename used to store network traffic and usage data logs. (optional, default backhaul.json)
     tls_cert = "/root/server.crt" # Path to the TLS certificate file for wss/wssmux. (mandatory).
     tls_key = "/root/server.key"  # Path to the TLS private key file for wss/wssmux. (mandatory).
     path = ""                     # Custom base path prepended to the /channel and /tunnel endpoints, for ws/wss/wsmux/wssmux. (optional, default: none)
+    fallback = ""                 # ws/wss/wsmux/wssmux: host:port of a decoy web backend. Requests that aren't valid tunnel traffic (wrong/absent token, or any non-tunnel path such as "/") are reverse-proxied here instead of getting a 401, so a single backhaul origin can carry the tunnel under a secret path AND look like an ordinary website to probes - no separate nginx needed in the data path. e.g. "127.0.0.1:8080". (optional, default: none)
+    tls_engine = "go"             # wss/wssmux: TLS stack that terminates the connection. "go" (default) uses Go's crypto/tls and keeps the pure-Go static binary. "openssl" terminates with the system OpenSSL so the server's TLS handshake fingerprint matches a same-version nginx (Go's stack e.g. always picks AES-128-GCM for TLS 1.3 where nginx/OpenSSL picks AES-256-GCM). "openssl" ONLY works in a binary built with `-tags openssl` (CGO_ENABLED=1); see the OpenSSL build note. Use it when the origin IP is directly reachable and could be fingerprinted. (optional, default: "go")
     log_level = "info"            # Log level ("panic", "fatal", "error", "warn", "info", "debug", "trace", optional, default: "info").
     skip_optz = true              # Skip optimizations performed by Backhaul (default: false)
     mss = 1360                    # TCP/TCPMux: Maximum Segment Size in bytes; controls max TCP payload size to avoid fragmentation. (default: system-defined)
@@ -583,6 +585,72 @@ journalctl -u backhaul.service -e -f
 * `tcpmux`: Use if you need to handle multiple sessions over a single connection.
 * `ws`: Use if you need to traverse HTTP-based firewalls or proxies.
 * `wss`: Use this for secure WebSocket connections that need to traverse HTTP-based firewalls or proxies. It encrypts data for added security, similar to WS but with encryption. Its TLS ClientHello is generated with uTLS to mimic Chrome, for CDN edges/DPI that fingerprint the TLS handshake itself.
+
+**Q: My CPU saturates (~95%) on a low-core box and I can't reach line rate (e.g. 1Gbps). Why, and what actually helps?**
+
+On these boxes the per-byte CPU cost is almost entirely **TLS/AES**, not moving bytes. The right fix depends on whether you're free to choose the transport or locked into WebSocket-over-TLS by a CDN.
+
+*If you control both ends and don't need a CDN/HTTP front:* prefer `tcp` or `tcpmux`. With those, both ends of each forwarded connection are raw `*net.TCPConn`, so the data pump routes straight to `splice(2)` on Linux - bytes move kernel-side without ever entering this process, so backhaul's own per-byte CPU cost is effectively zero (`ws`/`wss`/`wsmux`/`wssmux` cannot take that path). And don't wrap already-encrypted traffic (e.g. an xray/VLESS/Reality payload) in a second TLS layer - that extra AES pass costs CPU without adding confidentiality.
+
+*If you're behind a CDN (Cloudflare, etc.) and must use `ws`/`wss`/`wsmux`/`wssmux` for obfuscation:* `tcp` and `splice` are off the table, so the levers are:
+
+* **Check AES-NI first:** `grep -m1 -o aes /proc/cpuinfo`. Cheap VPS instances often don't expose it to the guest, and without it TLS termination is several times more expensive - frequently the entire reason a 2-core box stalls below 1Gbps. If it's present, make sure the negotiated cipher is AES-GCM (hardware-accelerated) rather than ChaCha20.
+* **Get nginx out of the tunnel's data path** - it's usually the real bottleneck. When nginx fronts the tunnel to serve a decoy site under the same hostname (path-based camouflage), it must terminate TLS and reverse-proxy the WebSocket, and it has **no zero-copy path for a proxied WebSocket** - it copies every byte in userspace, burning roughly a core per Gbps. On a 2-core box, a single ~1Gbps flow then eats one core in nginx and another in backhaul, saturating both. Point the CDN/origin **straight at backhaul** (`transport = "wss"`/`"wssmux"`, backhaul terminates the origin TLS itself) and let the `fallback` option (below) preserve the decoy - so the camouflage stays but nginx no longer copies the tunnel's bytes.
+* **Trim nginx waste on the tunnel vhost:** `access_log off;`, `gzip off;`, `ssl_protocols TLSv1.2 TLSv1.3;` only, and `worker_cpu_affinity auto;` so workers spread across every core. Keep `proxy_buffering off;` - that's correct for a streamed tunnel.
+* **`mux_*` settings only apply to the mux transports.** On plain `ws`/`wss` (and `tcp`), `mux_con`, `mux_framesize`, `mux_recievebuffer`, `mux_streambuffer` and `mux_stripe` are silently ignored - each forwarded connection is its own WebSocket. If you set large mux buffers expecting them to take effect, switch the transport to `wsmux`/`wssmux` (still just WebSocket-over-TLS, so it passes through a CDN exactly like `ws`/`wss`).
+* **If one core is pinned while the other is idle** (a single big flow bottlenecked on one connection's copy/decrypt), the mux transports' `mux_stripe = N` splits that one flow across N pooled connections so it can use more than one core - or, more commonly on an intercontinental link, across N congestion windows so per-flow packet loss doesn't cap it. The earlier deadlock and tail data-loss bugs are fixed (see the option docs); it has no leg-failure recovery, so a dropped pool connection ends the flow with a reset rather than silent corruption. If *both* cores are already saturated (aggregate-bound), striping won't help anyway - you're out of CPU, so reduce per-byte cost with the points above instead.
+
+**Q: But I need the decoy site for obfuscation - that's why nginx is there. How do I drop it without losing camouflage?**
+
+Use the server's `fallback` option so backhaul itself is the CDN origin and plays both roles:
+
+```toml
+[server]
+bind_addr = "0.0.0.0:443"          # backhaul is the origin, terminates TLS itself
+transport = "wss"                  # or "wssmux"
+tls_cert = "/root/certs/site.crt"  # reuse the cert nginx was using
+tls_key  = "/root/certs/site.key"
+path = "/your-secret-path"         # tunnel lives here
+fallback = "127.0.0.1:8080"        # everything else -> your decoy site
+token = "..."
+ports = ["..."]
+```
+
+Run your decoy web server on `127.0.0.1:8080` (a tiny static site is fine). Now:
+
+* A real WebSocket client with the token, hitting `path`, gets the tunnel.
+* A probe/crawler/browser hitting `/` (or any other path, or without the token) is reverse-proxied to the decoy and sees a normal website - the same camouflage nginx gave you, minus the 401 tell.
+
+Because the tunnel bytes now flow **straight through backhaul** instead of being copied by an extra nginx hop, this is the change that most directly frees a CPU core on a low-core box. The decoy traffic still passes through a local server, but that's a negligible trickle - the 1Gbps of tunnel traffic no longer touches it. (Path-based camouflage inherently needs an L7/TLS-terminating router; `fallback` just makes backhaul be that router instead of a separate nginx.)
+
+**Q: If backhaul terminates TLS itself, doesn't its handshake fingerprint differ from nginx's - and give it away to a censor probing my origin directly?**
+
+Yes - and that's a real limitation of the default build, worth being precise about. When backhaul terminates `wss`/`wssmux` with Go's `crypto/tls`, its ServerHello differs from nginx's: most concretely, for TLS 1.3 Go's stack always selects `AES-128-GCM` when AES-NI is present and does not expose TLS 1.3 ciphersuite ordering, whereas nginx (OpenSSL) selects `AES-256-GCM`. A censor who can reach your origin IP directly (e.g. because it also serves users on another port) can fingerprint that difference.
+
+Two things determine whether it matters:
+
+* **If your origin is only reachable through a CDN** (its real IP isn't exposed), the censor sees the CDN's TLS, not backhaul's - so the default Go engine is fine and none of the below is needed.
+* **If your origin IP is directly reachable**, use the OpenSSL TLS engine: set `tls_engine = "openssl"` and run a binary built with OpenSSL. Because it terminates with the *same* OpenSSL library nginx links, the ServerHello - cipher selection and extension order - matches nginx's. (`internal/utils/network` ships a test that asserts the OpenSSL engine negotiates `TLS_AES_256_GCM_SHA384` exactly like nginx while the Go engine negotiates `TLS_AES_128_GCM_SHA256`.)
+
+Honest caveats for the OpenSSL engine:
+
+* It requires cgo, so the binary is **no longer a pure-Go static one**: build with `CGO_ENABLED=1 go build -tags openssl`, and the target servers need a compatible `libssl` installed. Build against and run on the **same OpenSSL major version** your nginx uses for the closest match.
+* nginx's `http2` directive also advertises `h2` in ALPN; this listener speaks HTTP/1.1 only (the WebSocket tunnel needs it), so for tightest parity drop `http2` from any nginx you compare against.
+* It closes the biggest, directly-observable gap (the TLS 1.3 cipher), but "byte-identical to nginx in every respect" is not a claim to lean on - verify your own setup with a fingerprinting tool (e.g. JARM) against a real nginx before relying on it.
+
+Building the OpenSSL variant:
+
+```bash
+# needs a C toolchain and libssl headers, e.g. on Debian/Ubuntu:
+#   apt-get install -y gcc libssl-dev
+CGO_ENABLED=1 go build -tags openssl -o backhaul .
+```
+
+The default `go build` (and the released binaries) remain pure-Go and static; `tls_engine = "openssl"` in one of those exits with a clear error rather than silently downgrading.
+
+**Q: My link is high-latency / intercontinental and throughput stalls well below the line rate even though CPU is fine. What helps?**
+
+Enable **BBR** congestion control (`net.ipv4.tcp_congestion_control=bbr` with `net.core.default_qdisc=fq`). On a high-RTT, mildly-lossy path the default cubic/reno collapses its window on every stray loss and never fills the pipe. BBR paces to the measured bottleneck bandwidth instead, at no extra CPU cost. Backhaul enables this automatically at startup unless `skip_optz = true`. Also size `so_rcvbuf`/`so_sndbuf` to the bandwidth-delay product of the link (e.g. ~8MB for 1Gbps at ~40ms RTT) so the window has room to open.
 
 
 ## Benchmark
