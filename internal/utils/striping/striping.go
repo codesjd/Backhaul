@@ -104,6 +104,13 @@ type Conn struct {
 	errMu   sync.Mutex
 	permErr error // sticky once set: every Read/Write after this returns it
 
+	// writeBroken is set (via AbortWrite) when the byte stream feeding Write was
+	// truncated by an upstream error, so the chunks queued so far are NOT a
+	// complete stream. Close consults it to decide whether the end-of-stream
+	// marker may be sent: emitting it on a truncated stream would tell the peer
+	// the data ended cleanly at the truncation point - silent loss.
+	writeBroken int32
+
 	chunkCh chan chunk
 	errCh   chan error
 
@@ -512,6 +519,17 @@ func (c *Conn) currentErr() error {
 	}
 }
 
+// AbortWrite records that the byte stream feeding Write was truncated by an
+// upstream error - the data queued so far is not a complete stream. A
+// subsequent Close therefore skips the end-of-stream marker, so the peer's Read
+// reports io.ErrUnexpectedEOF (a loud, dropped-connection-style failure)
+// instead of a clean io.EOF that would silently pass the truncated stream off
+// as complete. The caller still calls Close to flush and tear down; AbortWrite
+// only records intent and is safe to call concurrently with, or before, Close.
+func (c *Conn) AbortWrite() {
+	atomic.StoreInt32(&c.writeBroken, 1)
+}
+
 // Close flushes queued writes to the legs before tearing them down, so the
 // tail of the stream isn't dropped when Close follows the last Write. A
 // broken leg takes the abrupt path via fail instead.
@@ -527,9 +545,17 @@ func (c *Conn) Close() error {
 		case <-done:
 		case <-time.After(c.stallTimeout):
 		}
-		// All data chunks are now flushed to the legs; announce the total so
-		// the peer knows exactly how many to expect, before teardown sends FIN.
-		c.sendEndMarkers()
+		// The end-of-stream marker certifies "the complete stream is exactly
+		// writeSeq chunks". Emit it only when the outbound data really is
+		// complete: if the write source was truncated (AbortWrite) or a leg has
+		// already failed, writeSeq is a partial count, and announcing it would
+		// tell the peer the stream ended cleanly at the truncation point -
+		// silent data loss. Skipping it leaves the peer's Read to report
+		// io.ErrUnexpectedEOF when the legs close short, honouring this package's
+		// lossless-or-loud contract.
+		if atomic.LoadInt32(&c.writeBroken) == 0 && c.getPermErr() == nil {
+			c.sendEndMarkers()
+		}
 	})
 	return c.teardown()
 }

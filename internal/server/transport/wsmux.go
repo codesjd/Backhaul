@@ -39,6 +39,7 @@ type WsMuxTransport struct {
 	restartMutex   sync.Mutex
 	streamCounter  int32
 	sessionCounter int32
+	stripedFlows   int32 // in-flight striped flows, bounded by the pool's stream budget
 
 	// sessions is a live registry of pool sessions, used only when
 	// StripeFactor > 1 so the striped dispatcher can pick several sessions
@@ -654,65 +655,125 @@ func (s *WsMuxTransport) openStripedLegs(n int) ([]*smux.Stream, error) {
 // from several distinct pool sessions instead of one stream from one
 // session, so the flow isn't pinned to a single underlying TCP connection.
 func (s *WsMuxTransport) stripedDispatchLoop() {
-	sem := make(chan struct{}, s.config.MuxCon)
-
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
 
 		case incomingConn := <-s.localChannel:
-			if time.Now().UnixMilli()-incomingConn.timeCreated > 3000 { // 3000ms
-				s.logger.Debugf("timeouted local connection: %d ms", time.Now().UnixMilli()-incomingConn.timeCreated)
-				incomingConn.conn.Close()
-				continue
-			}
-
-			legs, err := s.openStripedLegs(s.config.StripeFactor)
-			if err != nil {
-				s.logger.Tracef("striped dispatch: %v, retrying shortly", err)
-				time.Sleep(100 * time.Millisecond)
-				select {
-				case s.localChannel <- incomingConn:
-				default:
-					incomingConn.conn.Close()
-				}
-				continue
-			}
-
-			gid := atomic.AddUint32(&s.stripeGroupID, 1)
-			headerErr := false
-			for i, stream := range legs {
-				if err := utils.SendStripeHeader(stream, gid, uint8(i), uint8(len(legs)), incomingConn.remoteAddr); err != nil {
-					s.logger.Tracef("failed to send stripe header: %v", err)
-					headerErr = true
-					break
-				}
-			}
-			if headerErr {
-				for _, stream := range legs {
-					stream.Close()
-				}
-				select {
-				case s.localChannel <- incomingConn:
-				default:
-					incomingConn.conn.Close()
-				}
-				continue
-			}
-
-			conns := make([]net.Conn, len(legs))
-			for i, st := range legs {
-				conns[i] = st
-			}
-			stripedConn := striping.New(conns, striping.DefaultChunkSize)
-
-			sem <- struct{}{}
-			go func(local net.Conn, remote net.Conn, port int) {
-				defer func() { <-sem }()
-				handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, local, remote, s.logger, s.usageMonitor, port, s.config.Sniffer)
-			}(incomingConn.conn, stripedConn, incomingConn.conn.LocalAddr().(*net.TCPAddr).Port)
+			// Set up each flow in its own goroutine. Opening the legs and writing
+			// the per-leg stripe headers can block on smux flow control when the
+			// pool is busy carrying bulk data; doing it inline would serialize
+			// every new flow's startup behind that one blocking write (the
+			// non-striped path avoids this by dispatching per session). Handing
+			// off keeps a slow setup from inflating the time-to-first-byte of
+			// every other pending connection.
+			go s.dispatchStriped(incomingConn)
 		}
+	}
+}
+
+// dispatchStriped opens the striped legs for one incoming connection, sends the
+// per-leg headers, and pumps the flow. streamCounter (incremented in
+// localListener when the connection was accepted) is decremented exactly once
+// for every connection that leaves this pipeline - dropped here, or handed to a
+// handler that later finishes - mirroring handleSession on the non-striped path.
+// A connection requeued onto localChannel keeps its count, since it passes
+// through here again.
+func (s *WsMuxTransport) dispatchStriped(incomingConn LocalTCPConn) {
+	if time.Now().UnixMilli()-incomingConn.timeCreated > 3000 { // 3000ms
+		s.logger.Debugf("timeouted local connection: %d ms", time.Now().UnixMilli()-incomingConn.timeCreated)
+		incomingConn.conn.Close()
+		atomic.AddInt32(&s.streamCounter, -1)
+		return
+	}
+
+	// Bound concurrent striped flows to the pool's stream budget
+	// (sessionCounter*MuxCon): each flow opens StripeFactor legs and drives a
+	// local dial, so running more flows than the sessions can carry just floods
+	// the pool and the local service. The bound scales with the live pool - as
+	// load makes streamCounter request more sessions, more flows are admitted -
+	// mirroring the non-striped path's per-session MuxCon cap. In the common
+	// under-budget case the slot is taken immediately (no added latency); only a
+	// genuinely saturated pool makes a new flow wait instead of piling on.
+	if !s.acquireStripedSlot() {
+		// ctx cancelled while waiting for a slot
+		incomingConn.conn.Close()
+		atomic.AddInt32(&s.streamCounter, -1)
+		return
+	}
+	defer atomic.AddInt32(&s.stripedFlows, -1)
+
+	legs, err := s.openStripedLegs(s.config.StripeFactor)
+	if err != nil {
+		s.logger.Tracef("striped dispatch: %v, retrying shortly", err)
+		time.Sleep(100 * time.Millisecond)
+		s.requeueOrDrop(incomingConn)
+		return
+	}
+
+	gid := atomic.AddUint32(&s.stripeGroupID, 1)
+	for i, stream := range legs {
+		if err := utils.SendStripeHeader(stream, gid, uint8(i), uint8(len(legs)), incomingConn.remoteAddr); err != nil {
+			s.logger.Tracef("failed to send stripe header: %v", err)
+			for _, st := range legs {
+				st.Close()
+			}
+			s.requeueOrDrop(incomingConn)
+			return
+		}
+	}
+
+	conns := make([]net.Conn, len(legs))
+	for i, st := range legs {
+		conns[i] = st
+	}
+	stripedConn := striping.New(conns, striping.DefaultChunkSize)
+
+	defer atomic.AddInt32(&s.streamCounter, -1)
+	handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, incomingConn.conn, stripedConn, s.logger, s.usageMonitor, incomingConn.conn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
+}
+
+// acquireStripedSlot reserves one in-flight striped-flow slot, blocking (with a
+// short poll) while the pool is at its stream budget so a burst of new flows
+// can't open more legs than the sessions can carry. The budget is
+// sessionCounter*MuxCon streams and each flow uses StripeFactor legs, so at most
+// sessionCounter*MuxCon/StripeFactor flows run at once; the budget grows as the
+// pool does. Returns false only if the transport is shutting down.
+func (s *WsMuxTransport) acquireStripedSlot() bool {
+	sf := int32(s.config.StripeFactor)
+	if sf < 1 {
+		sf = 1
+	}
+	for {
+		active := atomic.LoadInt32(&s.stripedFlows)
+		budget := atomic.LoadInt32(&s.sessionCounter) * int32(s.config.MuxCon)
+		if budget < sf {
+			budget = sf // always admit at least one flow while the pool warms up
+		}
+		if (active+1)*sf <= budget {
+			if atomic.CompareAndSwapInt32(&s.stripedFlows, active, active+1) {
+				return true
+			}
+			continue // lost the CAS race, re-read and retry
+		}
+		select {
+		case <-s.ctx.Done():
+			return false
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+// requeueOrDrop puts a connection whose striped setup could not complete back on
+// localChannel to be retried, or closes it (and releases its streamCounter slot)
+// if the channel is full.
+func (s *WsMuxTransport) requeueOrDrop(incomingConn LocalTCPConn) {
+	select {
+	case s.localChannel <- incomingConn:
+	default:
+		incomingConn.conn.Close()
+		atomic.AddInt32(&s.streamCounter, -1)
 	}
 }
 
