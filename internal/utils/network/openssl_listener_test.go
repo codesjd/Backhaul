@@ -57,7 +57,7 @@ func writeSelfSignedCert(t *testing.T) (certPath, keyPath string) {
 // with Go's TLS client, and reports the TLS 1.3 cipher the server chose.
 func negotiatedTLS13Cipher(t *testing.T, engine, certPath, keyPath string) uint16 {
 	t.Helper()
-	ln, err := NewTLSListener(engine, "127.0.0.1:0", certPath, keyPath)
+	ln, err := NewTLSListener(engine, "127.0.0.1:0", []string{certPath}, []string{keyPath})
 	if err != nil {
 		t.Fatalf("NewTLSListener(%q): %v", engine, err)
 	}
@@ -117,7 +117,7 @@ func TestOpenSSLMatchesNginxTLS13Cipher(t *testing.T) {
 // accepts a real TLS connection and yields a usable net.Conn.
 func TestOpenSSLListenerServesTLS(t *testing.T) {
 	certPath, keyPath := writeSelfSignedCert(t)
-	ln, err := NewTLSListener(TLSEngineOpenSSL, "127.0.0.1:0", certPath, keyPath)
+	ln, err := NewTLSListener(TLSEngineOpenSSL, "127.0.0.1:0", []string{certPath}, []string{keyPath})
 	if err != nil {
 		t.Fatalf("NewTLSListener: %v", err)
 	}
@@ -151,4 +151,44 @@ func TestOpenSSLListenerServesTLS(t *testing.T) {
 		t.Fatalf("got %q, want pong", buf)
 	}
 	<-done
+}
+
+// TestOpenSSLListenerSNISelectsByServerName verifies the OpenSSL engine's
+// servername callback serves the certificate matching the client's SNI, and
+// falls back to the first cert when nothing matches.
+func TestOpenSSLListenerSNISelectsByServerName(t *testing.T) {
+	certA, keyA := writeNamedCert(t, "alpha.test")
+	certB, keyB := writeNamedCert(t, "beta.test")
+
+	ln, err := NewTLSListener(TLSEngineOpenSSL, "127.0.0.1:0",
+		[]string{certA, certB}, []string{keyA, keyB})
+	if err != nil {
+		t.Fatalf("NewTLSListener: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			// A read drives the OpenSSL handshake (and its SNI callback).
+			buf := make([]byte, 1)
+			c.Read(buf)
+			c.Close()
+		}
+	}()
+
+	addr := ln.Addr().String()
+	cases := map[string]string{
+		"alpha.test":   "alpha.test",
+		"beta.test":    "beta.test",
+		"unknown.test": "alpha.test", // no match -> fallback to first cert
+	}
+	for sni, wantCN := range cases {
+		if got := serverCertCommonNameForSNI(t, addr, sni); got != wantCN {
+			t.Errorf("SNI %q: served cert CN=%q, want %q", sni, got, wantCN)
+		}
+	}
 }

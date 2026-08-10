@@ -36,6 +36,8 @@ type ServerConfig struct {
 	SnifferLog           string        `toml:"sniffer_log"`
 	TLSCertFile          string        `toml:"tls_cert"`
 	TLSKeyFile           string        `toml:"tls_key"`
+	TLSCerts             []string      `toml:"tls_certs"` // optional: multiple cert files for SNI (multi-domain); pairs with tls_keys by index
+	TLSKeys              []string      `toml:"tls_keys"`  // optional: key files matching tls_certs by index
 	Heartbeat            int           `toml:"heartbeat"`
 	MuxCon               int           `toml:"mux_con"`
 	AcceptUDP            bool          `toml:"accept_udp"`
