@@ -172,6 +172,7 @@ func (s *WsMuxTransport) Restart() {
 	s.config.TunnelStatus = ""
 	s.streamCounter = 0
 	s.sessionCounter = 0
+	s.stripedFlows = 0
 
 	s.sessionsMu.Lock()
 	s.sessions = nil
@@ -209,6 +210,9 @@ func (s *WsMuxTransport) channelHandler() {
 						go s.Restart()
 					}
 					return
+				}
+				if len(msg) == 0 {
+					continue
 				}
 				messageChan <- msg[0]
 			}
@@ -352,6 +356,7 @@ func (s *WsMuxTransport) tunnelListener() {
 				case s.tunnelChannel <- session: // ok
 				default:
 					s.logger.Warnf("tunnel listener channel is full, discarding TCP connection from %s", conn.LocalAddr().String())
+					session.Close()
 					conn.Close()
 				}
 			}
@@ -705,15 +710,22 @@ func (s *WsMuxTransport) dispatchStriped(incomingConn LocalTCPConn) {
 		atomic.AddInt32(&s.streamCounter, -1)
 		return
 	}
-	defer atomic.AddInt32(&s.stripedFlows, -1)
 
 	legs, err := s.openStripedLegs(s.config.StripeFactor)
 	if err != nil {
+		// Release the slot before sleeping/requeueing so a transient open
+		// failure doesn't shrink the admission budget for everyone else.
+		atomic.AddInt32(&s.stripedFlows, -1)
 		s.logger.Tracef("striped dispatch: %v, retrying shortly", err)
 		time.Sleep(100 * time.Millisecond)
+		// Refresh the accept timestamp so a connection that waited for the
+		// pool to warm up isn't immediately dropped by the 3s setup timeout
+		// on the next attempt.
+		incomingConn.timeCreated = time.Now().UnixMilli()
 		s.requeueOrDrop(incomingConn)
 		return
 	}
+	defer atomic.AddInt32(&s.stripedFlows, -1)
 
 	gid := atomic.AddUint32(&s.stripeGroupID, 1)
 	for i, stream := range legs {
@@ -722,6 +734,7 @@ func (s *WsMuxTransport) dispatchStriped(incomingConn LocalTCPConn) {
 			for _, st := range legs {
 				st.Close()
 			}
+			incomingConn.timeCreated = time.Now().UnixMilli()
 			s.requeueOrDrop(incomingConn)
 			return
 		}
@@ -759,6 +772,15 @@ func (s *WsMuxTransport) acquireStripedSlot() bool {
 				return true
 			}
 			continue // lost the CAS race, re-read and retry
+		}
+		// At the stream budget: ask the client to dial another pool session
+		// so the admission ceiling can rise. With mux_stripe > 1 each flow
+		// consumes StripeFactor streams, so the accept-path's
+		// streamCounter>=sessions*MuxCon check under-counts and may never
+		// fire - this is what actually grows the pool under striping load.
+		select {
+		case s.reqNewConnChan <- struct{}{}:
+		default:
 		}
 		select {
 		case <-s.ctx.Done():
@@ -813,8 +835,16 @@ func (s *WsMuxTransport) handleSession(session *smux.Session) {
 			// Send the target port over the tunnel connection
 			if err := utils.SendBinaryString(stream, incomingConn.remoteAddr); err != nil {
 				s.logger.Tracef("failed to send address over stream: %v", err)
-				// Put local connection back to local channel
-				s.localChannel <- incomingConn
+				stream.Close()
+				// Put local connection back to local channel without blocking
+				// the session loop if the channel is full.
+				select {
+				case s.localChannel <- incomingConn:
+				default:
+					incomingConn.conn.Close()
+					atomic.AddInt32(&s.streamCounter, -1)
+				}
+				<-counter
 				continue
 			}
 
@@ -834,8 +864,15 @@ func (s *WsMuxTransport) handleSessionError(incomingConn *LocalTCPConn, err erro
 	// decrease session value
 	atomic.AddInt32(&s.sessionCounter, -1)
 
-	// Put local connection back to local channel
-	s.localChannel <- *incomingConn
+	// Put local connection back to local channel without blocking forever if
+	// the channel is already full (that used to deadlock the session goroutine
+	// and permanently leak its MuxCon slot).
+	select {
+	case s.localChannel <- *incomingConn:
+	default:
+		incomingConn.conn.Close()
+		atomic.AddInt32(&s.streamCounter, -1)
+	}
 
 	// Attempt to request a new connection
 	select {

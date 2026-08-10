@@ -349,6 +349,9 @@ func (c *WsMuxTransport) channelHandler() {
 					}
 					return
 				}
+				if len(msg) == 0 {
+					continue
+				}
 				msgChan <- msg[0]
 			}
 		}

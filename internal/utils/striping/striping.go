@@ -179,6 +179,13 @@ func (c *Conn) readLeg(leg net.Conn) {
 			continue
 		}
 
+		// Reject absurd lengths before allocating. A real chunk is at most
+		// chunkSize; anything larger is corrupt/malicious and would OOM us.
+		if int(length) > c.chunkSize {
+			c.fail(fmt.Errorf("striping: chunk length %d exceeds chunk size %d", length, c.chunkSize))
+			return
+		}
+
 		data := make([]byte, length)
 		if length > 0 {
 			if _, err := io.ReadFull(leg, data); err != nil {
@@ -249,7 +256,6 @@ func (c *Conn) legDone() {
 // always make progress independently.
 func (c *Conn) writeLeg(leg net.Conn) {
 	defer c.writersWG.Done()
-	header := make([]byte, headerSize)
 	for {
 		// Always prefer to drain a queued chunk before considering exit. This
 		// is what makes a graceful Close lossless even when a teardown races
@@ -257,7 +263,7 @@ func (c *Conn) writeLeg(leg net.Conn) {
 		// still-queued tail chunk is ever abandoned to the closed/flush signal.
 		select {
 		case job := <-c.writeQueue:
-			if !c.writeChunk(leg, header, job) {
+			if !c.writeChunk(leg, job) {
 				return
 			}
 			continue
@@ -266,7 +272,7 @@ func (c *Conn) writeLeg(leg net.Conn) {
 
 		select {
 		case job := <-c.writeQueue:
-			if !c.writeChunk(leg, header, job) {
+			if !c.writeChunk(leg, job) {
 				return
 			}
 		case <-c.flush:
@@ -279,22 +285,20 @@ func (c *Conn) writeLeg(leg net.Conn) {
 
 // writeChunk frames and sends one chunk on a leg, returning false (after
 // failing the whole Conn) if the leg errors.
-func (c *Conn) writeChunk(leg net.Conn, header []byte, job writeJob) bool {
+func (c *Conn) writeChunk(leg net.Conn, job writeJob) bool {
 	if err := leg.SetWriteDeadline(time.Now().Add(c.stallTimeout)); err != nil {
 		c.fail(err)
 		return false
 	}
-	binary.BigEndian.PutUint32(header[0:4], job.seq)
-	binary.BigEndian.PutUint32(header[4:8], uint32(len(job.data)))
-	if _, err := leg.Write(header); err != nil {
+	// One Write for header+payload so the leg's transport (smux) sees a
+	// single frame instead of two syscalls / two mux frames per chunk.
+	frame := make([]byte, headerSize+len(job.data))
+	binary.BigEndian.PutUint32(frame[0:4], job.seq)
+	binary.BigEndian.PutUint32(frame[4:8], uint32(len(job.data)))
+	copy(frame[headerSize:], job.data)
+	if _, err := leg.Write(frame); err != nil {
 		c.fail(err)
 		return false
-	}
-	if len(job.data) > 0 {
-		if _, err := leg.Write(job.data); err != nil {
-			c.fail(err)
-			return false
-		}
 	}
 	return true
 }
@@ -457,12 +461,21 @@ func (c *Conn) Read(p []byte) (int, error) {
 		}
 
 		timer := time.NewTimer(c.stallTimeout)
+
+		// totalKnown is closed once and stays permanently selectable. Including
+		// it in the select after that would busy-spin (and starve timer.C), so
+		// only wait on it until the END marker has actually been seen.
+		var totalCh <-chan struct{}
+		if atomic.LoadInt32(&c.haveTotal) == 0 {
+			totalCh = c.totalKnown
+		}
+
 		select {
 		case ch := <-c.chunkCh:
 			timer.Stop()
 			c.stash(ch)
 
-		case <-c.totalKnown:
+		case <-totalCh:
 			timer.Stop()
 			// The total just became known; loop to re-check completion and
 			// drain whatever is buffered.

@@ -242,6 +242,9 @@ func (c *WsTransport) channelHandler() {
 					}
 					return
 				}
+				if len(msg) == 0 {
+					continue
+				}
 
 				msgChan <- msg[0]
 			}

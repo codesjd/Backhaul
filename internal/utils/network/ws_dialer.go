@@ -78,7 +78,10 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 		wsURL = fmt.Sprintf("ws://%s%s", addr, path)
 
 		dialer = websocket.Dialer{
-			EnableCompression: true,
+			// Tunnel payloads are already compressed at higher layers (TLS /
+			// application) or are smux binary frames; permessage-deflate would
+			// burn CPU for no throughput gain. Keep negotiation off.
+			EnableCompression: false,
 			HandshakeTimeout:  45 * time.Second, // default handshake timeout
 			ReadBufferSize:    64 * 1024,        // match server upgrader; avoids falling back to gorilla's 4KB default
 			WriteBufferSize:   64 * 1024,        // ditto, reduces syscall/copy overhead for large mux frames
@@ -99,7 +102,7 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 		}
 
 		dialer = websocket.Dialer{
-			EnableCompression: true,
+			EnableCompression: false,
 			HandshakeTimeout:  45 * time.Second, // default handshake timeout
 			ReadBufferSize:    64 * 1024,        // match server upgrader; avoids falling back to gorilla's 4KB default
 			WriteBufferSize:   64 * 1024,        // ditto, reduces syscall/copy overhead for large mux frames
