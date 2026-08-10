@@ -77,7 +77,14 @@ func transferWebSocketToTCP(wsConn *websocket.Conn, tcpConn net.Conn, logger *lo
 
 // transferTCPToWebSocket transfers data from a TCP connection to a WebSocket connection
 func transferTCPToWebSocket(tcpConn net.Conn, wsConn *websocket.Conn, logger *logrus.Logger, usage *web.Usage, remotePort int, sniffer bool) {
-	buf := make([]byte, 16*1024) // 16K buffer size
+	// Reuse the same pooled 64KB buffer as the TCP handler instead of a fresh
+	// per-connection allocation. This runs once per tunnelled connection, and
+	// the buffer is consumed synchronously each iteration (read, then written
+	// to the WebSocket before the next read), so it's safe to return to the
+	// pool. WriteMessage doesn't retain the slice past its return.
+	bufPtr := copyBufferPool.Get().(*[]byte)
+	defer copyBufferPool.Put(bufPtr)
+	buf := *bufPtr
 	for {
 		// Read data from the TCP connection
 		n, err := tcpConn.Read(buf)
