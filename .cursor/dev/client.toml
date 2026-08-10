@@ -1,0 +1,14 @@
+[client]
+remote_addr = "127.0.0.1:3080"
+transport = "tcp"
+token = "dev-token"
+connection_pool = 2
+aggressive_pool = false
+keepalive_period = 75
+dial_timeout = 10
+nodelay = true
+retry_interval = 3
+sniffer = false
+web_port = 0
+log_level = "info"
+skip_optz = true

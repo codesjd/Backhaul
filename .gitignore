@@ -23,6 +23,7 @@ go.work.sum
 
 # toml file
 *.toml
+!.cursor/dev/*.toml
 
 # Makefile
 MakeFile
@@ -34,6 +35,7 @@ dist/
 
 # other
 *.json
+!.cursor/environment.json
 server.*
 backhaul
 *.log

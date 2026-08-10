@@ -1,0 +1,5 @@
+{
+  "name": "Backhaul",
+  "user": "ubuntu",
+  "install": ".cursor/scripts/install.sh"
+}
