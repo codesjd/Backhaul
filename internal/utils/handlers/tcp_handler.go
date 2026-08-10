@@ -29,8 +29,6 @@ var copyBufferPool = sync.Pool{
 }
 
 func TCPConnectionHandler(ctx context.Context, proxyProtocol bool, from net.Conn, to net.Conn, logger *logrus.Logger, usage *web.Usage, remotePort int, sniffer bool) {
-	done := make(chan struct{})
-
 	// Write Proxy Protocol V2 Header
 	if proxyProtocol {
 		err := WriteProxyProtocol(from, to)
@@ -42,6 +40,23 @@ func TCPConnectionHandler(ctx context.Context, proxyProtocol bool, from net.Conn
 		}
 	}
 
+	done := make(chan struct{})
+
+	// Close both connections as soon as the transport context is cancelled
+	// (e.g. on a tunnel restart). The io.CopyBuffer calls below block until the
+	// peer sends EOF, so without this watcher an idle tunnelled connection would
+	// linger long past the restart. Those leaked sockets pile up across repeated
+	// restarts and keep splitting traffic with the fresh generation. Closing the
+	// connections unblocks both copy directions at once.
+	go func() {
+		select {
+		case <-ctx.Done():
+			from.Close()
+			to.Close()
+		case <-done:
+		}
+	}()
+
 	go func() {
 		defer close(done)
 		transferData(from, to, logger, usage, remotePort, sniffer)
@@ -49,13 +64,10 @@ func TCPConnectionHandler(ctx context.Context, proxyProtocol bool, from net.Conn
 
 	transferData(to, from, logger, usage, remotePort, sniffer)
 
-	select {
-	case <-ctx.Done():
-		from.Close()
-		to.Close()
-		return
-	case <-done:
-	}
+	// Wait for the reverse copy to finish. transferData closes both ends on
+	// return, so this resolves promptly once either direction completes; the
+	// watcher goroutine above then exits via the closed done channel.
+	<-done
 }
 
 // transferData pumps from -> to until either side closes or errors.
