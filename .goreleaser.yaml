@@ -2,8 +2,10 @@
 version: 2  # Specify the config version
 project_name: backhaul
 builds:
+  # Default, pure-Go static binary (no cgo) for every supported platform.
   - id: backhaul
-    main: ./main.go 
+    main: ./main.go
+    binary: backhaul
     goos:
       - linux
       - darwin
@@ -11,14 +13,38 @@ builds:
       - amd64
       - arm64
     flags:
-      - -ldflags=-s -w 
+      - -ldflags=-s -w
     env:
        - CGO_ENABLED=0
 
+  # OpenSSL TLS-engine variant (linux/amd64 only). Needs cgo + libssl, so it is
+  # dynamically linked against libssl.so.3 and built only for the native runner
+  # architecture. Enable at runtime with tls_engine = "openssl".
+  - id: backhaul-openssl
+    main: ./main.go
+    binary: backhaul
+    goos:
+      - linux
+    goarch:
+      - amd64
+    flags:
+      - -tags=openssl
+      - -ldflags=-s -w
+    env:
+       - CGO_ENABLED=1
+
 
 archives:
-  - format: tar.gz
+  - id: default
+    ids:
+      - backhaul
+    format: tar.gz
     name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+  - id: openssl
+    ids:
+      - backhaul-openssl
+    format: tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}_openssl"
 
 
 release:
