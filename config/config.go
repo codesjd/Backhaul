@@ -54,6 +54,8 @@ type ServerConfig struct {
 // ClientConfig represents the configuration for the client.
 type ClientConfig struct {
 	RemoteAddr           string        `toml:"remote_addr"`
+	RemoteAddrs          []string      `toml:"remote_addrs"` // optional: multiple tunnel endpoints (e.g. same origin behind several CDNs/domains); the ws/wss/wsmux/wssmux pool spreads across them round-robin. Falls back to remote_addr when empty.
+	EdgeIPs              []string      `toml:"edge_ips"`     // optional: edge IP to dial per remote_addrs entry (aligned by index); empty entries dial the domain directly.
 	Transport            TransportType `toml:"transport"`
 	Token                string        `toml:"token"`
 	ConnectionPool       int           `toml:"connection_pool"`

@@ -45,6 +45,49 @@ type WsMuxTransport struct {
 	// tagged them with.
 	stripeGroupsMu sync.Mutex
 	stripeGroups   map[uint32]*stripeGroup
+
+	// endpoints is the set of tunnel entry points (one origin behind one or
+	// more CDNs/domains). Pool and control dials round-robin across it via
+	// dialSeq so traffic spreads over every CDN at once instead of one.
+	endpoints []wsEndpoint
+	dialSeq   int32
+}
+
+// wsEndpoint is a single tunnel entry point: the domain dialed (which also
+// becomes the TLS SNI / WebSocket Host) and an optional edge IP to connect to
+// instead of resolving the domain.
+type wsEndpoint struct {
+	addr   string
+	edgeIP string
+}
+
+// buildEndpoints turns the multi-endpoint config (remote_addrs/edge_ips) into a
+// list, falling back to the single remote_addr/edge_ip so existing configs are
+// unchanged.
+func buildEndpoints(addrs, edges []string, addr, edge string) []wsEndpoint {
+	if len(addrs) == 0 {
+		return []wsEndpoint{{addr: addr, edgeIP: edge}}
+	}
+	eps := make([]wsEndpoint, len(addrs))
+	for i, a := range addrs {
+		e := ""
+		if i < len(edges) {
+			e = edges[i]
+		}
+		eps[i] = wsEndpoint{addr: a, edgeIP: e}
+	}
+	return eps
+}
+
+// nextEndpoint returns the next entry point round-robin. With a single
+// endpoint it's a plain read; with several, each dial lands on a different
+// CDN/domain so the pool aggregates them.
+func (c *WsMuxTransport) nextEndpoint() wsEndpoint {
+	if len(c.endpoints) == 1 {
+		return c.endpoints[0]
+	}
+	i := atomic.AddInt32(&c.dialSeq, 1)
+	return c.endpoints[int(uint32(i))%len(c.endpoints)]
 }
 
 // stripeGroup accumulates the legs the server opened for one logical
@@ -57,6 +100,8 @@ type stripeGroup struct {
 }
 type WsMuxConfig struct {
 	RemoteAddr           string
+	RemoteAddrs          []string
+	EdgeIPs              []string
 	Token                string
 	SnifferLog           string
 	TunnelStatus         string
@@ -110,6 +155,8 @@ func NewWSMuxClient(parentCtx context.Context, config *WsMuxConfig, logger *logr
 		userAgent:       network.RandomUserAgent(),
 		stripeGroups:    make(map[uint32]*stripeGroup),
 	}
+
+	client.endpoints = buildEndpoints(config.RemoteAddrs, config.EdgeIPs, config.RemoteAddr, config.EdgeIP)
 
 	return client
 }
@@ -187,7 +234,8 @@ func (c *WsMuxTransport) channelDialer() {
 			return
 		default:
 
-			tunnelWSConn, err := network.WebSocketDialer(c.ctx, c.config.RemoteAddr, c.config.EdgeIP, network.NormalizeBasePath(c.config.Path)+"/channel", c.config.DialTimeOut, c.config.KeepAlive, true, c.config.Token, c.userAgent, c.config.Mode, 3, 0, 0, 0)
+			ep := c.nextEndpoint()
+			tunnelWSConn, err := network.WebSocketDialer(c.ctx, ep.addr, ep.edgeIP, network.NormalizeBasePath(c.config.Path)+"/channel", c.config.DialTimeOut, c.config.KeepAlive, true, c.config.Token, c.userAgent, c.config.Mode, 3, 0, 0, 0)
 			if err != nil {
 				c.logger.Errorf("control channel dialer: %v", err)
 				time.Sleep(c.config.RetryInterval)
@@ -350,10 +398,11 @@ func (c *WsMuxTransport) channelHandler() {
 }
 
 func (c *WsMuxTransport) tunnelDialer() {
-	c.logger.Debugf("initiating new %s tunnel connection to address %s", c.config.Mode, c.config.RemoteAddr)
+	ep := c.nextEndpoint()
+	c.logger.Debugf("initiating new %s tunnel connection to address %s", c.config.Mode, ep.addr)
 
 	// Dial to the tunnel server
-	tunnelWSConn, err := network.WebSocketDialer(c.ctx, c.config.RemoteAddr, c.config.EdgeIP, network.NormalizeBasePath(c.config.Path)+"/tunnel", c.config.DialTimeOut, c.config.KeepAlive, c.config.Nodelay, c.config.Token, c.userAgent, c.config.Mode, 3, c.config.SO_RCVBUF, c.config.SO_SNDBUF, c.config.MSS)
+	tunnelWSConn, err := network.WebSocketDialer(c.ctx, ep.addr, ep.edgeIP, network.NormalizeBasePath(c.config.Path)+"/tunnel", c.config.DialTimeOut, c.config.KeepAlive, c.config.Nodelay, c.config.Token, c.userAgent, c.config.Mode, 3, c.config.SO_RCVBUF, c.config.SO_SNDBUF, c.config.MSS)
 	if err != nil {
 		c.logger.Errorf("tunnel server dialer: %v", err)
 

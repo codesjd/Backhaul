@@ -117,6 +117,8 @@ func (c *Client) Start() {
 	case config.WSMUX, config.WSSMUX:
 		wsMuxConfig := &transport.WsMuxConfig{
 			RemoteAddr:           c.config.RemoteAddr,
+			RemoteAddrs:          c.config.RemoteAddrs,
+			EdgeIPs:              c.config.EdgeIPs,
 			Nodelay:              c.config.Nodelay,
 			KeepAlive:            time.Duration(c.config.Keepalive) * time.Second,
 			RetryInterval:        time.Duration(c.config.RetryInterval) * time.Second,
