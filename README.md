@@ -140,7 +140,9 @@ To start using the solution, you'll need to configure both server and client com
    ```toml
    [client]  # Behind NAT, firewall-blocked
    remote_addr = "0.0.0.0:3080"  # Server address and port (mandatory).
+   remote_addrs = []             # ws/wss/wsmux/wssmux: optional list of tunnel endpoints (e.g. the same origin fronted by several CDNs/domains). The connection pool spreads across all of them round-robin, so the tunnel aggregates every CDN at once instead of one. Each entry dials with its own host as the TLS SNI. Leave empty to use the single remote_addr above. e.g. ["aosky.ir:443", "nekocafe.sbs:443", "onionchips.sbs:443"]. (optional, default: none)
    edge_ip = "188.114.96.0"      # Edge IP used for CDN connection, specifically for WebSocket-based transports.(Optional, default none)
+   edge_ips = []                 # ws/wss/wsmux/wssmux: optional edge IP to dial per remote_addrs entry (aligned by index); empty entries resolve/dial the domain directly. (optional, default: none)
    path = ""                     # Custom base path prepended to the /channel and /tunnel endpoints, for ws/wss/wsmux/wssmux. Must match the server. (optional, default: none)
    transport = "tcp"             # Protocol to use ("tcp", "tcpmux", "ws", "wss", "wsmux", "wssmux". mandatory).
    token = "your_token"          # Authentication token for secure communication (optional).
