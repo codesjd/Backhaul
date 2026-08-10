@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/musix/backhaul/internal/utils"
@@ -44,7 +45,11 @@ func (c *Client) Start() {
 		}()
 	}
 
-	c.logger.Infof("client with remote address %s started successfully", c.config.RemoteAddr)
+	remoteDisplay := c.config.RemoteAddr
+	if remoteDisplay == "" && len(c.config.RemoteAddrs) > 0 {
+		remoteDisplay = strings.Join(c.config.RemoteAddrs, ", ")
+	}
+	c.logger.Infof("client with remote address %s started successfully", remoteDisplay)
 
 	switch c.config.Transport {
 	case config.TCP:
