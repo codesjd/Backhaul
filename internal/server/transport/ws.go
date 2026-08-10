@@ -39,8 +39,10 @@ type WsTransport struct {
 type WsConfig struct {
 	BindAddr     string
 	SnifferLog   string
-	TLSCertFile  string // Path to the TLS certificate file
-	TLSKeyFile   string // Path to the TLS key file
+	TLSCertFile  string   // Path to the TLS certificate file
+	TLSKeyFile   string   // Path to the TLS key file
+	TLSCerts     []string // Optional: multiple cert files for SNI (multi-domain)
+	TLSKeys      []string // Optional: key files aligned with TLSCerts
 	TunnelStatus string
 	Token        string
 	Ports        []string
@@ -324,7 +326,8 @@ func (s *WsTransport) tunnelListener() {
 			if s.controlChannel == nil {
 				s.logger.Info("waiting for wss control channel connection")
 			}
-			ln, err := network.NewTLSListener(s.config.TLSEngine, addr, s.config.TLSCertFile, s.config.TLSKeyFile)
+			certs, keys := network.ResolveCertPairs(s.config.TLSCertFile, s.config.TLSKeyFile, s.config.TLSCerts, s.config.TLSKeys)
+			ln, err := network.NewTLSListener(s.config.TLSEngine, addr, certs, keys)
 			if err != nil {
 				s.logger.Fatalf("failed to create tls listener on %s: %v", addr, err)
 			}

@@ -57,8 +57,10 @@ type WsMuxConfig struct {
 	BindAddr             string
 	Token                string
 	SnifferLog           string
-	TLSCertFile          string // Path to the TLS certificate file
-	TLSKeyFile           string // Path to the TLS key file
+	TLSCertFile          string   // Path to the TLS certificate file
+	TLSKeyFile           string   // Path to the TLS key file
+	TLSCerts             []string // Optional: multiple cert files for SNI (multi-domain)
+	TLSKeys              []string // Optional: key files aligned with TLSCerts
 	TunnelStatus         string
 	Ports                []string
 	Nodelay              bool
@@ -376,7 +378,8 @@ func (s *WsMuxTransport) tunnelListener() {
 			if s.controlChannel == nil {
 				s.logger.Infof("waiting for %s control channel connection", s.config.Mode)
 			}
-			ln, err := network.NewTLSListener(s.config.TLSEngine, addr, s.config.TLSCertFile, s.config.TLSKeyFile)
+			certs, keys := network.ResolveCertPairs(s.config.TLSCertFile, s.config.TLSKeyFile, s.config.TLSCerts, s.config.TLSKeys)
+			ln, err := network.NewTLSListener(s.config.TLSEngine, addr, certs, keys)
 			if err != nil {
 				s.logger.Fatalf("failed to create tls listener on %s: %v", addr, err)
 			}
