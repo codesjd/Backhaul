@@ -37,5 +37,6 @@ dist/
 *.json
 !.cursor/environment.json
 server.*
+!.cursor/dev/server.toml
 backhaul
 *.log
