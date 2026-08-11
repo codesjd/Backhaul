@@ -242,6 +242,14 @@ func (c *QuicTransport) handleTCPStream(conn *quic.Conn, stream *quic.Stream) {
 		stream.CancelRead(1)
 		return
 	}
+	// A bare-port mapping (e.g. ports = ["6033"]) arrives as just "6033";
+	// ResolveRemoteAddr normalizes it to 127.0.0.1:6033 and leaves host:port as-is.
+	if _, target, err = network.ResolveRemoteAddr(target); err != nil {
+		c.logger.Debugf("quic: invalid tcp target: %v", err)
+		stream.CancelRead(1)
+		stream.CancelWrite(1)
+		return
+	}
 	local, err := net.DialTimeout("tcp", target, c.config.DialTimeOut)
 	if err != nil {
 		c.logger.Debugf("quic: dial local tcp %s: %v", target, err)
@@ -265,6 +273,12 @@ func (c *QuicTransport) handleUDPSession(conn *quic.Conn, stream *quic.Stream) {
 	id := binary.BigEndian.Uint32(idBuf[:])
 	target, err := network.ReadLPString(stream)
 	if err != nil {
+		stream.CancelRead(1)
+		return
+	}
+	// Normalize a bare-port target ("6033" -> "127.0.0.1:6033"); see handleTCPStream.
+	if _, target, err = network.ResolveRemoteAddr(target); err != nil {
+		c.logger.Debugf("quic: invalid udp target: %v", err)
 		stream.CancelRead(1)
 		return
 	}

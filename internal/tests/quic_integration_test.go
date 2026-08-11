@@ -126,9 +126,11 @@ func TestQuicTunnelTCPAndUDP(t *testing.T) {
 	const obfs = "s3cret-obfs" // exercise Salamander packet obfuscation end to end
 
 	srvCfg := &stransport.QuicConfig{
-		BindAddr:     fmt.Sprintf("127.0.0.1:%d", serverPort),
-		Token:        token,
-		Ports:        []string{fmt.Sprintf("%d=127.0.0.1:%d", pubPort, echoPort)},
+		BindAddr: fmt.Sprintf("127.0.0.1:%d", serverPort),
+		Token:    token,
+		// Bare-port target ("pub=9000", not "pub=127.0.0.1:9000") exercises the
+		// client's ResolveRemoteAddr normalization (a bare port -> 127.0.0.1:port).
+		Ports:        []string{fmt.Sprintf("%d=%d", pubPort, echoPort)},
 		Keepalive:    30 * time.Second,
 		ObfsPassword: obfs,
 		UpMbps:       100, // exercise Brutal congestion control on both directions
