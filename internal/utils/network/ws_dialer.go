@@ -14,7 +14,7 @@ import (
 	"github.com/musix/backhaul/config"
 )
 
-func WebSocketDialer(ctx context.Context, addr string, edgeIP string, path string, timeout time.Duration, keepalive time.Duration, nodelay bool, token string, userAgent string, mode config.TransportType, retry int, SO_RCVBUF int, SO_SNDBUF int, mss int) (*websocket.Conn, error) {
+func WebSocketDialer(ctx context.Context, addr string, edgeIP string, path string, timeout time.Duration, keepalive time.Duration, nodelay bool, token string, userAgent string, mode config.TransportType, retry int, SO_RCVBUF int, SO_SNDBUF int, mss int, tlsVerify bool) (*websocket.Conn, error) {
 	var tunnelWSConn *websocket.Conn
 	var err error
 
@@ -23,7 +23,7 @@ func WebSocketDialer(ctx context.Context, addr string, edgeIP string, path strin
 
 	for i := 0; i < retries; i++ {
 		// Attempt to dial the WebSocket
-		tunnelWSConn, err = attemptDialWebSocket(ctx, addr, edgeIP, path, timeout, keepalive, nodelay, token, userAgent, mode, SO_RCVBUF, SO_SNDBUF, mss)
+		tunnelWSConn, err = attemptDialWebSocket(ctx, addr, edgeIP, path, timeout, keepalive, nodelay, token, userAgent, mode, SO_RCVBUF, SO_SNDBUF, mss, tlsVerify)
 		if err == nil {
 			// If successful, return the connection
 			return tunnelWSConn, nil
@@ -42,7 +42,7 @@ func WebSocketDialer(ctx context.Context, addr string, edgeIP string, path strin
 	return nil, err
 }
 
-func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path string, timeout time.Duration, keepalive time.Duration, nodelay bool, token string, userAgent string, mode config.TransportType, SO_RCVBUF int, SO_SNDBUF int, mss int) (*websocket.Conn, error) {
+func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path string, timeout time.Duration, keepalive time.Duration, nodelay bool, token string, userAgent string, mode config.TransportType, SO_RCVBUF int, SO_SNDBUF int, mss int, tlsVerify bool) (*websocket.Conn, error) {
 	// Generate a random X-user-id
 	randomUserID := rand.Int31() // Generate a random int64 number
 
@@ -78,7 +78,10 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 		wsURL = fmt.Sprintf("ws://%s%s", addr, path)
 
 		dialer = websocket.Dialer{
-			EnableCompression: true,
+			// Tunnel traffic underneath is smux/TLS binary that doesn't
+			// compress, so permessage-deflate only burns CPU (and adds latency
+			// if ever negotiated). The server upgrader doesn't enable it either.
+			EnableCompression: false,
 			HandshakeTimeout:  45 * time.Second, // default handshake timeout
 			ReadBufferSize:    64 * 1024,        // match server upgrader; avoids falling back to gorilla's 4KB default
 			WriteBufferSize:   64 * 1024,        // ditto, reduces syscall/copy overhead for large mux frames
@@ -99,7 +102,10 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 		}
 
 		dialer = websocket.Dialer{
-			EnableCompression: true,
+			// Tunnel traffic underneath is smux/TLS binary that doesn't
+			// compress, so permessage-deflate only burns CPU (and adds latency
+			// if ever negotiated). The server upgrader doesn't enable it either.
+			EnableCompression: false,
 			HandshakeTimeout:  45 * time.Second, // default handshake timeout
 			ReadBufferSize:    64 * 1024,        // match server upgrader; avoids falling back to gorilla's 4KB default
 			WriteBufferSize:   64 * 1024,        // ditto, reduces syscall/copy overhead for large mux frames
@@ -108,7 +114,11 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 			// default, which passive DPI can key on. Gorilla ignores
 			// TLSClientConfig once NetDialTLSContext is set.
 			NetDialTLSContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return UtlsDialTLS(ctx, edgeIP, sniHost, true, []string{"http/1.1"}, timeout, keepalive, nodelay, SO_RCVBUF, SO_SNDBUF, mss)
+				// insecureSkipVerify is the inverse of the operator's tls_verify:
+				// off by default (self-signed friendly), but an on-path party can
+				// then MITM the token-bearing handshake, so tls_verify=true is
+				// available to pin the certificate.
+				return UtlsDialTLS(ctx, edgeIP, sniHost, !tlsVerify, []string{"http/1.1"}, timeout, keepalive, nodelay, SO_RCVBUF, SO_SNDBUF, mss)
 			},
 		}
 	}

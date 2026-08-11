@@ -37,11 +37,13 @@ func NewClient(cfg *config.ClientConfig, parentCtx context.Context) *Client {
 
 // Run starts the client and begins dialing the tunnel server
 func (c *Client) Start() {
-	// for pprof
+	// for pprof. Bind to loopback only: pprof serves heap dumps from a process
+	// holding the tunnel token and TLS keys, so it must never be reachable
+	// off-host. Reach it via an SSH tunnel if you need it remotely.
 	if c.config.PPROF {
 		go func() {
-			c.logger.Info("pprof started at port 6061")
-			http.ListenAndServe("0.0.0.0:6061", nil)
+			c.logger.Info("pprof started at 127.0.0.1:6061")
+			http.ListenAndServe("127.0.0.1:6061", nil)
 		}()
 	}
 
@@ -115,6 +117,10 @@ func (c *Client) Start() {
 			SO_RCVBUF:      c.config.SO_RCVBUF,
 			SO_SNDBUF:      c.config.SO_SNDBUF,
 			MSS:            c.config.MSS,
+			TLSVerify:      c.config.TLSVerify,
+		}
+		if c.config.Transport == config.WSS && !c.config.TLSVerify {
+			c.logger.Warn("SECURITY: wss server certificate verification is OFF (tls_verify=false); the auth token can be harvested by an on-path party via TLS MITM. Set tls_verify=true once the server presents a verifiable certificate.")
 		}
 		WsClient := transport.NewWSClient(c.ctx, WsConfig, c.logger)
 		go WsClient.Start()
@@ -146,6 +152,10 @@ func (c *Client) Start() {
 			AggressivePool:       c.config.AggressivePool,
 			EdgeIP:               c.config.EdgeIP,
 			Path:                 c.config.Path,
+			TLSVerify:            c.config.TLSVerify,
+		}
+		if c.config.Transport == config.WSSMUX && !c.config.TLSVerify {
+			c.logger.Warn("SECURITY: wssmux server certificate verification is OFF (tls_verify=false); the auth token can be harvested by an on-path party via TLS MITM. Set tls_verify=true once the server presents a verifiable certificate.")
 		}
 		wsMuxClient := transport.NewWSMuxClient(c.ctx, wsMuxConfig, c.logger)
 		go wsMuxClient.Start()
@@ -155,6 +165,7 @@ func (c *Client) Start() {
 			RemoteAddr:     c.config.RemoteAddr,
 			RetryInterval:  time.Duration(c.config.RetryInterval) * time.Second,
 			DialTimeOut:    time.Duration(c.config.DialTimeout) * time.Second,
+			KeepAlive:      time.Duration(c.config.Keepalive) * time.Second,
 			ConnPoolSize:   c.config.ConnectionPool,
 			Token:          c.config.Token,
 			Sniffer:        c.config.Sniffer,

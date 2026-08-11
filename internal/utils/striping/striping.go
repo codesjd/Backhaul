@@ -179,6 +179,15 @@ func (c *Conn) readLeg(leg net.Conn) {
 			continue
 		}
 
+		// A real chunk is never larger than chunkSize (the sender slices Write
+		// to exactly that). A length beyond it can only be a corrupt or hostile
+		// header, so refuse to allocate for it instead of trusting the wire and
+		// make()ing a multi-gigabyte buffer (OOM / DoS).
+		if int(length) > c.chunkSize {
+			c.fail(fmt.Errorf("striping: chunk length %d exceeds max %d", length, c.chunkSize))
+			return
+		}
+
 		data := make([]byte, length)
 		if length > 0 {
 			if _, err := io.ReadFull(leg, data); err != nil {
@@ -249,7 +258,10 @@ func (c *Conn) legDone() {
 // always make progress independently.
 func (c *Conn) writeLeg(leg net.Conn) {
 	defer c.writersWG.Done()
-	header := make([]byte, headerSize)
+	// One reusable frame buffer per worker: header + a full-size payload. Chunks
+	// are framed into it and sent in a single Write (see writeChunk), so the leg
+	// transport sees one frame per chunk instead of two.
+	frame := make([]byte, headerSize+c.chunkSize)
 	for {
 		// Always prefer to drain a queued chunk before considering exit. This
 		// is what makes a graceful Close lossless even when a teardown races
@@ -257,7 +269,7 @@ func (c *Conn) writeLeg(leg net.Conn) {
 		// still-queued tail chunk is ever abandoned to the closed/flush signal.
 		select {
 		case job := <-c.writeQueue:
-			if !c.writeChunk(leg, header, job) {
+			if !c.writeChunk(leg, frame, job) {
 				return
 			}
 			continue
@@ -266,7 +278,7 @@ func (c *Conn) writeLeg(leg net.Conn) {
 
 		select {
 		case job := <-c.writeQueue:
-			if !c.writeChunk(leg, header, job) {
+			if !c.writeChunk(leg, frame, job) {
 				return
 			}
 		case <-c.flush:
@@ -278,23 +290,21 @@ func (c *Conn) writeLeg(leg net.Conn) {
 }
 
 // writeChunk frames and sends one chunk on a leg, returning false (after
-// failing the whole Conn) if the leg errors.
-func (c *Conn) writeChunk(leg net.Conn, header []byte, job writeJob) bool {
+// failing the whole Conn) if the leg errors. Header and payload are packed into
+// a single buffer and sent with one Write so the leg's transport (an smux
+// stream) frames the chunk once instead of twice - fewer syscalls, and the
+// header can't interleave with another chunk's payload under load.
+func (c *Conn) writeChunk(leg net.Conn, frame []byte, job writeJob) bool {
 	if err := leg.SetWriteDeadline(time.Now().Add(c.stallTimeout)); err != nil {
 		c.fail(err)
 		return false
 	}
-	binary.BigEndian.PutUint32(header[0:4], job.seq)
-	binary.BigEndian.PutUint32(header[4:8], uint32(len(job.data)))
-	if _, err := leg.Write(header); err != nil {
+	binary.BigEndian.PutUint32(frame[0:4], job.seq)
+	binary.BigEndian.PutUint32(frame[4:8], uint32(len(job.data)))
+	n := copy(frame[headerSize:], job.data)
+	if _, err := leg.Write(frame[:headerSize+n]); err != nil {
 		c.fail(err)
 		return false
-	}
-	if len(job.data) > 0 {
-		if _, err := leg.Write(job.data); err != nil {
-			c.fail(err)
-			return false
-		}
 	}
 	return true
 }
@@ -456,13 +466,25 @@ func (c *Conn) Read(p []byte) (int, error) {
 			continue
 		}
 
+		// Only arm the totalKnown case while the END marker hasn't been seen.
+		// totalKnown is closed (never reopened) once the marker arrives, so
+		// leaving it in the select would make it win every iteration - a busy
+		// spin that pegs a core and starves the stallTimeout timer whenever the
+		// marker arrives on a fast leg before a chunk still in flight on a slow
+		// one. A nil channel never selects, so afterwards we fall through to the
+		// real work (chunkCh / legsDone / errCh / timer).
+		var totalKnown <-chan struct{}
+		if atomic.LoadInt32(&c.haveTotal) == 0 {
+			totalKnown = c.totalKnown
+		}
+
 		timer := time.NewTimer(c.stallTimeout)
 		select {
 		case ch := <-c.chunkCh:
 			timer.Stop()
 			c.stash(ch)
 
-		case <-c.totalKnown:
+		case <-totalKnown:
 			timer.Stop()
 			// The total just became known; loop to re-check completion and
 			// drain whatever is buffered.

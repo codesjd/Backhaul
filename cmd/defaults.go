@@ -7,8 +7,11 @@ import (
 )
 
 const ( // Default values
-	defaultToken          = "musix"
-	defaultChannelSize    = 2048
+	// No default token: a shared secret baked into the binary would
+	// authenticate any tokenless deployment with a value that is public in this
+	// repo, turning it into an open relay attributable to the host. A token must
+	// be configured explicitly (enforced in cmd.Run).
+	defaultChannelSize = 2048
 	defaultRetryInterval  = 3 // only for client
 	defaultConnectionPool = 8
 	defaultLogLevel       = "info"
@@ -20,20 +23,15 @@ const ( // Default values
 	defaultMuxVersion       = 1
 	defaultMaxFrameSize     = 32768   // 32KB
 	defaultMaxReceiveBuffer = 4194304 // 4MB
-	defaultMaxStreamBuffer  = 65536   // 256KB
+	defaultMaxStreamBuffer  = 65536   // 64KB
 	defaultSnifferLog       = "backhaul.json"
 	defaultMuxCon           = 8
 	defaultMuxStripe        = 1 // 1 disables striping - one flow, one connection
 )
 
 func applyDefaults(cfg *config.Config) {
-	// Token
-	if cfg.Server.Token == "" {
-		cfg.Server.Token = defaultToken
-	}
-	if cfg.Client.Token == "" {
-		cfg.Client.Token = defaultToken
-	}
+	// Token is intentionally not defaulted - see cmd.Run, which requires the
+	// active side to configure one explicitly.
 
 	// Nodelay default is false if not valid value found
 

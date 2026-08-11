@@ -43,8 +43,17 @@ func echoTarget(t *testing.T, payload []byte) (addr string, gotCh <-chan []byte)
 			return
 		}
 		defer ln.Close()
+		// A real server closes its connection once it has sent its reply. Doing
+		// so here sends a clean FIN that lets the download direction reach EOF,
+		// which is what the half-close pump needs to know the reply is complete
+		// (an echo target that never closed would leave the reverse copy blocked
+		// forever, since TCP has no in-band "reply done" signal).
+		defer conn.Close()
 		go func() {
 			conn.Write(payload)
+			if tcp, ok := conn.(*net.TCPConn); ok {
+				tcp.CloseWrite()
+			}
 		}()
 		got, _ := io.ReadAll(conn)
 		ch <- got

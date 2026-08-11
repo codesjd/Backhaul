@@ -86,7 +86,7 @@ To start using the solution, you'll need to configure both server and client com
     bind_addr = "0.0.0.0:3080"    # Address and port for the server to listen on (mandatory).
     transport = "tcp"             # Protocol to use ("tcp", "tcpmux", "ws", "wss", "wsmux", "wssmux". mandatory).
     accept_udp = false             # Enable transferring UDP connections over TCP transport. (optional, default: false)
-    token = "your_token"          # Authentication token for secure communication (optional).
+    token = "your_token"          # Authentication token for secure communication (required; must match on client and server).
     keepalive_period = 75         # Interval in seconds to send keep-alive packets.(optional, default: 75s)
     nodelay = false               # Enable TCP_NODELAY (optional, default: false).
     channel_size = 2048           # Tunnel and Local channel size. Excess connections are discarded. (optional, default: 2048).
@@ -95,7 +95,7 @@ To start using the solution, you'll need to configure both server and client com
     mux_version = 1               # SMUX protocol version (1 or 2). Version 2 may have extra features. (optional)
     mux_framesize = 32768         # 32 KB. The maximum size of a frame that can be sent over a connection. (optional)
     mux_recievebuffer = 4194304   # 4 MB. The maximum buffer size for incoming data per connection. (optional)
-    mux_streambuffer = 65536      # 256 KB. The maximum buffer size per individual stream within a connection. (optional)
+    mux_streambuffer = 65536      # 64 KB. The maximum buffer size per individual stream within a connection. (optional)
     mux_keepalive_disabled = false # wsmux/wssmux: disable smux's built-in per-connection keepalive ping. Every pool connection pings on the same fixed interval, which is a traffic-pattern signal; disabling it relies on TCP keepalive instead. (optional, default: false)
     mux_stripe = 1                 # wsmux/wssmux: split a single flow's data across this many pool connections instead of pinning it to one, so one flow isn't capped by a single connection's congestion window/RTT (the win on a lossy, high-RTT link). Must match on both server and client. 1 disables it (default). The earlier deadlock, tail data-loss, silent-truncation, and connection-pool leak bugs are fixed and covered by tests (incl. -race and end-to-end concurrent load). Still newer than the single-connection path and has no leg-failure recovery - if a pool connection drops mid-transfer the flow ends (surfacing as a reset, never silent corruption). Because each striped flow is reassembled in order, one leg whose transport backs up can briefly head-of-line-stall that single flow under very high concurrency; it no longer degrades the whole tunnel. Raise it above 1 when the bottleneck is genuinely one long-lived throughput-bound flow. (optional, default: 1)
     sniffer = false               # Enable or disable network sniffing for monitoring data. (optional, default false)
@@ -118,7 +118,7 @@ To start using the solution, you'll need to configure both server and client com
 
     ports = [
     "443-600",                  # Listen on all ports in the range 443 to 600
-    "443-600:5201",             # Listen on all ports in the range 443 to 600 and forward traffic to 5201
+    "443-600=5201",             # Listen on all ports in the range 443 to 600 and forward traffic to 5201
     "443-600=1.1.1.1:5201",     # Listen on all ports in the range 443 to 600 and forward traffic to 1.1.1.1:5201
     "443",                      # Listen on local port 443 and forward to remote port 443 (default forwarding).
     "4000=5000",                # Listen on local port 4000 (bind to all local IPs) and forward to remote port 5000.
@@ -144,8 +144,9 @@ To start using the solution, you'll need to configure both server and client com
    edge_ip = "188.114.96.0"      # Edge IP used for CDN connection, specifically for WebSocket-based transports.(Optional, default none)
    edge_ips = []                 # ws/wss/wsmux/wssmux: optional edge IP to dial per remote_addrs entry (aligned by index); empty entries resolve/dial the domain directly. (optional, default: none)
    path = ""                     # Custom base path prepended to the /channel and /tunnel endpoints, for ws/wss/wsmux/wssmux. Must match the server. (optional, default: none)
+   tls_verify = false            # wss/wssmux: verify the server's TLS certificate. Off by default for self-signed setups, but while off an on-path party can MITM the token-bearing handshake; enable once the server presents a verifiable certificate. (optional, default: false)
    transport = "tcp"             # Protocol to use ("tcp", "tcpmux", "ws", "wss", "wsmux", "wssmux". mandatory).
-   token = "your_token"          # Authentication token for secure communication (optional).
+   token = "your_token"          # Authentication token for secure communication (required; must match on client and server).
    connection_pool = 8           # Number of pre-established connections.(optional, default: 8).
    aggressive_pool = false       # Enables aggressive connection pool management.(optional, default: false).
    keepalive_period = 75         # Interval in seconds to send keep-alive packets. (optional, default: 75s)
@@ -155,7 +156,7 @@ To start using the solution, you'll need to configure both server and client com
    mux_version = 1               # SMUX protocol version (1 or 2). Version 2 may have extra features. (optional)
    mux_framesize = 32768         # 32 KB. The maximum size of a frame that can be sent over a connection. (optional)
    mux_recievebuffer = 4194304   # 4 MB. The maximum buffer size for incoming data per connection. (optional)
-   mux_streambuffer = 65536      # 256 KB. The maximum buffer size per individual stream within a connection. (optional)
+   mux_streambuffer = 65536      # 64 KB. The maximum buffer size per individual stream within a connection. (optional)
    mux_keepalive_disabled = false # wsmux/wssmux: disable smux's built-in per-connection keepalive ping (see server config for details). (optional, default: false)
    mux_stripe = 1                 # wsmux/wssmux (prototype): split a single flow's data across this many pool connections (see server config for details). Must match the server. (optional, default: 1)
    sniffer = false               # Enable or disable network sniffing for monitoring data. (optional, default false)

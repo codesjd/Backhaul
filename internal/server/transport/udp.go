@@ -357,9 +357,14 @@ func (s *UdpTransport) acceptTunnelConn(listener *net.UDPConn) {
 				s.logger.Debugf("accepted tunnel connection from %s", addr.String())
 			default:
 				s.logger.Warn("UDP tunnel channel is full")
-				// Close the newly created connection as it couldn't be added
+				// Close the newly created connection as it couldn't be added.
+				// The delete must hold activeMu like every other access to the
+				// map (:313, :348) - an unguarded map write races the reader
+				// goroutines and triggers a fatal concurrent-map-write throw.
 				close(tunnelConn.payload)
+				s.activeMu.Lock()
 				delete(s.activeConnections, key)
+				s.activeMu.Unlock()
 			}
 		}
 	}
@@ -442,7 +447,7 @@ func (s *UdpTransport) parsePortMappings() {
 			} else {
 				// Handle single local port case
 				port, err := strconv.Atoi(localPortOrRange)
-				if err == nil && port > 1 && port < 65535 { // format port=remoteAddress
+				if err == nil && port >= 1 && port <= 65535 { // format port=remoteAddress
 					localAddr = fmt.Sprintf(":%d", port)
 				} else {
 					localAddr = localPortOrRange // format ip:port=remoteAddress
