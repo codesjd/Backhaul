@@ -118,7 +118,7 @@ To start using the solution, you'll need to configure both server and client com
 
     ports = [
     "443-600",                  # Listen on all ports in the range 443 to 600
-    "443-600:5201",             # Listen on all ports in the range 443 to 600 and forward traffic to 5201
+    "443-600=5201",             # Listen on all ports in the range 443 to 600 and forward traffic to 5201
     "443-600=1.1.1.1:5201",     # Listen on all ports in the range 443 to 600 and forward traffic to 1.1.1.1:5201
     "443",                      # Listen on local port 443 and forward to remote port 443 (default forwarding).
     "4000=5000",                # Listen on local port 4000 (bind to all local IPs) and forward to remote port 5000.

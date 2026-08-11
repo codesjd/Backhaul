@@ -36,11 +36,13 @@ func NewClient(cfg *config.ClientConfig, parentCtx context.Context) *Client {
 
 // Run starts the client and begins dialing the tunnel server
 func (c *Client) Start() {
-	// for pprof
+	// for pprof. Bind to loopback only: pprof serves heap dumps from a process
+	// holding the tunnel token and TLS keys, so it must never be reachable
+	// off-host. Reach it via an SSH tunnel if you need it remotely.
 	if c.config.PPROF {
 		go func() {
-			c.logger.Info("pprof started at port 6061")
-			http.ListenAndServe("0.0.0.0:6061", nil)
+			c.logger.Info("pprof started at 127.0.0.1:6061")
+			http.ListenAndServe("127.0.0.1:6061", nil)
 		}()
 	}
 

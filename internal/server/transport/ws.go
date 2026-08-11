@@ -235,8 +235,14 @@ func (s *WsTransport) tunnelListener() {
 
 	// Create an HTTP server
 	server := &http.Server{
-		Addr:        addr,
-		IdleTimeout: -1,
+		Addr: addr,
+		// IdleTimeout stays disabled because after the WebSocket upgrade the
+		// connection is a long-lived raw tunnel. ReadHeaderTimeout still bounds
+		// how long an unauthenticated client may take to send its request
+		// headers (auth runs only after they're read), so a slow-header client
+		// can't pin a goroutine and a completed TLS session indefinitely.
+		IdleTimeout:       -1,
+		ReadHeaderTimeout: 10 * time.Second,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			s.logger.Tracef("received http request from %s", r.RemoteAddr)
 
@@ -433,7 +439,7 @@ func (s *WsTransport) parsePortMappings() {
 			} else {
 				// Handle single local port case
 				port, err := strconv.Atoi(localPortOrRange)
-				if err == nil && port > 1 && port < 65535 { // format port=remoteAddress
+				if err == nil && port >= 1 && port <= 65535 { // format port=remoteAddress
 					localAddr = fmt.Sprintf(":%d", port)
 				} else {
 					localAddr = localPortOrRange // format ip:port=remoteAddress
