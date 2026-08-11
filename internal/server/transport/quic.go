@@ -37,6 +37,7 @@ type QuicConfig struct {
 	TLSKeyFile   string
 	UpMbps       int
 	DownMbps     int
+	ObfsPassword string
 }
 
 type QuicTransport struct {
@@ -59,6 +60,7 @@ type QuicTransport struct {
 	udpMu       sync.Mutex
 	udpSessions map[uint32]*quicUDPSession
 	udpSeq      uint32
+	reassembler *network.UDPReassembler
 }
 
 // quicUDPSession ties one public UDP client (clientAddr on pubConn) to a session
@@ -82,6 +84,7 @@ func NewQuicServer(parentCtx context.Context, config *QuicConfig, logger *logrus
 		logger:       logger,
 		usageMonitor: web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), ctx, config.SnifferLog, config.Sniffer, &config.TunnelStatus, logger),
 		udpSessions:  make(map[uint32]*quicUDPSession),
+		reassembler:  network.NewUDPReassembler(),
 	}
 }
 
@@ -96,7 +99,22 @@ func (s *QuicTransport) Start() {
 		s.logger.Fatalf("quic: %v", err)
 		return
 	}
-	ln, err := quic.ListenAddr(s.config.BindAddr, tlsConf, network.QuicConfig(s.config.DownMbps, s.config.Keepalive))
+	udpAddr, err := net.ResolveUDPAddr("udp", s.config.BindAddr)
+	if err != nil {
+		s.logger.Fatalf("quic: invalid bind address %s: %v", s.config.BindAddr, err)
+		return
+	}
+	pc, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		s.logger.Fatalf("quic: failed to bind %s: %v", s.config.BindAddr, err)
+		return
+	}
+	var packetConn net.PacketConn = pc
+	if s.config.ObfsPassword != "" {
+		packetConn = network.NewObfsPacketConn(pc, s.config.ObfsPassword)
+		s.logger.Info("quic: Salamander packet obfuscation enabled")
+	}
+	ln, err := quic.Listen(packetConn, tlsConf, network.QuicConfig(s.config.DownMbps, s.config.Keepalive))
 	if err != nil {
 		s.logger.Fatalf("quic: failed to listen on %s: %v", s.config.BindAddr, err)
 		return
@@ -369,10 +387,6 @@ func (s *QuicTransport) udpListener(localAddr, remoteAddr string) {
 }
 
 func (s *QuicTransport) forwardUDP(pc *net.UDPConn, src *net.UDPAddr, remoteAddr string, data []byte) {
-	if len(data) > network.QuicMaxDatagramPayload {
-		s.logger.Warnf("quic: udp packet from %s too large for a datagram (%d bytes), dropping", src, len(data))
-		return
-	}
 	conn := s.currentConn()
 	if conn == nil {
 		return
@@ -415,12 +429,16 @@ func (s *QuicTransport) forwardUDP(pc *net.UDPConn, src *net.UDPAddr, remoteAddr
 	}
 
 	sess.lastActive.Store(time.Now().UnixNano())
-	dgram := make([]byte, 4+len(data))
-	binary.BigEndian.PutUint32(dgram[0:4], sess.id)
-	copy(dgram[4:], data)
-	if err := conn.SendDatagram(dgram); err != nil {
-		s.logger.Debugf("quic: send datagram failed: %v", err)
+	frags := network.FragmentUDP(sess.id, network.NextUDPPacketID(), data)
+	if frags == nil {
+		s.logger.Warnf("quic: udp packet from %s too large to fragment (%d bytes), dropping", src, len(data))
 		return
+	}
+	for _, dgram := range frags {
+		if err := conn.SendDatagram(dgram); err != nil {
+			s.logger.Debugf("quic: send datagram failed: %v", err)
+			return
+		}
 	}
 	if s.config.Sniffer {
 		s.usageMonitor.AddOrUpdatePort(int(portOf(pc.LocalAddr())), uint64(len(data)))
@@ -493,11 +511,10 @@ func (s *QuicTransport) datagramReturnLoop(conn *quic.Conn) {
 		if err != nil {
 			return
 		}
-		if len(data) < 4 {
+		id, payload, ok := s.reassembler.Push(data)
+		if !ok {
 			continue
 		}
-		id := binary.BigEndian.Uint32(data[0:4])
-		payload := data[4:]
 		s.udpMu.Lock()
 		sess, ok := s.udpSessions[id]
 		s.udpMu.Unlock()

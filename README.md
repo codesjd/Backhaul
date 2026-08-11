@@ -314,7 +314,9 @@ To start using the solution, you'll need to configure both server and client com
    
 #### QUIC Configuration
 
-The `quic` transport is a TUIC/Hysteria2-shaped path built on QUIC (UDP underneath, TLS 1.3 built in). A single QUIC connection carries every forwarded flow: forwarded **TCP** connections ride independently flow-controlled QUIC **streams** (one slow flow never head-of-line-blocks the others), and forwarded **UDP** rides QUIC **datagrams** (unreliable/unordered, matching UDP's own semantics instead of paying for retransmission). Each mapped port forwards both protocols to the same target address.
+The `quic` transport is a TUIC/Hysteria2-shaped path built on QUIC (UDP underneath, TLS 1.3 built in). A single QUIC connection carries every forwarded flow: forwarded **TCP** connections ride independently flow-controlled QUIC **streams** (one slow flow never head-of-line-blocks the others), and forwarded **UDP** rides QUIC **datagrams** (unreliable/unordered, matching UDP's own semantics instead of paying for retransmission). UDP packets larger than one datagram are transparently **fragmented and reassembled**. Each mapped port forwards both protocols to the same target address.
+
+**Obfuscation (`quic_obfs_password`):** plain QUIC is an easy DPI target — the handshake exposes the QUIC version and connection IDs in cleartext, and censors actively block QUIC they can't attribute. When an obfuscation password is set (it must match on both ends), every UDP packet is XORed with a keystream derived from the password and a per-packet random salt (BLAKE2b) — Hysteria2's "Salamander" scheme. On the wire each packet looks like random bytes rather than QUIC, and an active probe that doesn't know the password gets garbage the server silently drops. This is obfuscation, not extra confidentiality (QUIC's own TLS 1.3 still provides that); leaving it empty gives plain QUIC.
 
 Bandwidth handling is Hysteria2-inspired: `quic_up_mbps`/`quic_down_mbps` size the QUIC flow-control windows to the bandwidth-delay product so a single fat flow is never throttled by the receiver's window. (A true loss-ignoring "Brutal" congestion controller has to live inside the QUIC stack, which mainline quic-go does not expose a hook for; the window sizing is the achievable part, and the code has a single seam where a real Brutal controller would be installed if a hooked quic-go is adopted.)
 
@@ -330,6 +332,7 @@ TLS: if `tls_cert`/`tls_key` are omitted the server generates an in-memory self-
    keepalive_period = 75        # Keeps the connection and its NAT mapping alive. (optional)
    quic_up_mbps = 100           # Target upload bandwidth (Mbps); sizes flow-control windows. (optional)
    quic_down_mbps = 100         # Target download bandwidth (Mbps). (optional)
+   quic_obfs_password = ""      # Salamander packet obfuscation password; must match the client. Empty = plain QUIC. (optional)
    tls_cert = ""                # Optional TLS cert; a self-signed cert is generated when empty.
    tls_key = ""                 # Optional TLS key.
    sniffer = false
@@ -354,6 +357,7 @@ TLS: if `tls_cert`/`tls_key` are omitted the server generates an in-memory self-
    retry_interval = 3           # Seconds between reconnect attempts. (optional)
    quic_up_mbps = 100           # (optional)
    quic_down_mbps = 100         # (optional)
+   quic_obfs_password = ""      # Salamander packet obfuscation password; must match the server. Empty = plain QUIC. (optional)
    sniffer = false
    web_port = 2060
    sniffer_log = "/root/backhaul.json"

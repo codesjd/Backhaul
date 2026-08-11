@@ -123,11 +123,14 @@ func TestQuicTunnelTCPAndUDP(t *testing.T) {
 	tcpEcho(t, ctx, echoPort)
 	udpEcho(t, ctx, echoPort)
 
+	const obfs = "s3cret-obfs" // exercise Salamander packet obfuscation end to end
+
 	srvCfg := &stransport.QuicConfig{
-		BindAddr:  fmt.Sprintf("127.0.0.1:%d", serverPort),
-		Token:     token,
-		Ports:     []string{fmt.Sprintf("%d=127.0.0.1:%d", pubPort, echoPort)},
-		Keepalive: 30 * time.Second,
+		BindAddr:     fmt.Sprintf("127.0.0.1:%d", serverPort),
+		Token:        token,
+		Ports:        []string{fmt.Sprintf("%d=127.0.0.1:%d", pubPort, echoPort)},
+		Keepalive:    30 * time.Second,
+		ObfsPassword: obfs,
 	}
 	srv := stransport.NewQuicServer(ctx, srvCfg, quietLogger())
 	go srv.Start()
@@ -138,6 +141,7 @@ func TestQuicTunnelTCPAndUDP(t *testing.T) {
 		KeepAlive:     30 * time.Second,
 		DialTimeOut:   5 * time.Second,
 		RetryInterval: 500 * time.Millisecond,
+		ObfsPassword:  obfs,
 	}
 	cli := ctransport.NewQuicClient(ctx, cliCfg, quietLogger())
 	go cli.Start()
@@ -195,6 +199,25 @@ func TestQuicTunnelTCPAndUDP(t *testing.T) {
 	}
 	if !udpOK {
 		t.Fatal("udp echo did not round-trip through the quic tunnel")
+	}
+
+	// --- large UDP round trip (exercises datagram fragmentation/reassembly) ---
+	big := make([]byte, 6000) // several fragments' worth
+	rand.Read(big)
+	var bigOK bool
+	for attempt := 0; attempt < 20 && !bigOK; attempt++ {
+		if _, err := udpConn.Write(big); err != nil {
+			t.Fatalf("large udp write: %v", err)
+		}
+		_ = udpConn.SetReadDeadline(time.Now().Add(time.Second))
+		rbuf := make([]byte, 8192)
+		n, err := udpConn.Read(rbuf)
+		if err == nil && bytes.Equal(rbuf[:n], big) {
+			bigOK = true
+		}
+	}
+	if !bigOK {
+		t.Fatal("fragmented UDP packet did not round-trip through the quic tunnel")
 	}
 }
 

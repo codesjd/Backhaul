@@ -11,6 +11,7 @@ require (
 	github.com/shirou/gopsutil/v4 v4.24.8
 	github.com/sirupsen/logrus v1.9.3
 	github.com/xtaci/smux v1.5.27
+	golang.org/x/crypto v0.48.0
 )
 
 require (
@@ -26,7 +27,6 @@ require (
 	github.com/tklauser/numcpus v0.8.0 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	go.uber.org/mock v0.5.0 // indirect
-	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/mod v0.18.0 // indirect
 	golang.org/x/net v0.49.0 // indirect
 	golang.org/x/sync v0.8.0 // indirect

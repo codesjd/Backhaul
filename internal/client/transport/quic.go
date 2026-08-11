@@ -32,6 +32,7 @@ type QuicConfig struct {
 	TLSVerify     bool
 	UpMbps        int
 	DownMbps      int
+	ObfsPassword  string
 }
 
 type QuicTransport struct {
@@ -49,6 +50,7 @@ type QuicTransport struct {
 	// dialed to the target service.
 	udpMu       sync.Mutex
 	udpSessions map[uint32]*net.UDPConn
+	reassembler *network.UDPReassembler
 }
 
 func NewQuicClient(parentCtx context.Context, config *QuicConfig, logger *logrus.Logger) *QuicTransport {
@@ -61,6 +63,7 @@ func NewQuicClient(parentCtx context.Context, config *QuicConfig, logger *logrus
 		logger:       logger,
 		usageMonitor: web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), ctx, config.SnifferLog, config.Sniffer, &config.TunnelStatus, logger),
 		udpSessions:  make(map[uint32]*net.UDPConn),
+		reassembler:  network.NewUDPReassembler(),
 	}
 }
 
@@ -131,10 +134,23 @@ func (c *QuicTransport) dialLoop() {
 
 func (c *QuicTransport) connectAndServe() error {
 	tlsConf := network.QuicClientTLSConfig(c.config.RemoteAddr, c.config.TLSVerify)
+	serverAddr, err := net.ResolveUDPAddr("udp", c.config.RemoteAddr)
+	if err != nil {
+		return fmt.Errorf("resolve %s: %w", c.config.RemoteAddr, err)
+	}
+	pc, err := net.ListenUDP("udp", &net.UDPAddr{})
+	if err != nil {
+		return fmt.Errorf("open udp socket: %w", err)
+	}
+	var packetConn net.PacketConn = pc
+	if c.config.ObfsPassword != "" {
+		packetConn = network.NewObfsPacketConn(pc, c.config.ObfsPassword)
+	}
 	dialCtx, cancel := context.WithTimeout(c.ctx, c.config.DialTimeOut)
-	conn, err := quic.DialAddr(dialCtx, c.config.RemoteAddr, tlsConf, network.QuicConfig(c.config.DownMbps, c.config.KeepAlive))
+	conn, err := quic.Dial(dialCtx, packetConn, serverAddr, tlsConf, network.QuicConfig(c.config.DownMbps, c.config.KeepAlive))
 	cancel()
 	if err != nil {
+		packetConn.Close()
 		return fmt.Errorf("dial %s: %w", c.config.RemoteAddr, err)
 	}
 	if err := c.authenticate(conn); err != nil {
@@ -267,14 +283,15 @@ func (c *QuicTransport) handleUDPSession(conn *quic.Conn, stream *quic.Stream) {
 			if err != nil {
 				break
 			}
-			if n > network.QuicMaxDatagramPayload {
-				continue
+			frags := network.FragmentUDP(id, network.NextUDPPacketID(), buf[:n])
+			if frags == nil {
+				continue // too large to fragment
 			}
-			dgram := make([]byte, 4+n)
-			binary.BigEndian.PutUint32(dgram[0:4], id)
-			copy(dgram[4:], buf[:n])
-			if err := conn.SendDatagram(dgram); err != nil {
-				c.logger.Debugf("quic: send udp datagram: %v", err)
+			for _, dgram := range frags {
+				if err := conn.SendDatagram(dgram); err != nil {
+					c.logger.Debugf("quic: send udp datagram: %v", err)
+					break
+				}
 			}
 		}
 	}()
@@ -301,11 +318,10 @@ func (c *QuicTransport) datagramLoop(conn *quic.Conn) {
 		if err != nil {
 			return
 		}
-		if len(data) < 4 {
+		id, payload, ok := c.reassembler.Push(data)
+		if !ok {
 			continue
 		}
-		id := binary.BigEndian.Uint32(data[0:4])
-		payload := data[4:]
 		c.udpMu.Lock()
 		uc, ok := c.udpSessions[id]
 		c.udpMu.Unlock()

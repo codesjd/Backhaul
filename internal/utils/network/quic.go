@@ -32,9 +32,12 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	quic "github.com/quic-go/quic-go"
+	"golang.org/x/crypto/blake2b"
 )
 
 const (
@@ -43,12 +46,18 @@ const (
 	// could switch it to "h3" to blend with real QUIC web traffic.
 	QuicALPN = "backhaul-quic"
 
-	// QuicMaxDatagramPayload bounds a single UDP payload carried in one QUIC
-	// datagram, leaving headroom under a conservative path MTU for the QUIC
-	// packet + our own datagram header. Larger UDP packets are dropped with a
-	// warning (fragmentation is a documented follow-up), so this stays well
-	// under the ~1200-byte floor quic-go can send unfragmented.
+	// QuicMaxDatagramPayload bounds a single QUIC datagram we send, leaving
+	// headroom under a conservative path MTU for the QUIC packet + our datagram
+	// header, so it stays under the ~1200-byte floor quic-go sends unfragmented.
 	QuicMaxDatagramPayload = 1100
+
+	// udpFragHeaderLen is the per-datagram UDP framing: session id (4) +
+	// packet id (2) + fragment count (1) + fragment index (1).
+	udpFragHeaderLen = 8
+
+	// MaxUDPFragPayload is how many bytes of the original UDP packet fit in one
+	// datagram after the framing header.
+	MaxUDPFragPayload = QuicMaxDatagramPayload - udpFragHeaderLen
 )
 
 // Server-opened stream types. The first byte of every stream the server opens to
@@ -208,4 +217,248 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 	return tls.X509KeyPair(certPEM, keyPEM)
+}
+
+// -------- UDP datagram framing + fragmentation --------
+//
+// A forwarded UDP packet can exceed what one QUIC datagram carries, so packets
+// are split into fragments that share a (sessionID, packetID) and are reassembled
+// on the far side. The common small-packet case is a single fragment (fragCount
+// == 1) and takes the fast path with no reassembly state.
+
+var udpPacketSeq uint32
+
+// NextUDPPacketID returns a process-wide monotonic packet id (wrapping at 16
+// bits). Reassembly is keyed by (sessionID, packetID), and stale partials are
+// evicted well within a 16-bit wrap, so per-session uniqueness holds.
+func NextUDPPacketID() uint16 {
+	return uint16(atomic.AddUint32(&udpPacketSeq, 1))
+}
+
+// FragmentUDP splits one UDP payload into datagrams ready for SendDatagram. Each
+// datagram is [sessionID][packetID][fragCount][fragIndex][slice]. A payload that
+// fits in one datagram yields a single fragment.
+func FragmentUDP(sessionID uint32, packetID uint16, payload []byte) [][]byte {
+	n := len(payload) / MaxUDPFragPayload
+	if len(payload)%MaxUDPFragPayload != 0 || len(payload) == 0 {
+		n++
+	}
+	if n > 255 {
+		return nil // too large to fragment into a single packetID's 8-bit index space
+	}
+	frags := make([][]byte, 0, n)
+	for i := 0; i < n; i++ {
+		start := i * MaxUDPFragPayload
+		end := start + MaxUDPFragPayload
+		if end > len(payload) {
+			end = len(payload)
+		}
+		slice := payload[start:end]
+		dg := make([]byte, udpFragHeaderLen+len(slice))
+		binary.BigEndian.PutUint32(dg[0:4], sessionID)
+		binary.BigEndian.PutUint16(dg[4:6], packetID)
+		dg[6] = byte(n)
+		dg[7] = byte(i)
+		copy(dg[udpFragHeaderLen:], slice)
+		frags = append(frags, dg)
+	}
+	return frags
+}
+
+// UDPReassembler reassembles fragmented UDP datagrams. It is safe for concurrent
+// use and bounds its memory: at most maxPartials in-flight packets, each evicted
+// after partialTTL, so a peer that sends only opening fragments can't grow it
+// without limit.
+type UDPReassembler struct {
+	mu       sync.Mutex
+	partials map[uint64]*udpPartial
+}
+
+type udpPartial struct {
+	parts   [][]byte
+	have    int
+	count   int
+	total   int
+	created time.Time
+}
+
+const (
+	maxUDPPartials = 1024
+	udpPartialTTL  = 10 * time.Second
+)
+
+func NewUDPReassembler() *UDPReassembler {
+	return &UDPReassembler{partials: make(map[uint64]*udpPartial)}
+}
+
+// Push feeds one received datagram. When it completes a packet (or is a lone
+// fragment), it returns the sessionID, the full payload, and ok=true.
+func (r *UDPReassembler) Push(dg []byte) (sessionID uint32, payload []byte, ok bool) {
+	if len(dg) < udpFragHeaderLen {
+		return 0, nil, false
+	}
+	sessionID = binary.BigEndian.Uint32(dg[0:4])
+	packetID := binary.BigEndian.Uint16(dg[4:6])
+	count := int(dg[6])
+	index := int(dg[7])
+	frag := dg[udpFragHeaderLen:]
+	if count == 0 || index >= count {
+		return 0, nil, false
+	}
+	if count == 1 {
+		// Fast path: a whole packet, copied out so the caller owns it.
+		out := make([]byte, len(frag))
+		copy(out, frag)
+		return sessionID, out, true
+	}
+
+	key := uint64(sessionID)<<16 | uint64(packetID)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.evictLocked()
+
+	p := r.partials[key]
+	if p == nil {
+		if len(r.partials) >= maxUDPPartials {
+			r.dropOldestLocked()
+		}
+		p = &udpPartial{parts: make([][]byte, count), count: count, created: time.Now()}
+		r.partials[key] = p
+	}
+	if p.count != count || p.parts[index] != nil {
+		return 0, nil, false // inconsistent or duplicate fragment; ignore
+	}
+	cp := make([]byte, len(frag))
+	copy(cp, frag)
+	p.parts[index] = cp
+	p.have++
+	p.total += len(cp)
+	if p.have < p.count {
+		return 0, nil, false
+	}
+	out := make([]byte, 0, p.total)
+	for _, part := range p.parts {
+		out = append(out, part...)
+	}
+	delete(r.partials, key)
+	return sessionID, out, true
+}
+
+// evictLocked drops partials older than the TTL. Caller holds mu.
+func (r *UDPReassembler) evictLocked() {
+	now := time.Now()
+	for k, p := range r.partials {
+		if now.Sub(p.created) > udpPartialTTL {
+			delete(r.partials, k)
+		}
+	}
+}
+
+// dropOldestLocked removes the oldest partial to make room. Caller holds mu.
+func (r *UDPReassembler) dropOldestLocked() {
+	var oldestKey uint64
+	var oldest time.Time
+	first := true
+	for k, p := range r.partials {
+		if first || p.created.Before(oldest) {
+			oldestKey, oldest, first = k, p.created, false
+		}
+	}
+	if !first {
+		delete(r.partials, oldestKey)
+	}
+}
+
+// -------- Salamander-style packet obfuscation --------
+//
+// Plain QUIC is an easy DPI target: the long-header handshake exposes the QUIC
+// version and connection IDs in cleartext, and censors actively block or throttle
+// QUIC they can't attribute to a known service. ObfsPacketConn wraps the UDP
+// socket and XORs every packet with a keystream derived from a shared password
+// and a per-packet random salt (BLAKE2b), so on the wire each packet is
+// salt + pseudo-random bytes - not recognizably QUIC - and a probe that doesn't
+// know the password produces garbage the server silently drops. This mirrors
+// Hysteria2's "Salamander" obfuscation. It is obfuscation, not additional
+// confidentiality: QUIC's own TLS 1.3 still provides that underneath.
+
+const obfsSaltLen = 8
+
+// ObfsPacketConn is a net.PacketConn that obfuscates every datagram with a
+// password-derived per-packet keystream.
+type ObfsPacketConn struct {
+	net.PacketConn
+	psk     []byte
+	readBuf []byte
+	readMu  sync.Mutex
+}
+
+// NewObfsPacketConn wraps inner so every packet is obfuscated with password.
+func NewObfsPacketConn(inner net.PacketConn, password string) *ObfsPacketConn {
+	return &ObfsPacketConn{
+		PacketConn: inner,
+		psk:        []byte(password),
+		readBuf:    make([]byte, 2048),
+	}
+}
+
+// SetReadBuffer / SetWriteBuffer delegate to the wrapped socket so quic-go can
+// still size the kernel buffers (it type-asserts for these); without them it
+// logs a warning and leaves the buffers at the OS default. We deliberately do
+// NOT expose the OOB batch-read interface: quic-go must keep reading through
+// ReadFrom below so every packet is deobfuscated.
+func (o *ObfsPacketConn) SetReadBuffer(n int) error {
+	if c, ok := o.PacketConn.(interface{ SetReadBuffer(int) error }); ok {
+		return c.SetReadBuffer(n)
+	}
+	return nil
+}
+
+func (o *ObfsPacketConn) SetWriteBuffer(n int) error {
+	if c, ok := o.PacketConn.(interface{ SetWriteBuffer(int) error }); ok {
+		return c.SetWriteBuffer(n)
+	}
+	return nil
+}
+
+func (o *ObfsPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	out := make([]byte, obfsSaltLen+len(p))
+	if _, err := rand.Read(out[:obfsSaltLen]); err != nil {
+		return 0, err
+	}
+	key := blake2b.Sum256(append(append([]byte{}, o.psk...), out[:obfsSaltLen]...))
+	for i, b := range p {
+		out[obfsSaltLen+i] = b ^ key[i%len(key)]
+	}
+	if _, err := o.PacketConn.WriteTo(out, addr); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (o *ObfsPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	o.readMu.Lock()
+	defer o.readMu.Unlock()
+	if len(o.readBuf) < len(p)+obfsSaltLen {
+		o.readBuf = make([]byte, len(p)+obfsSaltLen)
+	}
+	for {
+		n, addr, err := o.PacketConn.ReadFrom(o.readBuf)
+		if err != nil {
+			return 0, addr, err
+		}
+		if n < obfsSaltLen+1 {
+			// Too short to be one of ours (or an unauthenticated probe): drop it
+			// and keep reading instead of surfacing garbage to the QUIC stack.
+			continue
+		}
+		key := blake2b.Sum256(append(append([]byte{}, o.psk...), o.readBuf[:obfsSaltLen]...))
+		plainLen := n - obfsSaltLen
+		if plainLen > len(p) {
+			plainLen = len(p)
+		}
+		for i := 0; i < plainLen; i++ {
+			p[i] = o.readBuf[obfsSaltLen+i] ^ key[i%len(key)]
+		}
+		return plainLen, addr, nil
+	}
 }

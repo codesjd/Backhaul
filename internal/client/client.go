@@ -173,6 +173,7 @@ func (c *Client) Start() {
 			TLSVerify:     c.config.TLSVerify,
 			UpMbps:        c.config.QuicUpMbps,
 			DownMbps:      c.config.QuicDownMbps,
+			ObfsPassword:  c.config.QuicObfs,
 		}
 
 		quicClient := transport.NewQuicClient(c.ctx, quicConfig, c.logger)
