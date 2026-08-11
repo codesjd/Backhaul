@@ -175,6 +175,7 @@ func (s *Server) Start() {
 			UpMbps:       s.config.QuicUpMbps,
 			DownMbps:     s.config.QuicDownMbps,
 			ObfsPassword: s.config.QuicObfs,
+			Masquerade:   s.config.QuicMasquerade,
 		}
 
 		quicServer := transport.NewQuicServer(s.ctx, quicConfig, s.logger)

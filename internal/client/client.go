@@ -174,6 +174,7 @@ func (c *Client) Start() {
 			UpMbps:        c.config.QuicUpMbps,
 			DownMbps:      c.config.QuicDownMbps,
 			ObfsPassword:  c.config.QuicObfs,
+			Masquerade:    c.config.QuicMasquerade,
 		}
 
 		quicClient := transport.NewQuicClient(c.ctx, quicConfig, c.logger)

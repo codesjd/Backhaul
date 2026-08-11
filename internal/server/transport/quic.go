@@ -39,6 +39,7 @@ type QuicConfig struct {
 	UpMbps       int
 	DownMbps     int
 	ObfsPassword string
+	Masquerade   bool
 }
 
 type QuicTransport struct {
@@ -95,10 +96,13 @@ func (s *QuicTransport) Start() {
 	}
 	s.config.TunnelStatus = "Disconnected (QUIC)"
 
-	tlsConf, err := network.QuicServerTLSConfig(s.config.TLSCertFile, s.config.TLSKeyFile)
+	tlsConf, err := network.QuicServerTLSConfig(s.config.TLSCertFile, s.config.TLSKeyFile, network.QuicALPNProtocols(s.config.Masquerade))
 	if err != nil {
 		s.logger.Fatalf("quic: %v", err)
 		return
+	}
+	if s.config.Masquerade {
+		s.logger.Info("quic: HTTP/3 ALPN masquerade enabled")
 	}
 	udpAddr, err := net.ResolveUDPAddr("udp", s.config.BindAddr)
 	if err != nil {

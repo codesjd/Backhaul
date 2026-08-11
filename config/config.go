@@ -53,6 +53,7 @@ type ServerConfig struct {
 	QuicUpMbps           int           `toml:"quic_up_mbps"`       // quic: target upload bandwidth in Mbps. >0 enables real Brutal congestion control on the send path; 0 = default (Cubic).
 	QuicDownMbps         int           `toml:"quic_down_mbps"`     // quic: target download bandwidth in Mbps; sizes QUIC flow-control windows. 0 = default.
 	QuicObfs             string        `toml:"quic_obfs_password"` // quic: Salamander-style packet obfuscation password. Must match the client. Empty = plain QUIC.
+	QuicMasquerade       bool          `toml:"quic_masquerade"`    // quic: advertise ALPN "h3" so the handshake blends with HTTP/3 web traffic. Must match the client.
 }
 
 // ClientConfig represents the configuration for the client.
@@ -90,6 +91,7 @@ type ClientConfig struct {
 	QuicUpMbps           int           `toml:"quic_up_mbps"`       // quic: target upload bandwidth in Mbps. >0 enables real Brutal congestion control on the send path; 0 = default (Cubic).
 	QuicDownMbps         int           `toml:"quic_down_mbps"`     // quic: target download bandwidth in Mbps; sizes QUIC flow-control windows. 0 = default.
 	QuicObfs             string        `toml:"quic_obfs_password"` // quic: Salamander-style packet obfuscation password. Must match the server. Empty = plain QUIC.
+	QuicMasquerade       bool          `toml:"quic_masquerade"`    // quic: advertise ALPN "h3" so the handshake blends with HTTP/3 web traffic. Must match the server.
 }
 
 // Config represents the complete configuration, including both server and client settings.

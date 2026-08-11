@@ -133,6 +133,7 @@ func TestQuicTunnelTCPAndUDP(t *testing.T) {
 		ObfsPassword: obfs,
 		UpMbps:       100, // exercise Brutal congestion control on both directions
 		DownMbps:     100,
+		Masquerade:   true, // exercise the h3 ALPN masquerade
 	}
 	srv := stransport.NewQuicServer(ctx, srvCfg, quietLogger())
 	go srv.Start()
@@ -146,6 +147,7 @@ func TestQuicTunnelTCPAndUDP(t *testing.T) {
 		ObfsPassword:  obfs,
 		UpMbps:        100,
 		DownMbps:      100,
+		Masquerade:    true,
 	}
 	cli := ctransport.NewQuicClient(ctx, cliCfg, quietLogger())
 	go cli.Start()

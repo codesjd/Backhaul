@@ -34,6 +34,7 @@ type QuicConfig struct {
 	UpMbps        int
 	DownMbps      int
 	ObfsPassword  string
+	Masquerade    bool
 }
 
 type QuicTransport struct {
@@ -134,7 +135,7 @@ func (c *QuicTransport) dialLoop() {
 }
 
 func (c *QuicTransport) connectAndServe() error {
-	tlsConf := network.QuicClientTLSConfig(c.config.RemoteAddr, c.config.TLSVerify)
+	tlsConf := network.QuicClientTLSConfig(c.config.RemoteAddr, c.config.TLSVerify, network.QuicALPNProtocols(c.config.Masquerade))
 	serverAddr, err := net.ResolveUDPAddr("udp", c.config.RemoteAddr)
 	if err != nil {
 		return fmt.Errorf("resolve %s: %w", c.config.RemoteAddr, err)

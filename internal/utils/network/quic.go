@@ -40,9 +40,9 @@ import (
 )
 
 const (
-	// QuicALPN is the ALPN token both ends negotiate. It is deliberately
-	// distinct from "h3" - this is not HTTP/3 - but a future masquerade mode
-	// could switch it to "h3" to blend with real QUIC web traffic.
+	// QuicALPN is the default ALPN token both ends negotiate when masquerade is
+	// off. quic_masquerade switches it to "h3" (see QuicALPNProtocols) so the
+	// handshake blends with real HTTP/3 web traffic.
 	QuicALPN = "backhaul-quic"
 
 	// QuicMaxDatagramPayload bounds a single QUIC datagram we send, leaving
@@ -66,10 +66,22 @@ const (
 	QuicStreamUDP byte = 2 // followed by uint32 session id + LP-string target address; registers a UDP session
 )
 
+// QuicALPNProtocols returns the ALPN list to advertise. With masquerade on it
+// claims "h3" so the negotiated ALPN (which QUIC-aware DPI recovers by decrypting
+// the Initial packet) matches real HTTP/3 web traffic instead of a custom token
+// that stands out. Both ends must agree, so this is derived from the same
+// quic_masquerade flag on client and server.
+func QuicALPNProtocols(masquerade bool) []string {
+	if masquerade {
+		return []string{"h3"}
+	}
+	return []string{QuicALPN}
+}
+
 // QuicServerTLSConfig loads the configured cert/key, or generates an in-memory
 // self-signed certificate when none is set (the common case for this tool,
 // where the operator controls both ends and pins trust via the token, not a CA).
-func QuicServerTLSConfig(certFile, keyFile string) (*tls.Config, error) {
+func QuicServerTLSConfig(certFile, keyFile string, alpn []string) (*tls.Config, error) {
 	var cert tls.Certificate
 	var err error
 	if certFile != "" && keyFile != "" {
@@ -86,14 +98,14 @@ func QuicServerTLSConfig(certFile, keyFile string) (*tls.Config, error) {
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS13,
-		NextProtos:   []string{QuicALPN},
+		NextProtos:   alpn,
 	}, nil
 }
 
 // QuicClientTLSConfig builds the client side. verify follows the same contract
 // as the ws/wss tls_verify knob: off by default (self-signed friendly), but
 // while off an on-path party can MITM the token-bearing handshake.
-func QuicClientTLSConfig(serverName string, verify bool) *tls.Config {
+func QuicClientTLSConfig(serverName string, verify bool, alpn []string) *tls.Config {
 	host := serverName
 	if h, _, err := net.SplitHostPort(serverName); err == nil {
 		host = h
@@ -102,7 +114,7 @@ func QuicClientTLSConfig(serverName string, verify bool) *tls.Config {
 		ServerName:         host,
 		InsecureSkipVerify: !verify,
 		MinVersion:         tls.VersionTLS13,
-		NextProtos:         []string{QuicALPN},
+		NextProtos:         alpn,
 	}
 }
 

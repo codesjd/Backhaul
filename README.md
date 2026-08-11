@@ -318,6 +318,8 @@ The `quic` transport is a TUIC/Hysteria2-shaped path built on QUIC (UDP undernea
 
 **Obfuscation (`quic_obfs_password`):** plain QUIC is an easy DPI target — the handshake exposes the QUIC version and connection IDs in cleartext, and censors actively block QUIC they can't attribute. When an obfuscation password is set (it must match on both ends), every UDP packet is XORed with a keystream derived from the password and a per-packet random salt (BLAKE2b) — Hysteria2's "Salamander" scheme. On the wire each packet looks like random bytes rather than QUIC, and an active probe that doesn't know the password gets garbage the server silently drops. This is obfuscation, not extra confidentiality (QUIC's own TLS 1.3 still provides that); leaving it empty gives plain QUIC.
 
+**HTTP/3 masquerade (`quic_masquerade`):** with this on (must match both ends), the connection advertises ALPN `h3` instead of a custom token, so QUIC-aware DPI — which recovers the ALPN by decrypting the Initial packet — sees it as ordinary HTTP/3 web traffic. This defeats *passive* classification (best paired with UDP port 443). It does **not** by itself defeat *active* probing (a probe that speaks HTTP/3 will notice the connection doesn't actually serve a website) — for that, use `quic_obfs_password`, which hides the protocol entirely. Obfuscation and masquerade are alternative strategies (looks-like-nothing vs. looks-like-HTTP/3); with obfuscation on, the ALPN isn't visible on the wire anyway.
+
 **Brutal congestion control:** setting `quic_up_mbps` enables a real Hysteria2-style **Brutal** controller on the send path — it paces at the configured target bandwidth and *ignores packet loss* (sending proportionally harder as loss rises so goodput holds near the target), which is what keeps throughput up on lossy/censored links where loss is induced rather than congestion-driven. This rides the `github.com/sagernet/quic-go` fork (the sing-box QUIC stack, which exposes the congestion-control hook). Leave `quic_up_mbps` at 0 to use QUIC's default (Cubic) congestion control. `quic_down_mbps` additionally sizes the receive flow-control windows to the bandwidth-delay product so a single fat flow is never throttled by the receiver's window. Set both to your link's real capacity — Brutal is aggressive and unfair by design, so an inflated value floods the path.
 
 TLS: if `tls_cert`/`tls_key` are omitted the server generates an in-memory self-signed certificate (the operator controls both ends and pins trust via the shared `token`). The client does **not** verify the certificate by default (`tls_verify = false`); set `tls_verify = true` once the server presents a verifiable certificate, otherwise an on-path party can MITM the token-bearing handshake.
@@ -333,6 +335,7 @@ TLS: if `tls_cert`/`tls_key` are omitted the server generates an in-memory self-
    quic_up_mbps = 100           # Target upload bandwidth (Mbps); sizes flow-control windows. (optional)
    quic_down_mbps = 100         # Target download bandwidth (Mbps). (optional)
    quic_obfs_password = ""      # Salamander packet obfuscation password; must match the client. Empty = plain QUIC. (optional)
+   quic_masquerade = false      # Advertise ALPN "h3" to blend with HTTP/3 traffic; must match the client. (optional)
    tls_cert = ""                # Optional TLS cert; a self-signed cert is generated when empty.
    tls_key = ""                 # Optional TLS key.
    sniffer = false
@@ -358,6 +361,7 @@ TLS: if `tls_cert`/`tls_key` are omitted the server generates an in-memory self-
    quic_up_mbps = 100           # (optional)
    quic_down_mbps = 100         # (optional)
    quic_obfs_password = ""      # Salamander packet obfuscation password; must match the server. Empty = plain QUIC. (optional)
+   quic_masquerade = false      # Advertise ALPN "h3" to blend with HTTP/3 traffic; must match the server. (optional)
    sniffer = false
    web_port = 2060
    sniffer_log = "/root/backhaul.json"
