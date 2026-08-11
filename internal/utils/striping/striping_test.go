@@ -3,6 +3,7 @@ package striping
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/binary"
 	"io"
 	"net"
 	"sync"
@@ -177,6 +178,49 @@ func TestStripedLegStall(t *testing.T) {
 	}
 	if _, err := client.Write([]byte("more data")); err == nil {
 		t.Fatal("expected client.Write to fail after the connection was torn down")
+	}
+}
+
+// TestReadDoesNotBusySpinWhenEndArrivesEarly is the regression test for the
+// busy-spin: the END marker (which carries the total chunk count) can arrive on
+// a fast leg while a data chunk is still in flight on a slower one. Once the
+// marker closes totalKnown, that channel stays permanently ready - so a Read
+// still waiting on the missing sequence would wake on it every loop iteration,
+// pegging a core and starving the stallTimeout timer (which loses the select
+// race to the closed channel), so a genuinely missing chunk never times out.
+//
+// Here the peer announces one data chunk but never sends it and keeps the legs
+// open. A correct Read waits on the missing sequence and gives up after
+// stallTimeout; the buggy one spins forever and never returns.
+func TestReadDoesNotBusySpinWhenEndArrivesEarly(t *testing.T) {
+	legs, peers := pipePair(2)
+	server := New(legs, 4096)
+	server.stallTimeout = 200 * time.Millisecond
+	defer server.Close()
+
+	var end [headerSize]byte
+	binary.BigEndian.PutUint32(end[0:4], 1) // total = 1 data chunk
+	binary.BigEndian.PutUint32(end[4:8], endMarkerLen)
+	go func() {
+		peers[0].Write(end[:])
+		// Never send chunk 0, and never close the legs - so the only thing that
+		// can end the Read is the stall timer.
+	}()
+
+	readErr := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 16)
+		_, err := server.Read(buf)
+		readErr <- err
+	}()
+
+	select {
+	case err := <-readErr:
+		if err == nil {
+			t.Fatal("expected a stall error waiting for the missing chunk, got nil")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Read did not return within 3s of a 200ms stall timeout - busy-spin defeated stallTimeout")
 	}
 }
 

@@ -163,6 +163,11 @@ func (s *WsTransport) channelHandler() {
 					}
 					return
 				}
+				// A zero-length binary frame (or padding-only payload) would
+				// panic on msg[0] and take down this read goroutine; skip it.
+				if len(msg) == 0 {
+					continue
+				}
 				messageChan <- msg[0]
 			}
 		}

@@ -35,6 +35,17 @@ func Run(configPath string, ctx context.Context) {
 		logger.Fatalf("neither server nor client configuration is properly set.")
 	}
 
+	// Require an explicit token on the active side. There is no built-in
+	// default: a tokenless deployment would otherwise authenticate peers with a
+	// well-known value and act as an open relay. Both tunnel ends must share the
+	// same token.
+	if configType == "server" && cfg.Server.Token == "" {
+		logger.Fatalf("server 'token' is required: set it in the [server] config (it must match the client's token)")
+	}
+	if configType == "client" && cfg.Client.Token == "" {
+		logger.Fatalf("client 'token' is required: set it in the [client] config (it must match the server's token)")
+	}
+
 	// Determine whether to run as a server or client
 	switch configType {
 	case "server":

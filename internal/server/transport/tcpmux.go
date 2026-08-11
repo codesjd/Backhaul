@@ -599,8 +599,18 @@ func (s *TcpMuxTransport) handleSession(session *smux.Session) {
 			// Send the target port over the tunnel connection
 			if err := utils.SendBinaryString(stream, incomingConn.remoteAddr); err != nil {
 				s.logger.Tracef("failed to send address over stream: %v", err)
-				// Put local connection back to local channel
-				s.localChannel <- incomingConn
+				// Close the stream that never served traffic - leaving it open
+				// leaks the smux stream. Requeue non-blocking (a full
+				// localChannel would otherwise park this goroutine forever and
+				// permanently burn a MuxCon slot), dropping the conn if full.
+				stream.Close()
+				select {
+				case s.localChannel <- incomingConn:
+				default:
+					incomingConn.conn.Close()
+					atomic.AddInt32(&s.streamCounter, -1)
+				}
+				<-counter // release the mux slot reserved at the top of the loop
 				continue
 			}
 
@@ -620,8 +630,15 @@ func (s *TcpMuxTransport) handleSessionError(incomingConn *LocalTCPConn, err err
 	// decrease session value
 	atomic.AddInt32(&s.sessionCounter, -1)
 
-	// Put local connection back to local channel
-	s.localChannel <- *incomingConn
+	// Put local connection back to local channel (non-blocking): a blocking
+	// send on a full localChannel would park this goroutine forever, and the
+	// caller returns right after this - leaking the session and its counter slot.
+	select {
+	case s.localChannel <- *incomingConn:
+	default:
+		incomingConn.conn.Close()
+		atomic.AddInt32(&s.streamCounter, -1)
+	}
 
 	// Attempt to request a new connection
 	select {

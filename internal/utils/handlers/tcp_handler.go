@@ -57,17 +57,30 @@ func TCPConnectionHandler(ctx context.Context, proxyProtocol bool, from net.Conn
 		}
 	}()
 
+	// Pump both directions independently and only tear the pair down once BOTH
+	// have finished. The old code fully closed both conns the moment either
+	// direction ended - so a client that half-closed its upload (a clean FIN,
+	// the normal end of a request) would trip a full close on the peer while its
+	// reply was still in flight. On a socket with data still unread that full
+	// close is an RST, discarding the buffered tail: silent reply truncation on
+	// tcp/tcpmux/ws/wsmux. Each direction now half-closes only the write side it
+	// finished feeding (see transferData), leaving the reverse copy free to
+	// drain; the pair is fully closed here once both are done.
+	var wg sync.WaitGroup
+	wg.Add(2)
 	go func() {
-		defer close(done)
+		defer wg.Done()
 		transferData(from, to, logger, usage, remotePort, sniffer)
 	}()
+	go func() {
+		defer wg.Done()
+		transferData(to, from, logger, usage, remotePort, sniffer)
+	}()
+	wg.Wait()
 
-	transferData(to, from, logger, usage, remotePort, sniffer)
-
-	// Wait for the reverse copy to finish. transferData closes both ends on
-	// return, so this resolves promptly once either direction completes; the
-	// watcher goroutine above then exits via the closed done channel.
-	<-done
+	close(done)
+	from.Close()
+	to.Close()
 }
 
 // transferData pumps from -> to until either side closes or errors.
@@ -86,21 +99,30 @@ func transferData(from net.Conn, to net.Conn, logger *logrus.Logger, usage *web.
 
 	n, err := io.CopyBuffer(to, from, *bufPtr)
 
-	// A copy that ends on a real transport error - not a clean EOF (err == nil),
-	// and not our own side being closed by the other direction's teardown
-	// (net.ErrClosed) - means the byte stream feeding `to` was truncated at the
-	// source. For a striped destination, tell it so it does not emit the
-	// end-of-stream marker that would certify the partial stream as complete:
-	// the far end's Read then reports io.ErrUnexpectedEOF instead of a clean EOF
-	// that silently hides the lost tail.
 	if err != nil && !errors.Is(err, net.ErrClosed) {
+		// A copy that ends on a real transport error - not a clean EOF, and not
+		// our own side being closed by the other direction's teardown
+		// (net.ErrClosed) - means the byte stream feeding `to` was truncated at
+		// the source. For a striped destination, tell it so it does not emit the
+		// end-of-stream marker that would certify the partial stream as
+		// complete: the far end's Read then reports io.ErrUnexpectedEOF instead
+		// of a clean EOF that silently hides the lost tail. The connection is
+		// broken, so tear both directions down.
 		if aw, ok := to.(interface{ AbortWrite() }); ok {
 			aw.AbortWrite()
 		}
+		from.Close()
+		to.Close()
+	} else {
+		// Clean EOF (err == nil), or our own side was already closed by the
+		// other direction (net.ErrClosed). Propagate the EOF by half-closing
+		// only `to`'s write side, so an in-flight reply on the reverse copy is
+		// not truncated by a full close. Conn types that can't half-close
+		// (smux.Stream, striping.Conn) fall back to a full close - no worse than
+		// the previous behavior for them; the reverse copy is torn down and the
+		// pair is fully closed by the caller once both directions return.
+		closeWrite(to)
 	}
-
-	from.Close()
-	to.Close()
 
 	switch {
 	case err == nil:
@@ -115,4 +137,16 @@ func transferData(from net.Conn, to net.Conn, logger *logrus.Logger, usage *web.
 	if sniffer && n > 0 {
 		usage.AddOrUpdatePort(remotePort, uint64(n))
 	}
+}
+
+// closeWrite shuts down only the write half of c when the conn supports it
+// (*net.TCPConn, *tls.Conn, and the WS-over-raw legs whose NetConn is one of
+// those), sending a clean FIN that lets the peer finish replying. Conn types
+// without a half-close (smux.Stream, striping.Conn) fall back to a full close.
+func closeWrite(c net.Conn) {
+	if cw, ok := c.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
+		return
+	}
+	c.Close()
 }

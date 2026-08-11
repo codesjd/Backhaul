@@ -82,6 +82,7 @@ type ClientConfig struct {
 	SO_RCVBUF            int           `toml:"so_rcvbuf"`
 	SO_SNDBUF            int           `toml:"so_sndbuf"`
 	Path                 string        `toml:"path"`
+	TLSVerify            bool          `toml:"tls_verify"` // wss/wssmux: verify the server's TLS certificate. Off by default for self-signed setups; enable to stop an on-path party from MITMing the token-bearing handshake.
 }
 
 // Config represents the complete configuration, including both server and client settings.
