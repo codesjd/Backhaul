@@ -406,37 +406,50 @@ func (s *QuicTransport) forwardUDP(pc *net.UDPConn, src *net.UDPAddr, remoteAddr
 
 	s.udpMu.Lock()
 	sess := s.udpSessionByClient(key)
+	s.udpMu.Unlock()
+
 	if sess == nil {
-		// Register a new session: open a stream carrying the id + target so the
-		// client dials the local UDP service and maps the id.
+		// Open the registration stream OUTSIDE the lock. OpenStreamSync can block
+		// (peer stream limit / connection flow control); holding udpMu across it
+		// would wedge the entire UDP path - every other forward and the datagram
+		// return loop both need udpMu - which is the "stuck until restart" hang.
 		stream, err := conn.OpenStreamSync(s.ctx)
 		if err != nil {
-			s.udpMu.Unlock()
 			s.logger.Errorf("quic: failed to open udp session stream: %v", err)
 			return
 		}
-		s.udpSeq++
-		id := s.udpSeq
-		sess = &quicUDPSession{id: id, clientAddr: src, pubConn: pc, stream: stream}
-		sess.lastActive.Store(time.Now().UnixNano())
-		s.udpSessions[id] = sess
-		s.udpMu.Unlock()
 
-		hdr := []byte{network.QuicStreamUDP, 0, 0, 0, 0}
-		binary.BigEndian.PutUint32(hdr[1:], id)
-		if _, err := stream.Write(hdr); err != nil {
-			s.closeUDPSession(id)
-			s.logger.Errorf("quic: failed to write udp session header: %v", err)
-			return
+		s.udpMu.Lock()
+		if existing := s.udpSessionByClient(key); existing != nil {
+			// A concurrent packet from the same source already registered a
+			// session; drop the extra stream and reuse the existing one.
+			s.udpMu.Unlock()
+			stream.CancelWrite(0)
+			_ = stream.Close()
+			sess = existing
+		} else {
+			s.udpSeq++
+			id := s.udpSeq
+			sess = &quicUDPSession{id: id, clientAddr: src, pubConn: pc, stream: stream}
+			sess.lastActive.Store(time.Now().UnixNano())
+			s.udpSessions[id] = sess
+			s.udpMu.Unlock()
+
+			// Header writes can also block on flow control - keep them off the lock.
+			hdr := []byte{network.QuicStreamUDP, 0, 0, 0, 0}
+			binary.BigEndian.PutUint32(hdr[1:], id)
+			if _, err := stream.Write(hdr); err != nil {
+				s.closeUDPSession(id)
+				s.logger.Errorf("quic: failed to write udp session header: %v", err)
+				return
+			}
+			if err := network.WriteLPString(stream, remoteAddr); err != nil {
+				s.closeUDPSession(id)
+				s.logger.Errorf("quic: failed to write udp target: %v", err)
+				return
+			}
+			go s.watchUDPSession(id, stream)
 		}
-		if err := network.WriteLPString(stream, remoteAddr); err != nil {
-			s.closeUDPSession(id)
-			s.logger.Errorf("quic: failed to write udp target: %v", err)
-			return
-		}
-		go s.watchUDPSession(id, stream)
-	} else {
-		s.udpMu.Unlock()
 	}
 
 	sess.lastActive.Store(time.Now().UnixNano())
