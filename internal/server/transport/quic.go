@@ -12,11 +12,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/musix/backhaul/internal/utils/congestion"
 	"github.com/musix/backhaul/internal/utils/handlers"
 	"github.com/musix/backhaul/internal/utils/network"
 	"github.com/musix/backhaul/internal/web"
 
-	quic "github.com/quic-go/quic-go"
+	quic "github.com/sagernet/quic-go"
 	"github.com/sirupsen/logrus"
 )
 
@@ -198,6 +199,12 @@ func (s *QuicTransport) handleTunnelConn(conn *quic.Conn) {
 		return
 	}
 	_ = stream.Close()
+
+	// Enable Brutal congestion control for the server's send direction (the
+	// download path to public clients) when a target bandwidth is configured.
+	if s.config.UpMbps > 0 {
+		conn.SetCongestionControl(congestion.NewBrutalSender(uint64(s.config.UpMbps) * 1_000_000 / 8))
+	}
 
 	s.logger.Infof("quic: client authenticated from %s", conn.RemoteAddr())
 	s.config.TunnelStatus = "Connected (QUIC)"

@@ -6,8 +6,8 @@ require (
 	github.com/BurntSushi/toml v1.4.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/libp2p/go-openssl v0.1.0
-	github.com/quic-go/quic-go v0.54.0
 	github.com/refraction-networking/utls v1.8.2
+	github.com/sagernet/quic-go v0.59.0-sing-box-mod.5
 	github.com/shirou/gopsutil/v4 v4.24.8
 	github.com/sirupsen/logrus v1.9.3
 	github.com/xtaci/smux v1.5.27
@@ -26,10 +26,6 @@ require (
 	github.com/tklauser/go-sysconf v0.3.14 // indirect
 	github.com/tklauser/numcpus v0.8.0 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
-	go.uber.org/mock v0.5.0 // indirect
-	golang.org/x/mod v0.18.0 // indirect
 	golang.org/x/net v0.49.0 // indirect
-	golang.org/x/sync v0.8.0 // indirect
 	golang.org/x/sys v0.41.0 // indirect
-	golang.org/x/tools v0.22.0 // indirect
 )

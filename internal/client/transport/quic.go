@@ -9,11 +9,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/musix/backhaul/internal/utils/congestion"
 	"github.com/musix/backhaul/internal/utils/handlers"
 	"github.com/musix/backhaul/internal/utils/network"
 	"github.com/musix/backhaul/internal/web"
 
-	quic "github.com/quic-go/quic-go"
+	quic "github.com/sagernet/quic-go"
 	"github.com/sirupsen/logrus"
 )
 
@@ -156,6 +157,13 @@ func (c *QuicTransport) connectAndServe() error {
 	if err := c.authenticate(conn); err != nil {
 		conn.CloseWithError(1, "auth failed")
 		return fmt.Errorf("auth: %w", err)
+	}
+	// Enable Brutal congestion control for our send direction when a target
+	// upload bandwidth is configured. Brutal paces at a fixed rate and ignores
+	// loss - the Hysteria2 behaviour that keeps throughput up on lossy/censored
+	// links. Left off (default quic-go CC) when quic_up_mbps is 0.
+	if c.config.UpMbps > 0 {
+		conn.SetCongestionControl(congestion.NewBrutalSender(uint64(c.config.UpMbps) * 1_000_000 / 8))
 	}
 	c.conn = conn
 	c.config.TunnelStatus = "Connected (QUIC)"

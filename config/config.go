@@ -50,7 +50,7 @@ type ServerConfig struct {
 	Path                 string        `toml:"path"`
 	Fallback             string        `toml:"fallback"`
 	TLSEngine            string        `toml:"tls_engine"`
-	QuicUpMbps           int           `toml:"quic_up_mbps"`       // quic: target upload bandwidth in Mbps; sizes QUIC flow-control windows (Brutal-style). 0 = default.
+	QuicUpMbps           int           `toml:"quic_up_mbps"`       // quic: target upload bandwidth in Mbps. >0 enables real Brutal congestion control on the send path; 0 = default (Cubic).
 	QuicDownMbps         int           `toml:"quic_down_mbps"`     // quic: target download bandwidth in Mbps; sizes QUIC flow-control windows. 0 = default.
 	QuicObfs             string        `toml:"quic_obfs_password"` // quic: Salamander-style packet obfuscation password. Must match the client. Empty = plain QUIC.
 }
@@ -87,7 +87,7 @@ type ClientConfig struct {
 	SO_SNDBUF            int           `toml:"so_sndbuf"`
 	Path                 string        `toml:"path"`
 	TLSVerify            bool          `toml:"tls_verify"`         // wss/wssmux/quic: verify the server's TLS certificate. Off by default for self-signed setups; enable to stop an on-path party from MITMing the token-bearing handshake.
-	QuicUpMbps           int           `toml:"quic_up_mbps"`       // quic: target upload bandwidth in Mbps; sizes QUIC flow-control windows (Brutal-style). 0 = default.
+	QuicUpMbps           int           `toml:"quic_up_mbps"`       // quic: target upload bandwidth in Mbps. >0 enables real Brutal congestion control on the send path; 0 = default (Cubic).
 	QuicDownMbps         int           `toml:"quic_down_mbps"`     // quic: target download bandwidth in Mbps; sizes QUIC flow-control windows. 0 = default.
 	QuicObfs             string        `toml:"quic_obfs_password"` // quic: Salamander-style packet obfuscation password. Must match the server. Empty = plain QUIC.
 }

@@ -131,6 +131,8 @@ func TestQuicTunnelTCPAndUDP(t *testing.T) {
 		Ports:        []string{fmt.Sprintf("%d=127.0.0.1:%d", pubPort, echoPort)},
 		Keepalive:    30 * time.Second,
 		ObfsPassword: obfs,
+		UpMbps:       100, // exercise Brutal congestion control on both directions
+		DownMbps:     100,
 	}
 	srv := stransport.NewQuicServer(ctx, srvCfg, quietLogger())
 	go srv.Start()
@@ -142,6 +144,8 @@ func TestQuicTunnelTCPAndUDP(t *testing.T) {
 		DialTimeOut:   5 * time.Second,
 		RetryInterval: 500 * time.Millisecond,
 		ObfsPassword:  obfs,
+		UpMbps:        100,
+		DownMbps:      100,
 	}
 	cli := ctransport.NewQuicClient(ctx, cliCfg, quietLogger())
 	go cli.Start()

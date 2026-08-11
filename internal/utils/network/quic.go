@@ -10,14 +10,13 @@ package network
 // of paying for retransmission on packets that don't want it).
 //
 // Bandwidth handling: Hysteria2's headline feature is "Brutal", a congestion
-// controller that sets a fixed send rate and ignores packet loss, which is what
-// makes it fast on lossy censored links. A true Brutal has to live *inside* the
-// QUIC stack, and neither mainline quic-go nor its tagged forks expose a public
-// hook to swap the controller, so we approximate its intent with what the public
-// API does allow: flow-control windows sized to the configured bandwidth-delay
-// product, so a single fat flow is never throttled by the receiver's window
-// (the usual ceiling on one QUIC flow). QuicConfig is the single seam where a
-// real Brutal controller would be installed if a hooked quic-go is adopted.
+// controller that paces at a fixed rate and ignores packet loss, which is what
+// makes it fast on lossy censored links. Brutal has to live *inside* the QUIC
+// stack; this transport rides github.com/sagernet/quic-go (the sing-box fork),
+// which exposes conn.SetCongestionControl, and installs a real Brutal controller
+// (internal/utils/congestion) when quic_up_mbps is set. QuicConfig additionally
+// sizes the flow-control windows to the bandwidth-delay product so the receiver
+// window never caps a single fat flow.
 
 import (
 	"crypto/ecdsa"
@@ -36,7 +35,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	quic "github.com/quic-go/quic-go"
+	quic "github.com/sagernet/quic-go"
 	"golang.org/x/crypto/blake2b"
 )
 
