@@ -3,6 +3,7 @@ package network
 import (
 	"bytes"
 	"crypto/rand"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -151,5 +152,33 @@ func TestObfsRoundTripAndOnWire(t *testing.T) {
 	}
 	if bytes.Equal(out2[:n2], plain) {
 		t.Fatal("wrong password recovered plaintext")
+	}
+}
+
+// nullPacketConn discards writes; for benchmarking the obfs codec in isolation.
+type nullPacketConn struct{}
+
+func (nullPacketConn) ReadFrom(p []byte) (int, net.Addr, error)  { return 0, nil, io.EOF }
+func (nullPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) { return len(p), nil }
+func (nullPacketConn) Close() error                              { return nil }
+func (nullPacketConn) LocalAddr() net.Addr                       { return &net.UDPAddr{} }
+func (nullPacketConn) SetDeadline(time.Time) error               { return nil }
+func (nullPacketConn) SetReadDeadline(time.Time) error           { return nil }
+func (nullPacketConn) SetWriteDeadline(time.Time) error          { return nil }
+
+// BenchmarkObfsWriteTo measures the per-packet obfuscation cost on the send path
+// (allocs/op should be 0 after the pooling + fast-salt changes).
+func BenchmarkObfsWriteTo(b *testing.B) {
+	oc := NewObfsPacketConn(nullPacketConn{}, "benchmark-password")
+	p := make([]byte, 1200)
+	rand.Read(p)
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
+	b.SetBytes(1200)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := oc.WriteTo(p, addr); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

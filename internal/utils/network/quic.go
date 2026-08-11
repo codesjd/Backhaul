@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	mrand "math/rand/v2"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -398,17 +399,45 @@ const obfsSaltLen = 8
 // password-derived per-packet keystream.
 type ObfsPacketConn struct {
 	net.PacketConn
-	psk     []byte
-	readBuf []byte
-	readMu  sync.Mutex
+	psk       []byte
+	readBuf   []byte
+	readKeyIn []byte // scratch for psk||salt on the (single-reader) read path
+	readMu    sync.Mutex
 }
 
 // NewObfsPacketConn wraps inner so every packet is obfuscated with password.
 func NewObfsPacketConn(inner net.PacketConn, password string) *ObfsPacketConn {
+	psk := []byte(password)
 	return &ObfsPacketConn{
 		PacketConn: inner,
-		psk:        []byte(password),
+		psk:        psk,
 		readBuf:    make([]byte, 2048),
+		readKeyIn:  make([]byte, 0, len(psk)+obfsSaltLen),
+	}
+}
+
+// obfsScratch is the per-WriteTo working set, pooled so the hot send path does
+// no per-packet allocation. WriteTo can run concurrently (a server's listener
+// shares one packet conn across every connection), hence the pool rather than a
+// single per-conn buffer.
+type obfsScratch struct {
+	out   []byte
+	keyIn []byte
+}
+
+var obfsScratchPool = sync.Pool{New: func() any {
+	return &obfsScratch{out: make([]byte, 0, 1600), keyIn: make([]byte, 0, 64)}
+}}
+
+// xorWithKey XORs src into dst using key repeated, without a per-byte modulo.
+func xorWithKey(dst, src []byte, key *[32]byte) {
+	ki := 0
+	for i := 0; i < len(src); i++ {
+		dst[i] = src[i] ^ key[ki]
+		ki++
+		if ki == len(key) {
+			ki = 0
+		}
 	}
 }
 
@@ -432,15 +461,24 @@ func (o *ObfsPacketConn) SetWriteBuffer(n int) error {
 }
 
 func (o *ObfsPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
-	out := make([]byte, obfsSaltLen+len(p))
-	if _, err := rand.Read(out[:obfsSaltLen]); err != nil {
-		return 0, err
+	s := obfsScratchPool.Get().(*obfsScratch)
+	need := obfsSaltLen + len(p)
+	if cap(s.out) < need {
+		s.out = make([]byte, need)
+	} else {
+		s.out = s.out[:need]
 	}
-	key := blake2b.Sum256(append(append([]byte{}, o.psk...), out[:obfsSaltLen]...))
-	for i, b := range p {
-		out[obfsSaltLen+i] = b ^ key[i%len(key)]
-	}
-	if _, err := o.PacketConn.WriteTo(out, addr); err != nil {
+	// The salt is prepended in the clear, so it need not be cryptographically
+	// secret - only non-repeating so identical plaintext packets don't produce
+	// identical ciphertext. A fast userspace PRNG replaces a per-packet
+	// crypto/rand syscall, which was the dominant cost on the send path.
+	binary.LittleEndian.PutUint64(s.out[:obfsSaltLen], mrand.Uint64())
+	s.keyIn = append(append(s.keyIn[:0], o.psk...), s.out[:obfsSaltLen]...)
+	key := blake2b.Sum256(s.keyIn)
+	xorWithKey(s.out[obfsSaltLen:], p, &key)
+	_, err := o.PacketConn.WriteTo(s.out, addr)
+	obfsScratchPool.Put(s)
+	if err != nil {
 		return 0, err
 	}
 	return len(p), nil
@@ -462,14 +500,13 @@ func (o *ObfsPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 			// and keep reading instead of surfacing garbage to the QUIC stack.
 			continue
 		}
-		key := blake2b.Sum256(append(append([]byte{}, o.psk...), o.readBuf[:obfsSaltLen]...))
+		o.readKeyIn = append(append(o.readKeyIn[:0], o.psk...), o.readBuf[:obfsSaltLen]...)
+		key := blake2b.Sum256(o.readKeyIn)
 		plainLen := n - obfsSaltLen
 		if plainLen > len(p) {
 			plainLen = len(p)
 		}
-		for i := 0; i < plainLen; i++ {
-			p[i] = o.readBuf[obfsSaltLen+i] ^ key[i%len(key)]
-		}
+		xorWithKey(p[:plainLen], o.readBuf[obfsSaltLen:n], &key)
 		return plainLen, addr, nil
 	}
 }
