@@ -125,6 +125,7 @@ type WsMuxConfig struct {
 	SO_RCVBUF            int
 	SO_SNDBUF            int
 	MSS                  int
+	TLSVerify            bool // wssmux: verify the server certificate during the TLS handshake
 }
 
 func NewWSMuxClient(parentCtx context.Context, config *WsMuxConfig, logger *logrus.Logger) *WsMuxTransport {
@@ -235,7 +236,7 @@ func (c *WsMuxTransport) channelDialer() {
 		default:
 
 			ep := c.nextEndpoint()
-			tunnelWSConn, err := network.WebSocketDialer(c.ctx, ep.addr, ep.edgeIP, network.NormalizeBasePath(c.config.Path)+"/channel", c.config.DialTimeOut, c.config.KeepAlive, true, c.config.Token, c.userAgent, c.config.Mode, 3, 0, 0, 0)
+			tunnelWSConn, err := network.WebSocketDialer(c.ctx, ep.addr, ep.edgeIP, network.NormalizeBasePath(c.config.Path)+"/channel", c.config.DialTimeOut, c.config.KeepAlive, true, c.config.Token, c.userAgent, c.config.Mode, 3, 0, 0, 0, c.config.TLSVerify)
 			if err != nil {
 				c.logger.Errorf("control channel dialer: %v", err)
 				time.Sleep(c.config.RetryInterval)
@@ -349,6 +350,11 @@ func (c *WsMuxTransport) channelHandler() {
 					}
 					return
 				}
+				// A zero-length binary frame (or padding-only payload) would
+				// panic on msg[0] and take down this read goroutine; skip it.
+				if len(msg) == 0 {
+					continue
+				}
 				msgChan <- msg[0]
 			}
 		}
@@ -402,7 +408,7 @@ func (c *WsMuxTransport) tunnelDialer() {
 	c.logger.Debugf("initiating new %s tunnel connection to address %s", c.config.Mode, ep.addr)
 
 	// Dial to the tunnel server
-	tunnelWSConn, err := network.WebSocketDialer(c.ctx, ep.addr, ep.edgeIP, network.NormalizeBasePath(c.config.Path)+"/tunnel", c.config.DialTimeOut, c.config.KeepAlive, c.config.Nodelay, c.config.Token, c.userAgent, c.config.Mode, 3, c.config.SO_RCVBUF, c.config.SO_SNDBUF, c.config.MSS)
+	tunnelWSConn, err := network.WebSocketDialer(c.ctx, ep.addr, ep.edgeIP, network.NormalizeBasePath(c.config.Path)+"/tunnel", c.config.DialTimeOut, c.config.KeepAlive, c.config.Nodelay, c.config.Token, c.userAgent, c.config.Mode, 3, c.config.SO_RCVBUF, c.config.SO_SNDBUF, c.config.MSS, c.config.TLSVerify)
 	if err != nil {
 		c.logger.Errorf("tunnel server dialer: %v", err)
 

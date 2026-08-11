@@ -34,6 +34,7 @@ type UdpConfig struct {
 	TunnelStatus   string
 	RetryInterval  time.Duration
 	DialTimeOut    time.Duration
+	KeepAlive      time.Duration
 	ConnPoolSize   int
 	WebPort        int
 	Sniffer        bool
@@ -122,7 +123,7 @@ func (c *UdpTransport) channelDialer() {
 		case <-c.ctx.Done():
 			return
 		default:
-			tunnelTCPConn, err := network.TcpDialer(c.ctx, c.config.RemoteAddr, "", c.config.DialTimeOut, 30, true, 3, 0, 0, 0)
+			tunnelTCPConn, err := network.TcpDialer(c.ctx, c.config.RemoteAddr, "", c.config.DialTimeOut, c.config.KeepAlive, true, 3, 0, 0, 0)
 			if err != nil {
 				c.logger.Errorf("channel dialer: %v", err)
 				time.Sleep(c.config.RetryInterval)
@@ -403,6 +404,7 @@ func (c *UdpTransport) localDialer(remoteAddr string, port int, tunConn *net.UDP
 	remoteConn, err := net.DialUDP("udp", nil, remoteResolvedAddr)
 	if err != nil {
 		c.logger.Errorf("failed to dial remote UDP address: %v", err)
+		return // without this, the defer below dereferences a nil remoteConn and crashes the client
 	}
 
 	defer remoteConn.Close()

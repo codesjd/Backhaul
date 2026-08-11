@@ -3,6 +3,7 @@ package transport
 import (
 	"net"
 	"sync"
+	"sync/atomic"
 
 	"github.com/gorilla/websocket"
 )
@@ -25,7 +26,7 @@ type LocalAcceptUDPConn struct {
 	remoteAddr  string
 	listener    *net.UDPConn
 	clientAddr  *net.UDPAddr
-	IsCongested bool // for congested tcp connection
+	IsCongested atomic.Bool // set from tcpToUDP, read from the accept loop and handler; atomic to avoid a data race
 }
 
 type LocalUDPConn struct {

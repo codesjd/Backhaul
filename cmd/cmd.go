@@ -16,6 +16,21 @@ var (
 	logger = utils.NewLogger("info")
 )
 
+// detectConfigType decides whether a config is a server or a client (or
+// neither). A client is recognized by either the single remote_addr or the
+// multi-endpoint remote_addrs list, so a config that only sets remote_addrs is
+// still valid.
+func detectConfigType(cfg *config.Config) string {
+	switch {
+	case cfg.Server.BindAddr != "":
+		return "server"
+	case cfg.Client.RemoteAddr != "" || len(cfg.Client.RemoteAddrs) > 0:
+		return "client"
+	default:
+		return ""
+	}
+}
+
 func Run(configPath string, ctx context.Context) {
 	// Load and parse the configuration file
 	cfg, err := loadConfig(configPath)
@@ -26,13 +41,20 @@ func Run(configPath string, ctx context.Context) {
 	// Apply default values to the configuration
 	applyDefaults(cfg)
 
-	configType := ""
-	if cfg.Server.BindAddr != "" {
-		configType = "server"
-	} else if cfg.Client.RemoteAddr != "" {
-		configType = "client"
-	} else {
+	configType := detectConfigType(cfg)
+	if configType == "" {
 		logger.Fatalf("neither server nor client configuration is properly set.")
+	}
+
+	// Require an explicit token on the active side. There is no built-in
+	// default: a tokenless deployment would otherwise authenticate peers with a
+	// well-known value and act as an open relay. Both tunnel ends must share the
+	// same token.
+	if configType == "server" && cfg.Server.Token == "" {
+		logger.Fatalf("server 'token' is required: set it in the [server] config (it must match the client's token)")
+	}
+	if configType == "client" && cfg.Client.Token == "" {
+		logger.Fatalf("client 'token' is required: set it in the [client] config (it must match the server's token)")
 	}
 
 	// Determine whether to run as a server or client

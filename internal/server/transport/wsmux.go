@@ -172,6 +172,11 @@ func (s *WsMuxTransport) Restart() {
 	s.config.TunnelStatus = ""
 	s.streamCounter = 0
 	s.sessionCounter = 0
+	// Reset the in-flight striped-flow count too. Left stale, acquireStripedSlot
+	// would see active*StripeFactor already over the budget of a fresh, empty
+	// pool and busy-wait (or hang) until leftover goroutines from the previous
+	// generation happened to decrement it.
+	atomic.StoreInt32(&s.stripedFlows, 0)
 
 	s.sessionsMu.Lock()
 	s.sessions = nil
@@ -209,6 +214,11 @@ func (s *WsMuxTransport) channelHandler() {
 						go s.Restart()
 					}
 					return
+				}
+				// A zero-length binary frame (or padding-only payload) would
+				// panic on msg[0] and take down this read goroutine; skip it.
+				if len(msg) == 0 {
+					continue
 				}
 				messageChan <- msg[0]
 			}
@@ -278,8 +288,14 @@ func (s *WsMuxTransport) tunnelListener() {
 
 	// Create an HTTP server
 	server := &http.Server{
-		Addr:        addr,
-		IdleTimeout: -1,
+		Addr: addr,
+		// IdleTimeout stays disabled because after the WebSocket upgrade the
+		// connection is a long-lived raw tunnel. ReadHeaderTimeout still bounds
+		// how long an unauthenticated client may take to send its request
+		// headers (auth runs only after they're read), so a slow-header client
+		// can't pin a goroutine and a completed TLS session indefinitely.
+		IdleTimeout:       -1,
+		ReadHeaderTimeout: 10 * time.Second,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			s.logger.Tracef("received http request from %s", r.RemoteAddr)
 
@@ -352,6 +368,10 @@ func (s *WsMuxTransport) tunnelListener() {
 				case s.tunnelChannel <- session: // ok
 				default:
 					s.logger.Warnf("tunnel listener channel is full, discarding TCP connection from %s", conn.LocalAddr().String())
+					// Close the smux session, not just the raw conn: a bare
+					// conn.Close() leaves the session's goroutines and buffers
+					// leaked. session.Close() also closes the underlying conn.
+					session.Close()
 					conn.Close()
 				}
 			}
@@ -480,7 +500,7 @@ func (s *WsMuxTransport) parsePortMappings() {
 			} else {
 				// Handle single local port case
 				port, err := strconv.Atoi(localPortOrRange)
-				if err == nil && port > 1 && port < 65535 { // format port=remoteAddress
+				if err == nil && port >= 1 && port <= 65535 { // format port=remoteAddress
 					localAddr = fmt.Sprintf(":%d", port)
 				} else {
 					localAddr = localPortOrRange // format ip:port=remoteAddress
@@ -705,12 +725,21 @@ func (s *WsMuxTransport) dispatchStriped(incomingConn LocalTCPConn) {
 		atomic.AddInt32(&s.streamCounter, -1)
 		return
 	}
-	defer atomic.AddInt32(&s.stripedFlows, -1)
+	// The admission slot is released explicitly on each exit path rather than
+	// via a single defer: a setup that fails and requeues must give the slot
+	// back *before* the backoff sleep and requeue, otherwise it shrinks capacity
+	// for everyone else while doing nothing.
 
 	legs, err := s.openStripedLegs(s.config.StripeFactor)
 	if err != nil {
+		atomic.AddInt32(&s.stripedFlows, -1) // release before backoff + requeue
 		s.logger.Tracef("striped dispatch: %v, retrying shortly", err)
 		time.Sleep(100 * time.Millisecond)
+		// Refresh the creation time: a requeued conn keeps its original
+		// timestamp otherwise, so the 3s setup-timeout check at the top would
+		// almost always drop it on the retry, making the "retry" effectively
+		// dead.
+		incomingConn.timeCreated = time.Now().UnixMilli()
 		s.requeueOrDrop(incomingConn)
 		return
 	}
@@ -718,10 +747,12 @@ func (s *WsMuxTransport) dispatchStriped(incomingConn LocalTCPConn) {
 	gid := atomic.AddUint32(&s.stripeGroupID, 1)
 	for i, stream := range legs {
 		if err := utils.SendStripeHeader(stream, gid, uint8(i), uint8(len(legs)), incomingConn.remoteAddr); err != nil {
+			atomic.AddInt32(&s.stripedFlows, -1) // release before requeue
 			s.logger.Tracef("failed to send stripe header: %v", err)
 			for _, st := range legs {
 				st.Close()
 			}
+			incomingConn.timeCreated = time.Now().UnixMilli()
 			s.requeueOrDrop(incomingConn)
 			return
 		}
@@ -733,6 +764,7 @@ func (s *WsMuxTransport) dispatchStriped(incomingConn LocalTCPConn) {
 	}
 	stripedConn := striping.New(conns, striping.DefaultChunkSize)
 
+	defer atomic.AddInt32(&s.stripedFlows, -1) // hold the slot for the flow's lifetime
 	defer atomic.AddInt32(&s.streamCounter, -1)
 	handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, incomingConn.conn, stripedConn, s.logger, s.usageMonitor, incomingConn.conn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
 }
@@ -759,6 +791,16 @@ func (s *WsMuxTransport) acquireStripedSlot() bool {
 				return true
 			}
 			continue // lost the CAS race, re-read and retry
+		}
+		// At budget: ask the client to dial another pool session so the budget
+		// can grow. Under striping the usual growth trigger in localListener
+		// (streamCounter >= sessionCounter*MuxCon) rarely fires - streamCounter
+		// counts logical flows, but each flow consumes StripeFactor streams, so
+		// the slot cap is hit long before that threshold and the pool would
+		// otherwise never grow to meet striped demand.
+		select {
+		case s.reqNewConnChan <- struct{}{}:
+		default:
 		}
 		select {
 		case <-s.ctx.Done():
@@ -813,8 +855,18 @@ func (s *WsMuxTransport) handleSession(session *smux.Session) {
 			// Send the target port over the tunnel connection
 			if err := utils.SendBinaryString(stream, incomingConn.remoteAddr); err != nil {
 				s.logger.Tracef("failed to send address over stream: %v", err)
-				// Put local connection back to local channel
-				s.localChannel <- incomingConn
+				// Close the stream that never served traffic - leaving it open
+				// leaks the smux stream. Requeue non-blocking (a full
+				// localChannel would otherwise park this goroutine forever and
+				// permanently burn a MuxCon slot), dropping the conn if full.
+				stream.Close()
+				select {
+				case s.localChannel <- incomingConn:
+				default:
+					incomingConn.conn.Close()
+					atomic.AddInt32(&s.streamCounter, -1)
+				}
+				<-counter // release the mux slot reserved at the top of the loop
 				continue
 			}
 
@@ -834,8 +886,15 @@ func (s *WsMuxTransport) handleSessionError(incomingConn *LocalTCPConn, err erro
 	// decrease session value
 	atomic.AddInt32(&s.sessionCounter, -1)
 
-	// Put local connection back to local channel
-	s.localChannel <- *incomingConn
+	// Put local connection back to local channel (non-blocking): a blocking
+	// send on a full localChannel would park this goroutine forever, and the
+	// caller returns right after this - leaking the session and its counter slot.
+	select {
+	case s.localChannel <- *incomingConn:
+	default:
+		incomingConn.conn.Close()
+		atomic.AddInt32(&s.streamCounter, -1)
+	}
 
 	// Attempt to request a new connection
 	select {

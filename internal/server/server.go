@@ -31,11 +31,13 @@ func NewServer(cfg *config.ServerConfig, parentCtx context.Context) *Server {
 }
 
 func (s *Server) Start() {
-	// for pprof and debugging
+	// for pprof and debugging. Bind to loopback only: pprof serves heap dumps
+	// from a process holding the tunnel token and TLS keys, so it must never be
+	// reachable off-host. Reach it via an SSH tunnel if you need it remotely.
 	if s.config.PPROF {
 		go func() {
-			s.logger.Info("pprof started at port 6060")
-			http.ListenAndServe("0.0.0.0:6060", nil)
+			s.logger.Info("pprof started at 127.0.0.1:6060")
+			http.ListenAndServe("127.0.0.1:6060", nil)
 		}()
 	}
 

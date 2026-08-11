@@ -62,7 +62,7 @@ func (s *TcpTransport) udpListener(localAddr string, remoteAddr string) {
 				mu.Lock()
 				// Check if the connection is already active
 				if existingConn, exists := activeConnections[key]; exists {
-					if existingConn.IsCongested {
+					if existingConn.IsCongested.Load() {
 						s.logger.Debugf("connection with timestamp %d congested. Removing %s from active connections due to network congestion", existingConn.timeCreated, addr.String())
 						// For congested connections, closing the payload channel immediately can cause abrupt TCP disconnection,
 						// potentially leading to data loss. Instead, allow the connection to keep transferring data for 30 more
@@ -96,7 +96,6 @@ func (s *TcpTransport) udpListener(localAddr string, remoteAddr string) {
 					remoteAddr:  remoteAddr,
 					listener:    listener,
 					clientAddr:  addr,
-					IsCongested: false,
 				}
 
 				mu.Lock()
@@ -180,7 +179,7 @@ func UDPConnectionHandler(udp *LocalAcceptUDPConn, tcp net.Conn, logger *logrus.
 	mu.Lock()
 	close(udp.payload)
 
-	if !udp.IsCongested {
+	if !udp.IsCongested.Load() {
 		delete(*activeConnections, udp.clientAddr.String())
 	}
 	mu.Unlock()
@@ -263,7 +262,7 @@ func tcpToUDP(tcp net.Conn, udp *LocalAcceptUDPConn, logger *logrus.Logger, usag
 
 		// If the packet age exceeds the threshold (3x RTT), flag the connection as congested
 		if packetAge > 3*rtt {
-			udp.IsCongested = true
+			udp.IsCongested.Store(true)
 		}
 
 		// Read the 2-byte packet length header from the TCP connection
