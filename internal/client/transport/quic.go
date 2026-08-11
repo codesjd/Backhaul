@@ -1,0 +1,324 @@
+package transport
+
+import (
+	"context"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"net"
+	"sync"
+	"time"
+
+	"github.com/musix/backhaul/internal/utils/handlers"
+	"github.com/musix/backhaul/internal/utils/network"
+	"github.com/musix/backhaul/internal/web"
+
+	quic "github.com/quic-go/quic-go"
+	"github.com/sirupsen/logrus"
+)
+
+var authMagic = [4]byte{'B', 'H', 'Q', '1'}
+
+type QuicConfig struct {
+	RemoteAddr    string
+	Token         string
+	SnifferLog    string
+	TunnelStatus  string
+	Sniffer       bool
+	WebPort       int
+	KeepAlive     time.Duration
+	DialTimeOut   time.Duration
+	RetryInterval time.Duration
+	TLSVerify     bool
+	UpMbps        int
+	DownMbps      int
+}
+
+type QuicTransport struct {
+	config       *QuicConfig
+	parentctx    context.Context
+	ctx          context.Context
+	cancel       context.CancelFunc
+	logger       *logrus.Logger
+	usageMonitor *web.Usage
+	restartMutex sync.Mutex
+
+	conn *quic.Conn
+
+	// udpSessions maps a server-assigned session id to the local UDP socket
+	// dialed to the target service.
+	udpMu       sync.Mutex
+	udpSessions map[uint32]*net.UDPConn
+}
+
+func NewQuicClient(parentCtx context.Context, config *QuicConfig, logger *logrus.Logger) *QuicTransport {
+	ctx, cancel := context.WithCancel(parentCtx)
+	return &QuicTransport{
+		config:       config,
+		parentctx:    parentCtx,
+		ctx:          ctx,
+		cancel:       cancel,
+		logger:       logger,
+		usageMonitor: web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), ctx, config.SnifferLog, config.Sniffer, &config.TunnelStatus, logger),
+		udpSessions:  make(map[uint32]*net.UDPConn),
+	}
+}
+
+func (c *QuicTransport) Start() {
+	if c.config.WebPort > 0 {
+		go c.usageMonitor.Monitor()
+	}
+	c.config.TunnelStatus = "Disconnected (QUIC)"
+	go c.dialLoop()
+}
+
+func (c *QuicTransport) Restart() {
+	if !c.restartMutex.TryLock() {
+		c.logger.Warn("client is already restarting")
+		return
+	}
+	defer c.restartMutex.Unlock()
+
+	c.logger.Info("restarting client...")
+	level := c.logger.Level
+	c.logger.SetLevel(logrus.FatalLevel)
+
+	if c.cancel != nil {
+		c.cancel()
+	}
+	if c.conn != nil {
+		c.conn.CloseWithError(0, "restart")
+	}
+	time.Sleep(2 * time.Second)
+
+	ctx, cancel := context.WithCancel(c.parentctx)
+	c.ctx = ctx
+	c.cancel = cancel
+	c.usageMonitor = web.NewDataStore(fmt.Sprintf(":%v", c.config.WebPort), ctx, c.config.SnifferLog, c.config.Sniffer, &c.config.TunnelStatus, c.logger)
+	c.config.TunnelStatus = ""
+
+	c.udpMu.Lock()
+	for id, uc := range c.udpSessions {
+		uc.Close()
+		delete(c.udpSessions, id)
+	}
+	c.udpMu.Unlock()
+
+	c.logger.SetLevel(level)
+	go c.Start()
+}
+
+func (c *QuicTransport) dialLoop() {
+	if !c.config.TLSVerify {
+		c.logger.Warn("SECURITY: quic server certificate verification is OFF (tls_verify=false); the auth token can be harvested by an on-path party via TLS MITM. Set tls_verify=true once the server presents a verifiable certificate.")
+	}
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		default:
+		}
+		if err := c.connectAndServe(); err != nil {
+			c.logger.Errorf("quic: %v", err)
+		}
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-time.After(c.config.RetryInterval):
+		}
+	}
+}
+
+func (c *QuicTransport) connectAndServe() error {
+	tlsConf := network.QuicClientTLSConfig(c.config.RemoteAddr, c.config.TLSVerify)
+	dialCtx, cancel := context.WithTimeout(c.ctx, c.config.DialTimeOut)
+	conn, err := quic.DialAddr(dialCtx, c.config.RemoteAddr, tlsConf, network.QuicConfig(c.config.DownMbps, c.config.KeepAlive))
+	cancel()
+	if err != nil {
+		return fmt.Errorf("dial %s: %w", c.config.RemoteAddr, err)
+	}
+	if err := c.authenticate(conn); err != nil {
+		conn.CloseWithError(1, "auth failed")
+		return fmt.Errorf("auth: %w", err)
+	}
+	c.conn = conn
+	c.config.TunnelStatus = "Connected (QUIC)"
+	c.logger.Info("quic: control connection established successfully")
+
+	go c.datagramLoop(conn)
+
+	// Accept server-opened streams (one per forwarded TCP flow or UDP session)
+	// until the connection dies.
+	for {
+		stream, err := conn.AcceptStream(c.ctx)
+		if err != nil {
+			c.config.TunnelStatus = "Disconnected (QUIC)"
+			return fmt.Errorf("accept stream: %w", err)
+		}
+		go c.handleStream(conn, stream)
+	}
+}
+
+func (c *QuicTransport) authenticate(conn *quic.Conn) error {
+	stream, err := conn.OpenStreamSync(c.ctx)
+	if err != nil {
+		return fmt.Errorf("open auth stream: %w", err)
+	}
+	defer stream.Close()
+
+	var buf []byte
+	buf = append(buf, authMagic[:]...)
+	if err := writeAll(stream, buf); err != nil {
+		return err
+	}
+	if err := network.WriteLPString(stream, c.config.Token); err != nil {
+		return err
+	}
+	var bw [8]byte
+	binary.BigEndian.PutUint32(bw[0:4], uint32(c.config.UpMbps))
+	binary.BigEndian.PutUint32(bw[4:8], uint32(c.config.DownMbps))
+	if err := writeAll(stream, bw[:]); err != nil {
+		return err
+	}
+
+	_ = stream.SetReadDeadline(time.Now().Add(10 * time.Second))
+	var status [1]byte
+	if _, err := io.ReadFull(stream, status[:]); err != nil {
+		return fmt.Errorf("read status: %w", err)
+	}
+	if status[0] != 1 {
+		return fmt.Errorf("server rejected token")
+	}
+	_ = stream.SetReadDeadline(time.Time{})
+	return nil
+}
+
+func (c *QuicTransport) handleStream(conn *quic.Conn, stream *quic.Stream) {
+	var typ [1]byte
+	if _, err := io.ReadFull(stream, typ[:]); err != nil {
+		stream.CancelRead(1)
+		return
+	}
+	switch typ[0] {
+	case network.QuicStreamTCP:
+		c.handleTCPStream(conn, stream)
+	case network.QuicStreamUDP:
+		c.handleUDPSession(conn, stream)
+	default:
+		c.logger.Warnf("quic: unknown stream type %d", typ[0])
+		stream.CancelRead(1)
+	}
+}
+
+func (c *QuicTransport) handleTCPStream(conn *quic.Conn, stream *quic.Stream) {
+	target, err := network.ReadLPString(stream)
+	if err != nil {
+		c.logger.Debugf("quic: read tcp target: %v", err)
+		stream.CancelRead(1)
+		return
+	}
+	local, err := net.DialTimeout("tcp", target, c.config.DialTimeOut)
+	if err != nil {
+		c.logger.Debugf("quic: dial local tcp %s: %v", target, err)
+		stream.CancelRead(1)
+		stream.CancelWrite(1)
+		return
+	}
+	port := 0
+	if ta, ok := local.RemoteAddr().(*net.TCPAddr); ok {
+		port = ta.Port
+	}
+	handlers.TCPConnectionHandler(c.ctx, false, network.NewStreamConn(stream, conn), local, c.logger, c.usageMonitor, port, c.config.Sniffer)
+}
+
+func (c *QuicTransport) handleUDPSession(conn *quic.Conn, stream *quic.Stream) {
+	var idBuf [4]byte
+	if _, err := io.ReadFull(stream, idBuf[:]); err != nil {
+		stream.CancelRead(1)
+		return
+	}
+	id := binary.BigEndian.Uint32(idBuf[:])
+	target, err := network.ReadLPString(stream)
+	if err != nil {
+		stream.CancelRead(1)
+		return
+	}
+	raddr, err := net.ResolveUDPAddr("udp", target)
+	if err != nil {
+		c.logger.Debugf("quic: resolve udp %s: %v", target, err)
+		stream.CancelRead(1)
+		return
+	}
+	uc, err := net.DialUDP("udp", nil, raddr)
+	if err != nil {
+		c.logger.Debugf("quic: dial local udp %s: %v", target, err)
+		stream.CancelRead(1)
+		return
+	}
+	c.udpMu.Lock()
+	c.udpSessions[id] = uc
+	c.udpMu.Unlock()
+
+	// Read responses from the local service and send them back as datagrams.
+	go func() {
+		buf := make([]byte, 64*1024)
+		for {
+			n, err := uc.Read(buf)
+			if err != nil {
+				break
+			}
+			if n > network.QuicMaxDatagramPayload {
+				continue
+			}
+			dgram := make([]byte, 4+n)
+			binary.BigEndian.PutUint32(dgram[0:4], id)
+			copy(dgram[4:], buf[:n])
+			if err := conn.SendDatagram(dgram); err != nil {
+				c.logger.Debugf("quic: send udp datagram: %v", err)
+			}
+		}
+	}()
+
+	// The registration stream stays open for the session's lifetime; a read that
+	// returns tears the session down.
+	buf := make([]byte, 1)
+	_, _ = stream.Read(buf)
+
+	c.udpMu.Lock()
+	if cur, ok := c.udpSessions[id]; ok && cur == uc {
+		delete(c.udpSessions, id)
+	}
+	c.udpMu.Unlock()
+	uc.Close()
+	_ = stream.Close()
+}
+
+// datagramLoop delivers inbound datagrams (public UDP packets relayed by the
+// server) to the matching local UDP session.
+func (c *QuicTransport) datagramLoop(conn *quic.Conn) {
+	for {
+		data, err := conn.ReceiveDatagram(c.ctx)
+		if err != nil {
+			return
+		}
+		if len(data) < 4 {
+			continue
+		}
+		id := binary.BigEndian.Uint32(data[0:4])
+		payload := data[4:]
+		c.udpMu.Lock()
+		uc, ok := c.udpSessions[id]
+		c.udpMu.Unlock()
+		if !ok {
+			continue
+		}
+		if _, err := uc.Write(payload); err != nil {
+			c.logger.Debugf("quic: write to local udp: %v", err)
+		}
+	}
+}
+
+func writeAll(w io.Writer, b []byte) error {
+	_, err := w.Write(b)
+	return err
+}

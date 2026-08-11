@@ -160,6 +160,24 @@ func (c *Client) Start() {
 		udpClient := transport.NewUDPClient(c.ctx, udpConfig, c.logger)
 		go udpClient.Start()
 
+	case config.QUIC:
+		quicConfig := &transport.QuicConfig{
+			RemoteAddr:    c.config.RemoteAddr,
+			Token:         c.config.Token,
+			Sniffer:       c.config.Sniffer,
+			WebPort:       c.config.WebPort,
+			SnifferLog:    c.config.SnifferLog,
+			KeepAlive:     time.Duration(c.config.Keepalive) * time.Second,
+			DialTimeOut:   time.Duration(c.config.DialTimeout) * time.Second,
+			RetryInterval: time.Duration(c.config.RetryInterval) * time.Second,
+			TLSVerify:     c.config.TLSVerify,
+			UpMbps:        c.config.QuicUpMbps,
+			DownMbps:      c.config.QuicDownMbps,
+		}
+
+		quicClient := transport.NewQuicClient(c.ctx, quicConfig, c.logger)
+		go quicClient.Start()
+
 	default:
 		c.logger.Fatal("invalid transport type: ", c.config.Transport)
 	}

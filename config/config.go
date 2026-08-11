@@ -11,6 +11,7 @@ const (
 	WSMUX  TransportType = "wsmux"
 	WSSMUX TransportType = "wssmux"
 	UDP    TransportType = "udp"
+	QUIC   TransportType = "quic"
 )
 
 // ServerConfig represents the configuration for the server.
@@ -49,6 +50,8 @@ type ServerConfig struct {
 	Path                 string        `toml:"path"`
 	Fallback             string        `toml:"fallback"`
 	TLSEngine            string        `toml:"tls_engine"`
+	QuicUpMbps           int           `toml:"quic_up_mbps"`   // quic: target upload bandwidth in Mbps; sizes QUIC flow-control windows (Brutal-style). 0 = default.
+	QuicDownMbps         int           `toml:"quic_down_mbps"` // quic: target download bandwidth in Mbps; sizes QUIC flow-control windows. 0 = default.
 }
 
 // ClientConfig represents the configuration for the client.
@@ -82,6 +85,9 @@ type ClientConfig struct {
 	SO_RCVBUF            int           `toml:"so_rcvbuf"`
 	SO_SNDBUF            int           `toml:"so_sndbuf"`
 	Path                 string        `toml:"path"`
+	TLSVerify            bool          `toml:"tls_verify"`     // wss/wssmux/quic: verify the server's TLS certificate. Off by default for self-signed setups; enable to stop an on-path party from MITMing the token-bearing handshake.
+	QuicUpMbps           int           `toml:"quic_up_mbps"`   // quic: target upload bandwidth in Mbps; sizes QUIC flow-control windows (Brutal-style). 0 = default.
+	QuicDownMbps         int           `toml:"quic_down_mbps"` // quic: target download bandwidth in Mbps; sizes QUIC flow-control windows. 0 = default.
 }
 
 // Config represents the complete configuration, including both server and client settings.

@@ -15,6 +15,7 @@ Welcome to the **`Backhaul`** project! This project provides a high-performance 
       - [TCP Configuration](#tcp-configuration)
       - [TCP Multiplexing Configuration](#tcp-multiplexing-configuration)
       - [UDP Configuration](#udp-configuration)
+      - [QUIC Configuration](#quic-configuration)
       - [WebSocket Configuration](#websocket-configuration)
       - [Secure WebSocket Configuration](#secure-websocket-configuration)
       - [WS Multiplexing Configuration](#ws-multiplexing-configuration)
@@ -311,6 +312,54 @@ To start using the solution, you'll need to configure both server and client com
 
    ```
    
+#### QUIC Configuration
+
+The `quic` transport is a TUIC/Hysteria2-shaped path built on QUIC (UDP underneath, TLS 1.3 built in). A single QUIC connection carries every forwarded flow: forwarded **TCP** connections ride independently flow-controlled QUIC **streams** (one slow flow never head-of-line-blocks the others), and forwarded **UDP** rides QUIC **datagrams** (unreliable/unordered, matching UDP's own semantics instead of paying for retransmission). Each mapped port forwards both protocols to the same target address.
+
+Bandwidth handling is Hysteria2-inspired: `quic_up_mbps`/`quic_down_mbps` size the QUIC flow-control windows to the bandwidth-delay product so a single fat flow is never throttled by the receiver's window. (A true loss-ignoring "Brutal" congestion controller has to live inside the QUIC stack, which mainline quic-go does not expose a hook for; the window sizing is the achievable part, and the code has a single seam where a real Brutal controller would be installed if a hooked quic-go is adopted.)
+
+TLS: if `tls_cert`/`tls_key` are omitted the server generates an in-memory self-signed certificate (the operator controls both ends and pins trust via the shared `token`). The client does **not** verify the certificate by default (`tls_verify = false`); set `tls_verify = true` once the server presents a verifiable certificate, otherwise an on-path party can MITM the token-bearing handshake.
+
+* **Server**:
+
+   ```toml
+   [server]
+   bind_addr = "0.0.0.0:3080"   # QUIC listens on this UDP address.
+   transport = "quic"
+   token = "your_token"         # Must match the client. Authenticates the QUIC connection.
+   keepalive_period = 75        # Keeps the connection and its NAT mapping alive. (optional)
+   quic_up_mbps = 100           # Target upload bandwidth (Mbps); sizes flow-control windows. (optional)
+   quic_down_mbps = 100         # Target download bandwidth (Mbps). (optional)
+   tls_cert = ""                # Optional TLS cert; a self-signed cert is generated when empty.
+   tls_key = ""                 # Optional TLS key.
+   sniffer = false
+   web_port = 2060
+   sniffer_log = "/root/backhaul.json"
+   log_level = "info"
+   ports = [
+       "443",
+       "8080=127.0.0.1:80",
+   ]
+   ```
+* **Client**:
+
+   ```toml
+   [client]
+   remote_addr = "0.0.0.0:3080"
+   transport = "quic"
+   token = "your_token"         # Must match the server.
+   tls_verify = false           # Verify the server certificate. Off by default for self-signed setups.
+   keepalive_period = 75        # (optional)
+   dial_timeout = 10            # (optional)
+   retry_interval = 3           # Seconds between reconnect attempts. (optional)
+   quic_up_mbps = 100           # (optional)
+   quic_down_mbps = 100         # (optional)
+   sniffer = false
+   web_port = 2060
+   sniffer_log = "/root/backhaul.json"
+   log_level = "info"
+   ```
+
 #### WebSocket Configuration
 * **Server**:
 
