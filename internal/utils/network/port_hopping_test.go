@@ -30,6 +30,48 @@ func (r *recordingPacketConn) SetDeadline(time.Time) error      { return nil }
 func (r *recordingPacketConn) SetReadDeadline(time.Time) error  { return nil }
 func (r *recordingPacketConn) SetWriteDeadline(time.Time) error { return nil }
 
+// bufRecordingConn records SetReadBuffer/SetWriteBuffer so a test can confirm the
+// call reaches the underlying socket through the wrapper chain.
+type bufRecordingConn struct {
+	net.PacketConn
+	rbuf, wbuf int
+}
+
+func (c *bufRecordingConn) ReadFrom(p []byte) (int, net.Addr, error)  { return 0, nil, nil }
+func (c *bufRecordingConn) WriteTo(p []byte, a net.Addr) (int, error) { return len(p), nil }
+func (c *bufRecordingConn) Close() error                              { return nil }
+func (c *bufRecordingConn) LocalAddr() net.Addr                       { return &net.UDPAddr{} }
+func (c *bufRecordingConn) SetDeadline(time.Time) error               { return nil }
+func (c *bufRecordingConn) SetReadDeadline(time.Time) error           { return nil }
+func (c *bufRecordingConn) SetWriteDeadline(time.Time) error          { return nil }
+func (c *bufRecordingConn) SetReadBuffer(n int) error                 { c.rbuf = n; return nil }
+func (c *bufRecordingConn) SetWriteBuffer(n int) error                { c.wbuf = n; return nil }
+
+// TestPortHoppingForwardsBufferSizing guards the throughput regression: quic-go
+// (and the obfs wrapper) size the kernel buffers via a SetReadBuffer/SetWriteBuffer
+// type assertion; if PortHoppingPacketConn doesn't forward them, the buffers stay
+// tiny and a fast link collapses. Verify the calls reach the socket both directly
+// and through the obfs -> port-hopping -> socket chain the client actually builds.
+func TestPortHoppingForwardsBufferSizing(t *testing.T) {
+	base := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443}
+
+	direct := &bufRecordingConn{}
+	h := NewPortHoppingPacketConn(direct, base, 20000, 20010, time.Second)
+	_ = h.SetReadBuffer(1 << 20)
+	_ = h.SetWriteBuffer(2 << 20)
+	if direct.rbuf != 1<<20 || direct.wbuf != 2<<20 {
+		t.Fatalf("port hopping did not forward buffer sizing: rbuf=%d wbuf=%d", direct.rbuf, direct.wbuf)
+	}
+
+	chained := &bufRecordingConn{}
+	obfs := NewObfsPacketConn(NewPortHoppingPacketConn(chained, base, 20000, 20010, time.Second), "pw")
+	_ = obfs.SetReadBuffer(3 << 20)
+	_ = obfs.SetWriteBuffer(4 << 20)
+	if chained.rbuf != 3<<20 || chained.wbuf != 4<<20 {
+		t.Fatalf("obfs->porthop->socket did not forward buffer sizing: rbuf=%d wbuf=%d", chained.rbuf, chained.wbuf)
+	}
+}
+
 // TestPortHoppingRewritesDestPort verifies writes land inside the configured
 // port range and keep the target IP, while reads report the canonical base
 // address so quic-go never sees a migration.

@@ -102,6 +102,26 @@ func (h *PortHoppingPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	return n, err
 }
 
+// SetReadBuffer / SetWriteBuffer forward down to the underlying socket so quic-go
+// can size the kernel buffers. Without this the type assertion quic-go (and the
+// obfs wrapper) makes fails once a PortHoppingPacketConn is in the chain, the
+// buffers stay at the small OS default, and packets are dropped under load -
+// collapsing throughput on a fast link. net.PacketConn does not carry these, so
+// they must be forwarded explicitly rather than promoted from the embedded field.
+func (h *PortHoppingPacketConn) SetReadBuffer(n int) error {
+	if c, ok := h.PacketConn.(interface{ SetReadBuffer(int) error }); ok {
+		return c.SetReadBuffer(n)
+	}
+	return nil
+}
+
+func (h *PortHoppingPacketConn) SetWriteBuffer(n int) error {
+	if c, ok := h.PacketConn.(interface{ SetWriteBuffer(int) error }); ok {
+		return c.SetWriteBuffer(n)
+	}
+	return nil
+}
+
 // ReadFrom returns the canonical baseAddr so quic-go always sees a stable peer,
 // regardless of which port the reply actually arrived from.
 func (h *PortHoppingPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
