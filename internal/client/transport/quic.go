@@ -162,10 +162,18 @@ func (c *QuicTransport) connectAndServe() error {
 	// Jitter the keep-alive per connection so the heartbeat isn't a fixed metronome.
 	keepalive := network.JitterKeepalive(c.config.KeepAlive, c.config.KeepAliveMin, c.config.KeepAliveMax)
 	dialCtx, cancel := context.WithTimeout(c.ctx, c.config.DialTimeOut)
-	conn, err := quic.Dial(dialCtx, packetConn, serverAddr, tlsConf, network.QuicConfig(c.config.DownMbps, keepalive))
+	overhead := network.ObfsOverhead(c.config.ObfsPassword != "", c.config.ObfsSTUN)
+	conn, err := quic.Dial(dialCtx, packetConn, serverAddr, tlsConf, network.QuicConfig(c.config.DownMbps, keepalive, overhead))
 	cancel()
 	if err != nil {
 		packetConn.Close()
+		// A dial timeout with obfuscation options on is almost always the server
+		// silently dropping our packets because it isn't running the same options.
+		// These must match on both ends: an obfs/STUN/masquerade mismatch looks
+		// exactly like an unreachable server.
+		if hint := c.mismatchHint(); hint != "" {
+			return fmt.Errorf("dial %s: %w%s", c.config.RemoteAddr, err, hint)
+		}
 		return fmt.Errorf("dial %s: %w", c.config.RemoteAddr, err)
 	}
 	// Masquerade authenticates over HTTP/3 (an ordinary token-bearing request);
@@ -173,7 +181,7 @@ func (c *QuicTransport) connectAndServe() error {
 	if c.config.Masquerade {
 		if err := c.authenticateH3(conn); err != nil {
 			conn.CloseWithError(1, "auth failed")
-			return fmt.Errorf("h3 auth: %w", err)
+			return fmt.Errorf("h3 auth: %w (check the token, and that the server has quic_masquerade = true on the same build)", err)
 		}
 	} else if err := c.authenticate(conn); err != nil {
 		conn.CloseWithError(1, "auth failed")
@@ -201,6 +209,22 @@ func (c *QuicTransport) connectAndServe() error {
 			return fmt.Errorf("accept stream: %w", err)
 		}
 		go c.handleStream(conn, stream)
+	}
+}
+
+// mismatchHint returns a human hint for a dial failure when obfuscation options
+// are enabled, since a mismatched option on the server drops our packets and is
+// indistinguishable from an unreachable server.
+func (c *QuicTransport) mismatchHint() string {
+	switch {
+	case c.config.ObfsPassword != "" && c.config.ObfsSTUN:
+		return " (server must run the same build with matching quic_obfs_password AND quic_obfs_stun)"
+	case c.config.ObfsPassword != "":
+		return " (server must run matching quic_obfs_password)"
+	case c.config.Masquerade:
+		return " (server must run the same build with quic_masquerade = true)"
+	default:
+		return ""
 	}
 }
 

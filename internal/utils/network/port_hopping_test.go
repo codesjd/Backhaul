@@ -138,6 +138,32 @@ func TestPortHoppingRuleSpec(t *testing.T) {
 	}
 }
 
+// TestObfsOverheadInitialPacketSize asserts QuicConfig shrinks the initial packet
+// size by exactly the obfuscation overhead, so the datagram on the wire is no
+// larger than a plain QUIC packet. Getting this wrong drops handshake packets on
+// any path whose MTU only just fits plain QUIC (the STUN dial-timeout regression).
+func TestObfsOverheadInitialPacketSize(t *testing.T) {
+	if got := ObfsOverhead(false, false); got != 0 {
+		t.Fatalf("ObfsOverhead(off) = %d, want 0", got)
+	}
+	if got := ObfsOverhead(true, false); got != obfsSaltLen {
+		t.Fatalf("ObfsOverhead(obfs) = %d, want %d", got, obfsSaltLen)
+	}
+	if got := ObfsOverhead(true, true); got != obfsSaltLen+stunHeaderLen {
+		t.Fatalf("ObfsOverhead(obfs+stun) = %d, want %d", got, obfsSaltLen+stunHeaderLen)
+	}
+
+	// No obfs -> leave InitialPacketSize at quic-go's default (0 = unset).
+	if got := QuicConfig(100, 30*time.Second, 0).InitialPacketSize; got != 0 {
+		t.Fatalf("plain InitialPacketSize = %d, want 0 (default)", got)
+	}
+	// obfs+STUN -> default minus overhead, so QUIC packet + obfs == plain size.
+	wantStun := uint16(quicDefaultInitialPacketSize - (obfsSaltLen + stunHeaderLen))
+	if got := QuicConfig(100, 30*time.Second, obfsSaltLen+stunHeaderLen).InitialPacketSize; got != wantStun {
+		t.Fatalf("obfs+stun InitialPacketSize = %d, want %d", got, wantStun)
+	}
+}
+
 // TestJitterKeepaliveBounds checks the jittered period stays within the expected
 // window and actually varies.
 func TestJitterKeepaliveBounds(t *testing.T) {
