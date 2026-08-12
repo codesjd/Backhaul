@@ -96,6 +96,73 @@ func runBulkUpload(t *testing.T, srvCfg *stransport.QuicConfig, cliCfg *ctranspo
 	pub.Close()
 }
 
+// TestQuicConnChurn opens many short connections in sequence and requires every
+// one to round-trip. A speed test does exactly this, and a stream that isn't
+// fully released on teardown would leak stream credit until OpenStreamSync blocks
+// and the tunnel wedges - which this guards against.
+func TestQuicConnChurn(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	serverPort := freeUDPPort(t)
+	pubPort := freeTCPPort(t)
+	echoPort := freeTCPPort(t)
+	tcpEcho(t, ctx, echoPort)
+	const obfs = "churn-obfs"
+
+	srv := stransport.NewQuicServer(ctx, &stransport.QuicConfig{
+		BindAddr: fmt.Sprintf("127.0.0.1:%d", serverPort), Token: "t",
+		Ports: []string{fmt.Sprintf("%d=%d", pubPort, echoPort)},
+		Keepalive: 30 * time.Second, ObfsPassword: obfs, ObfsSTUN: true, Masquerade: true,
+	}, quietLogger())
+	go srv.Start()
+	cli := ctransport.NewQuicClient(ctx, &ctransport.QuicConfig{
+		RemoteAddr: fmt.Sprintf("127.0.0.1:%d", serverPort), Token: "t",
+		KeepAlive: 30 * time.Second, DialTimeOut: 5 * time.Second, RetryInterval: 500 * time.Millisecond,
+		ObfsPassword: obfs, ObfsSTUN: true, Masquerade: true,
+	}, quietLogger())
+	go cli.Start()
+
+	// Wait for the tunnel to come up via a first successful round trip.
+	msg := []byte("ping")
+	deadline := time.Now().Add(10 * time.Second)
+	up := false
+	for time.Now().Before(deadline) && !up {
+		c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", pubPort), time.Second)
+		if err != nil {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		c.SetDeadline(time.Now().Add(time.Second))
+		c.Write(msg)
+		got := make([]byte, len(msg))
+		if _, err := readFull(c, got); err == nil {
+			up = true
+		}
+		c.Close()
+	}
+	if !up {
+		t.Fatal("tunnel never came up")
+	}
+
+	const n = 300
+	for i := 0; i < n; i++ {
+		c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", pubPort), 2*time.Second)
+		if err != nil {
+			t.Fatalf("conn %d dial: %v", i, err)
+		}
+		c.SetDeadline(time.Now().Add(3 * time.Second))
+		if _, err := c.Write(msg); err != nil {
+			t.Fatalf("conn %d write: %v", i, err)
+		}
+		got := make([]byte, len(msg))
+		if _, err := readFull(c, got); err != nil {
+			t.Fatalf("conn %d read (tunnel wedged after %d conns?): %v", i, i, err)
+		}
+		c.Close()
+	}
+}
+
 // TestQuicBulkUploadObfs reproduces the upload path with obfuscation only.
 func TestQuicBulkUploadObfs(t *testing.T) {
 	serverPort := freeUDPPort(t)

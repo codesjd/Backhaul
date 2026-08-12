@@ -240,6 +240,24 @@ func NewStreamConn(s *quic.Stream, conn *quic.Conn) *StreamConn {
 func (s *StreamConn) LocalAddr() net.Addr  { return s.local }
 func (s *StreamConn) RemoteAddr() net.Addr { return s.remote }
 
+// CloseWrite half-closes only the send side (a QUIC FIN), letting the peer finish
+// replying. The TCP pump calls this when one copy direction ends cleanly, so the
+// reverse direction is not truncated. quic.Stream.Close() closes just the send
+// side, which is exactly a write half-close.
+func (s *StreamConn) CloseWrite() error { return s.Stream.Close() }
+
+// Close fully releases the stream at final teardown: it aborts the receive side
+// (STOP_SENDING) in addition to FIN-ing the send side. Without the CancelRead, a
+// stream whose peer never sent a FIN - an aborted/reset public connection - keeps
+// its receive half open and holds a stream slot. Under heavy connection churn
+// (e.g. a speed test opening many short flows) those leaked slots pile up until
+// the peer's stream limit is hit and OpenStreamSync blocks, wedging the tunnel
+// with a live-but-stuck connection that only a restart clears.
+func (s *StreamConn) Close() error {
+	s.Stream.CancelRead(0)
+	return s.Stream.Close()
+}
+
 // WriteLPString writes a uint16 length-prefixed string.
 func WriteLPString(w io.Writer, s string) error {
 	if len(s) > 0xFFFF {
