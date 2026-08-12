@@ -48,12 +48,12 @@ type ServerConfig struct {
 	SO_SNDBUF            int           `toml:"so_sndbuf"`
 	ProxyProtocol        bool          `toml:"proxy_protocol"`
 	Path                 string        `toml:"path"`
-	Fallback             string        `toml:"fallback"`
+	Fallback             string        `toml:"fallback"` // decoy backend (host:port) reverse-proxied to non-tunnel requests. Applies to ws/wss and to quic when quic_masquerade is on.
 	TLSEngine            string        `toml:"tls_engine"`
 	QuicUpMbps           int           `toml:"quic_up_mbps"`       // quic: target upload bandwidth in Mbps. >0 enables real Brutal congestion control on the send path; 0 = default (Cubic).
 	QuicDownMbps         int           `toml:"quic_down_mbps"`     // quic: target download bandwidth in Mbps; sizes QUIC flow-control windows. 0 = default.
 	QuicObfs             string        `toml:"quic_obfs_password"` // quic: Salamander-style packet obfuscation password. Must match the client. Empty = plain QUIC.
-	QuicMasquerade       bool          `toml:"quic_masquerade"`    // quic: advertise ALPN "h3" so the handshake blends with HTTP/3 web traffic. Must match the client.
+	QuicMasquerade       bool          `toml:"quic_masquerade"`    // quic: present as a real HTTP/3 origin (ALPN "h3"). The server runs an h3 server: tunnel clients authenticate with a token-bearing request, everyone else is reverse-proxied to `fallback` (or a generic page). Must match the client.
 	QuicPortRange        []int         `toml:"quic_port_range"`    // quic: [start, end] UDP port range for port hopping to defeat per-flow throttling. Server must accept this range (via iptables REDIRECT or native binding). Empty = single port.
 	QuicObfsSTUN         bool          `toml:"quic_obfs_stun"`     // quic: prepend a mimicked STUN header to obfuscated packets so they don't look full-entropy to the fully-encrypted-traffic classifier. Requires quic_obfs_password. Must match the client.
 	QuicKeepaliveMin     int           `toml:"quic_keepalive_min"` // quic: min seconds for the randomized (jittered) keep-alive period. 0 = derive from keepalive (default 15s).
@@ -95,7 +95,7 @@ type ClientConfig struct {
 	QuicUpMbps           int           `toml:"quic_up_mbps"`       // quic: target upload bandwidth in Mbps. >0 enables real Brutal congestion control on the send path; 0 = default (Cubic).
 	QuicDownMbps         int           `toml:"quic_down_mbps"`     // quic: target download bandwidth in Mbps; sizes QUIC flow-control windows. 0 = default.
 	QuicObfs             string        `toml:"quic_obfs_password"` // quic: Salamander-style packet obfuscation password. Must match the server. Empty = plain QUIC.
-	QuicMasquerade       bool          `toml:"quic_masquerade"`    // quic: advertise ALPN "h3" so the handshake blends with HTTP/3 web traffic. Must match the server.
+	QuicMasquerade       bool          `toml:"quic_masquerade"`    // quic: authenticate over HTTP/3 (a token-bearing request) so the tunnel is indistinguishable from a real h3 client to an active probe. Must match the server.
 	QuicPortRange        []int         `toml:"quic_port_range"`    // quic: [start, end] UDP port range for port hopping to defeat per-flow throttling. Client rotates destination port across this range. Empty = single port from remote_addr.
 	QuicObfsSTUN         bool          `toml:"quic_obfs_stun"`     // quic: prepend a mimicked STUN header to obfuscated packets so they don't look full-entropy to the fully-encrypted-traffic classifier. Requires quic_obfs_password. Must match the server.
 	QuicKeepaliveMin     int           `toml:"quic_keepalive_min"` // quic: min seconds for the randomized (jittered) keep-alive period. 0 = derive from keepalive (default 15s).
