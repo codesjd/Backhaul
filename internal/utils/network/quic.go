@@ -167,12 +167,22 @@ func QuicConfig(downMbps int, keepalive time.Duration, obfsOverhead int) *quic.C
 	if window > maxWindow {
 		window = maxWindow
 	}
+	// A dead peer (e.g. the server process restarting) is only noticed after the
+	// idle timeout elapses with no packet received, so keep it short enough that
+	// the client reconnects promptly rather than hanging for a minute. The
+	// keep-alive must stay comfortably below it, or a healthy but quiet link is
+	// torn down between pings; cap it at half the idle timeout as a safety net on
+	// top of the jitter window.
+	const maxIdle = 30 * time.Second
 	if keepalive <= 0 {
-		keepalive = 30 * time.Second
+		keepalive = 15 * time.Second
+	}
+	if keepalive > maxIdle/2 {
+		keepalive = maxIdle / 2
 	}
 	cfg := &quic.Config{
 		EnableDatagrams:                true,
-		MaxIdleTimeout:                 60 * time.Second,
+		MaxIdleTimeout:                 maxIdle,
 		KeepAlivePeriod:                keepalive,
 		HandshakeIdleTimeout:           10 * time.Second,
 		InitialStreamReceiveWindow:     window / 2,
@@ -194,16 +204,15 @@ func QuicConfig(downMbps int, keepalive time.Duration, obfsOverhead int) *quic.C
 
 // JitterKeepalive returns a randomized QUIC keep-alive period so the heartbeat
 // stops being a fixed metronome a censor can lock onto. When minD/maxD are both
-// unset it jitters +/-50% around base (default 30s -> [15s, 45s], the documented
-// safe window); otherwise it draws uniformly from [minD, maxD]. A fresh value is
-// picked per connection, so reconnects don't reveal a stable period either.
-func JitterKeepalive(base, minD, maxD time.Duration) time.Duration {
+// unset it draws uniformly from a default [8s, 15s] window - deliberately kept
+// below QuicConfig's idle timeout so a healthy link is never torn down between
+// pings (QuicConfig also clamps as a safety net). When minD/maxD are set it draws
+// from [minD, maxD]. A fresh value is picked per connection, so reconnects don't
+// reveal a stable period either.
+func JitterKeepalive(minD, maxD time.Duration) time.Duration {
 	if minD <= 0 || maxD <= 0 {
-		if base <= 0 {
-			base = 30 * time.Second
-		}
-		minD = base / 2
-		maxD = base * 3 / 2
+		minD = 8 * time.Second
+		maxD = 15 * time.Second
 	}
 	if minD > maxD {
 		minD, maxD = maxD, minD
