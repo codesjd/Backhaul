@@ -167,12 +167,12 @@ func TestObfsOverheadInitialPacketSize(t *testing.T) {
 // TestJitterKeepaliveBounds checks the jittered period stays within the expected
 // window and actually varies.
 func TestJitterKeepaliveBounds(t *testing.T) {
-	// Default window derived from a 30s base is [15s, 45s].
+	// Default window is [8s, 15s] - kept below the 30s idle timeout.
 	seen := map[time.Duration]bool{}
 	for i := 0; i < 500; i++ {
-		d := JitterKeepalive(30*time.Second, 0, 0)
-		if d < 15*time.Second || d > 45*time.Second {
-			t.Fatalf("default jitter %v outside [15s,45s]", d)
+		d := JitterKeepalive(0, 0)
+		if d < 8*time.Second || d > 15*time.Second {
+			t.Fatalf("default jitter %v outside [8s,15s]", d)
 		}
 		seen[d] = true
 	}
@@ -182,7 +182,7 @@ func TestJitterKeepaliveBounds(t *testing.T) {
 
 	// Explicit window is honored.
 	for i := 0; i < 200; i++ {
-		d := JitterKeepalive(0, 5*time.Second, 9*time.Second)
+		d := JitterKeepalive(5*time.Second, 9*time.Second)
 		if d < 5*time.Second || d > 9*time.Second {
 			t.Fatalf("explicit jitter %v outside [5s,9s]", d)
 		}

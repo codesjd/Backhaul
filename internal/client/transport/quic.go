@@ -160,7 +160,7 @@ func (c *QuicTransport) connectAndServe() error {
 		packetConn = network.NewObfsPacketConn(packetConn, c.config.ObfsPassword).WithSTUN(c.config.ObfsSTUN)
 	}
 	// Jitter the keep-alive per connection so the heartbeat isn't a fixed metronome.
-	keepalive := network.JitterKeepalive(c.config.KeepAlive, c.config.KeepAliveMin, c.config.KeepAliveMax)
+	keepalive := network.JitterKeepalive(c.config.KeepAliveMin, c.config.KeepAliveMax)
 	dialCtx, cancel := context.WithTimeout(c.ctx, c.config.DialTimeOut)
 	overhead := network.ObfsOverhead(c.config.ObfsPassword != "", c.config.ObfsSTUN)
 	conn, err := quic.Dial(dialCtx, packetConn, serverAddr, tlsConf, network.QuicConfig(c.config.DownMbps, keepalive, overhead))

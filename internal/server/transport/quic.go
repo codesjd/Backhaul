@@ -163,7 +163,7 @@ func (s *QuicTransport) Start() {
 			}()
 		})
 	}
-	keepalive := network.JitterKeepalive(s.config.Keepalive, s.config.KeepAliveMin, s.config.KeepAliveMax)
+	keepalive := network.JitterKeepalive(s.config.KeepAliveMin, s.config.KeepAliveMax)
 	overhead := network.ObfsOverhead(s.config.ObfsPassword != "", s.config.ObfsSTUN)
 	ln, err := quic.Listen(packetConn, tlsConf, network.QuicConfig(s.config.DownMbps, keepalive, overhead))
 	if err != nil {
