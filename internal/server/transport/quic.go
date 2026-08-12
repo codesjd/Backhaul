@@ -164,7 +164,8 @@ func (s *QuicTransport) Start() {
 		})
 	}
 	keepalive := network.JitterKeepalive(s.config.Keepalive, s.config.KeepAliveMin, s.config.KeepAliveMax)
-	ln, err := quic.Listen(packetConn, tlsConf, network.QuicConfig(s.config.DownMbps, keepalive))
+	overhead := network.ObfsOverhead(s.config.ObfsPassword != "", s.config.ObfsSTUN)
+	ln, err := quic.Listen(packetConn, tlsConf, network.QuicConfig(s.config.DownMbps, keepalive, overhead))
 	if err != nil {
 		s.logger.Fatalf("quic: failed to listen on %s: %v", s.config.BindAddr, err)
 		return

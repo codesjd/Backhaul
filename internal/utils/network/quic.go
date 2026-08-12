@@ -131,7 +131,28 @@ func QuicClientTLSConfig(serverName string, verify bool, alpn []string) *tls.Con
 // windows to the bandwidth-delay product (assuming a generous RTT budget) so the
 // receiver window never caps a single fat flow - the achievable half of Brutal's
 // intent. keepalive keeps an idle tunnel's NAT mapping and the connection alive.
-func QuicConfig(downMbps int, keepalive time.Duration) *quic.Config {
+// quicDefaultInitialPacketSize mirrors quic-go's protocol.InitialPacketSize: the
+// UDP payload size quic-go uses for packets before path-MTU discovery. It is not
+// exported by the library, so it is duplicated here.
+const quicDefaultInitialPacketSize = 1280
+
+// ObfsOverhead is the number of bytes ObfsPacketConn prepends to every datagram:
+// the 8-byte salt, plus the 20-byte STUN header when STUN mimicry is on. It must
+// be subtracted from the QUIC packet size so the obfuscated datagram on the wire
+// is no larger than a plain QUIC packet - otherwise, on a path whose MTU only
+// just fits plain QUIC, the inflated handshake packets are silently dropped and
+// the dial times out.
+func ObfsOverhead(obfs, stun bool) int {
+	if !obfs {
+		return 0
+	}
+	if stun {
+		return obfsSaltLen + stunHeaderLen
+	}
+	return obfsSaltLen
+}
+
+func QuicConfig(downMbps int, keepalive time.Duration, obfsOverhead int) *quic.Config {
 	if downMbps <= 0 {
 		downMbps = 100
 	}
@@ -149,7 +170,7 @@ func QuicConfig(downMbps int, keepalive time.Duration) *quic.Config {
 	if keepalive <= 0 {
 		keepalive = 30 * time.Second
 	}
-	return &quic.Config{
+	cfg := &quic.Config{
 		EnableDatagrams:                true,
 		MaxIdleTimeout:                 60 * time.Second,
 		KeepAlivePeriod:                keepalive,
@@ -160,6 +181,15 @@ func QuicConfig(downMbps int, keepalive time.Duration) *quic.Config {
 		MaxConnectionReceiveWindow:     window * 2,
 		MaxIncomingStreams:             1 << 16,
 	}
+	// Shrink the initial packet size by the obfuscation overhead so the datagram
+	// that actually leaves the socket (QUIC packet + salt [+ STUN header]) is the
+	// same size a plain QUIC connection would send - deliverable on any path that
+	// carries plain QUIC. Path-MTU discovery is left on: its probes traverse the
+	// same obfs wrapper, so it self-corrects to the true on-wire MTU from here.
+	if obfsOverhead > 0 {
+		cfg.InitialPacketSize = uint16(quicDefaultInitialPacketSize - obfsOverhead)
+	}
+	return cfg
 }
 
 // JitterKeepalive returns a randomized QUIC keep-alive period so the heartbeat
