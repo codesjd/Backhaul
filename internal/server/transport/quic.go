@@ -56,6 +56,10 @@ type QuicTransport struct {
 	restartMutex sync.Mutex
 	listener     *quic.Listener
 
+	// natOnce guards installing the port-hopping NAT redirect exactly once across
+	// the transport's lifetime (Start runs again on every Restart).
+	natOnce sync.Once
+
 	// conn is the current authenticated client connection. Public listeners
 	// open streams/datagrams on whatever is stored here; it is cleared when the
 	// connection dies so a stale conn is never used.
@@ -127,13 +131,27 @@ func (s *QuicTransport) Start() {
 		}
 	}
 	// Port hopping is enforced at the network layer: the server binds one socket
-	// and a firewall rule redirects the whole range to it. Surface a reminder so a
-	// configured range without the matching rule isn't silently ineffective.
+	// and a NAT REDIRECT rule folds the client's rotating destination range back
+	// onto it. Install that rule automatically (best effort, like the TCP tuning),
+	// once per process, and tear it down on final shutdown.
 	if len(s.config.PortRange) == 2 && s.config.PortRange[0] > 0 && s.config.PortRange[1] > 0 {
-		s.logger.Infof("quic: port hopping expected on UDP %d-%d; ensure a redirect rule targets this listener, e.g. "+
-			"iptables -t nat -A PREROUTING -p udp --dport %d:%d -j REDIRECT --to-ports %d",
-			s.config.PortRange[0], s.config.PortRange[1],
-			s.config.PortRange[0], s.config.PortRange[1], udpAddr.Port)
+		start, end, toPort := s.config.PortRange[0], s.config.PortRange[1], udpAddr.Port
+		s.natOnce.Do(func() {
+			if err := network.EnsurePortHoppingRedirect(start, end, toPort); err != nil {
+				s.logger.Warnf("quic: could not auto-install port-hopping NAT rule (%v); add it manually: %s",
+					err, network.PortHoppingRuleCommand(start, end, toPort))
+			} else {
+				s.logger.Infof("quic: port hopping enabled; installed NAT redirect UDP %d-%d -> %d", start, end, toPort)
+			}
+			// Remove the rule only on true shutdown. parentctx survives Restart
+			// (which cancels the derived ctx), so the rule persists across restarts.
+			go func() {
+				<-s.parentctx.Done()
+				if err := network.RemovePortHoppingRedirect(start, end, toPort); err != nil {
+					s.logger.Debugf("quic: port-hopping NAT rule cleanup: %v", err)
+				}
+			}()
+		})
 	}
 	keepalive := network.JitterKeepalive(s.config.Keepalive, s.config.KeepAliveMin, s.config.KeepAliveMax)
 	ln, err := quic.Listen(packetConn, tlsConf, network.QuicConfig(s.config.DownMbps, keepalive))
