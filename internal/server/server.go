@@ -178,6 +178,10 @@ func (s *Server) Start() {
 			DownMbps:     s.config.QuicDownMbps,
 			ObfsPassword: s.config.QuicObfs,
 			Masquerade:   s.config.QuicMasquerade,
+			ObfsSTUN:     s.config.QuicObfsSTUN,
+			PortRange:    s.config.QuicPortRange,
+			KeepAliveMin: time.Duration(s.config.QuicKeepaliveMin) * time.Second,
+			KeepAliveMax: time.Duration(s.config.QuicKeepaliveMax) * time.Second,
 		}
 
 		quicServer := transport.NewQuicServer(s.ctx, quicConfig, s.logger)

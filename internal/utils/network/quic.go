@@ -59,8 +59,13 @@ const (
 	// datagram after the framing header.
 	MaxUDPFragPayload = QuicMaxDatagramPayload - udpFragHeaderLen
 
-	// STUN magic cookie for protocol mimicry obfuscation
+	// STUN magic cookie (RFC 5389) prepended in protocol-mimicry obfs mode so the
+	// first bytes of an obfuscated datagram read as a benign STUN packet instead
+	// of full-entropy random - evading the "fully-encrypted-traffic" classifier.
 	stunMagicCookie = 0x2112A442
+	// stunHeaderLen is the fixed STUN message header: 2-byte type + 2-byte length
+	// + 4-byte magic cookie + 12-byte transaction id.
+	stunHeaderLen = 20
 )
 
 // Server-opened stream types. The first byte of every stream the server opens to
@@ -155,6 +160,28 @@ func QuicConfig(downMbps int, keepalive time.Duration) *quic.Config {
 		MaxConnectionReceiveWindow:     window * 2,
 		MaxIncomingStreams:             1 << 16,
 	}
+}
+
+// JitterKeepalive returns a randomized QUIC keep-alive period so the heartbeat
+// stops being a fixed metronome a censor can lock onto. When minD/maxD are both
+// unset it jitters +/-50% around base (default 30s -> [15s, 45s], the documented
+// safe window); otherwise it draws uniformly from [minD, maxD]. A fresh value is
+// picked per connection, so reconnects don't reveal a stable period either.
+func JitterKeepalive(base, minD, maxD time.Duration) time.Duration {
+	if minD <= 0 || maxD <= 0 {
+		if base <= 0 {
+			base = 30 * time.Second
+		}
+		minD = base / 2
+		maxD = base * 3 / 2
+	}
+	if minD > maxD {
+		minD, maxD = maxD, minD
+	}
+	if minD == maxD {
+		return minD
+	}
+	return minD + time.Duration(mrand.Int64N(int64(maxD-minD)+1))
 }
 
 // StreamConn adapts a *quic.Stream to net.Conn (a quic.Stream has no
@@ -403,6 +430,7 @@ const obfsSaltLen = 8
 type ObfsPacketConn struct {
 	net.PacketConn
 	psk       []byte
+	stun      bool // prepend a mimicked STUN header so packets don't look full-entropy
 	readBuf   []byte
 	readKeyIn []byte // scratch for psk||salt on the (single-reader) read path
 	readMu    sync.Mutex
@@ -417,6 +445,30 @@ func NewObfsPacketConn(inner net.PacketConn, password string) *ObfsPacketConn {
 		readBuf:    make([]byte, 2048),
 		readKeyIn:  make([]byte, 0, len(psk)+obfsSaltLen),
 	}
+}
+
+// WithSTUN toggles STUN protocol-mimicry framing. When enabled, every datagram
+// is prefixed with a fake STUN Binding-request header (magic cookie 0x2112A442)
+// ahead of the salt+ciphertext body, so the packet's opening bytes match a
+// benign, universally-allowed protocol instead of sitting in the full-entropy
+// band the GFW "fully-encrypted-traffic" classifier flags. Both ends must agree
+// (it's driven by the same shared config), and the receiver drops any datagram
+// whose header lacks the cookie. Returns the receiver for call chaining.
+func (o *ObfsPacketConn) WithSTUN(enabled bool) *ObfsPacketConn {
+	o.stun = enabled
+	return o
+}
+
+// writeSTUNHeader fills dst[:stunHeaderLen] with a plausible STUN Binding request
+// whose message length advertises bodyLen. Only the magic cookie is load-bearing
+// for classifier evasion; the transaction id is fresh random each packet.
+func writeSTUNHeader(dst []byte, bodyLen int) {
+	binary.BigEndian.PutUint16(dst[0:2], 0x0001) // Binding Request
+	binary.BigEndian.PutUint16(dst[2:4], uint16(bodyLen))
+	binary.BigEndian.PutUint32(dst[4:8], stunMagicCookie)
+	binary.LittleEndian.PutUint32(dst[8:12], uint32(mrand.Uint64()))
+	binary.LittleEndian.PutUint32(dst[12:16], uint32(mrand.Uint64()))
+	binary.LittleEndian.PutUint32(dst[16:20], uint32(mrand.Uint64()))
 }
 
 // obfsScratch is the per-WriteTo working set, pooled so the hot send path does
@@ -465,20 +517,30 @@ func (o *ObfsPacketConn) SetWriteBuffer(n int) error {
 
 func (o *ObfsPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	s := obfsScratchPool.Get().(*obfsScratch)
-	need := obfsSaltLen + len(p)
+	hdr := 0
+	if o.stun {
+		hdr = stunHeaderLen
+	}
+	need := hdr + obfsSaltLen + len(p)
 	if cap(s.out) < need {
 		s.out = make([]byte, need)
 	} else {
 		s.out = s.out[:need]
 	}
+	if o.stun {
+		// Advertise the salt+ciphertext length in the STUN header; the cookie is
+		// what a DPI whitelist keys on.
+		writeSTUNHeader(s.out[:stunHeaderLen], obfsSaltLen+len(p))
+	}
+	salt := s.out[hdr : hdr+obfsSaltLen]
 	// The salt is prepended in the clear, so it need not be cryptographically
 	// secret - only non-repeating so identical plaintext packets don't produce
 	// identical ciphertext. A fast userspace PRNG replaces a per-packet
 	// crypto/rand syscall, which was the dominant cost on the send path.
-	binary.LittleEndian.PutUint64(s.out[:obfsSaltLen], mrand.Uint64())
-	s.keyIn = append(append(s.keyIn[:0], o.psk...), s.out[:obfsSaltLen]...)
+	binary.LittleEndian.PutUint64(salt, mrand.Uint64())
+	s.keyIn = append(append(s.keyIn[:0], o.psk...), salt...)
 	key := blake2b.Sum256(s.keyIn)
-	xorWithKey(s.out[obfsSaltLen:], p, &key)
+	xorWithKey(s.out[hdr+obfsSaltLen:], p, &key)
 	_, err := o.PacketConn.WriteTo(s.out, addr)
 	obfsScratchPool.Put(s)
 	if err != nil {
@@ -490,26 +552,35 @@ func (o *ObfsPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 func (o *ObfsPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	o.readMu.Lock()
 	defer o.readMu.Unlock()
-	if len(o.readBuf) < len(p)+obfsSaltLen {
-		o.readBuf = make([]byte, len(p)+obfsSaltLen)
+	hdr := 0
+	if o.stun {
+		hdr = stunHeaderLen
+	}
+	if len(o.readBuf) < len(p)+obfsSaltLen+hdr {
+		o.readBuf = make([]byte, len(p)+obfsSaltLen+hdr)
 	}
 	for {
 		n, addr, err := o.PacketConn.ReadFrom(o.readBuf)
 		if err != nil {
 			return 0, addr, err
 		}
-		if n < obfsSaltLen+1 {
+		if n < hdr+obfsSaltLen+1 {
 			// Too short to be one of ours (or an unauthenticated probe): drop it
 			// and keep reading instead of surfacing garbage to the QUIC stack.
 			continue
 		}
-		o.readKeyIn = append(append(o.readKeyIn[:0], o.psk...), o.readBuf[:obfsSaltLen]...)
+		if o.stun && binary.BigEndian.Uint32(o.readBuf[4:8]) != stunMagicCookie {
+			// Missing STUN cookie: not one of ours - drop and keep reading.
+			continue
+		}
+		salt := o.readBuf[hdr : hdr+obfsSaltLen]
+		o.readKeyIn = append(append(o.readKeyIn[:0], o.psk...), salt...)
 		key := blake2b.Sum256(o.readKeyIn)
-		plainLen := n - obfsSaltLen
+		plainLen := n - hdr - obfsSaltLen
 		if plainLen > len(p) {
 			plainLen = len(p)
 		}
-		xorWithKey(p[:plainLen], o.readBuf[obfsSaltLen:n], &key)
+		xorWithKey(p[:plainLen], o.readBuf[hdr+obfsSaltLen:n], &key)
 		return plainLen, addr, nil
 	}
 }

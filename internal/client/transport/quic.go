@@ -35,6 +35,10 @@ type QuicConfig struct {
 	DownMbps      int
 	ObfsPassword  string
 	Masquerade    bool
+	ObfsSTUN      bool
+	PortRange     []int
+	KeepAliveMin  time.Duration
+	KeepAliveMax  time.Duration
 }
 
 type QuicTransport struct {
@@ -145,11 +149,19 @@ func (c *QuicTransport) connectAndServe() error {
 		return fmt.Errorf("open udp socket: %w", err)
 	}
 	var packetConn net.PacketConn = pc
-	if c.config.ObfsPassword != "" {
-		packetConn = network.NewObfsPacketConn(pc, c.config.ObfsPassword)
+	// Port hopping (innermost, closest to the wire): rotate the destination UDP
+	// port so the tunnel never presents a stable 4-tuple for per-flow throttling.
+	if len(c.config.PortRange) == 2 && c.config.PortRange[0] > 0 && c.config.PortRange[1] > 0 {
+		packetConn = network.NewPortHoppingPacketConn(packetConn, serverAddr,
+			c.config.PortRange[0], c.config.PortRange[1], network.DefaultPortHopInterval)
 	}
+	if c.config.ObfsPassword != "" {
+		packetConn = network.NewObfsPacketConn(packetConn, c.config.ObfsPassword).WithSTUN(c.config.ObfsSTUN)
+	}
+	// Jitter the keep-alive per connection so the heartbeat isn't a fixed metronome.
+	keepalive := network.JitterKeepalive(c.config.KeepAlive, c.config.KeepAliveMin, c.config.KeepAliveMax)
 	dialCtx, cancel := context.WithTimeout(c.ctx, c.config.DialTimeOut)
-	conn, err := quic.Dial(dialCtx, packetConn, serverAddr, tlsConf, network.QuicConfig(c.config.DownMbps, c.config.KeepAlive))
+	conn, err := quic.Dial(dialCtx, packetConn, serverAddr, tlsConf, network.QuicConfig(c.config.DownMbps, keepalive))
 	cancel()
 	if err != nil {
 		packetConn.Close()

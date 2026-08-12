@@ -1,19 +1,20 @@
 package network
 
 // PortHoppingPacketConn wraps a net.PacketConn to rotate the destination UDP
-// port on every write, defeating per-flow DPI throttling that targets stable
-// 4-tuples. The wrapper rewrites the destination port to a rotating value within
-// a configured range, and normalizes the source address on read so the QUIC
-// stack never sees a "connection migration."
+// port on a timer, defeating per-flow DPI throttling that targets a stable
+// 4-tuple. Every write goes to a rotating port within a configured range; on
+// read the source address is normalized back to the canonical server address
+// so the QUIC stack never observes a "connection migration."
 //
-// This is the core technique Hysteria2 uses to survive in Iran: no stable flow
-// means no per-flow throttle state can be built by the censor's DPI.
+// This is the core technique Hysteria2 uses to survive in Iran: with no stable
+// flow, the censor's DPI can't build per-flow throttle state against the tunnel.
 //
-// Server-side deployment: bind one socket (e.g., :443) and use iptables to
-// redirect the port range:
-//   iptables -t nat -A PREROUTING -p udp --dport 20000:50000 -j REDIRECT --to-ports 443
-// conntrack automatically rewrites replies back to the port the client hit.
-
+// Server-side deployment needs no application change - bind one socket and let a
+// firewall rule redirect the whole range to it:
+//
+//	iptables -t nat -A PREROUTING -p udp --dport 20000:50000 -j REDIRECT --to-ports 443
+//
+// conntrack rewrites the replies back to the port the client actually hit.
 import (
 	"net"
 	"sync"
@@ -22,135 +23,91 @@ import (
 	mrand "math/rand/v2"
 )
 
-// PortHoppingPacketConn wraps a PacketConn with port hopping.
+// PortHoppingPacketConn rewrites the destination port of every outgoing packet.
 type PortHoppingPacketConn struct {
 	net.PacketConn
 	baseAddr    *net.UDPAddr
 	portStart   int
 	portEnd     int
 	rotationDur time.Duration
-	mu          sync.RWMutex
+
+	mu          sync.Mutex
 	currentPort int
 	lastRotate  time.Time
-	randSrc     mrand.RandSource
 }
 
-// NewPortHoppingPacketConn creates a port-hopping wrapper. baseAddr is the
-// canonical server address; the wrapper rotates the destination port within
-// [portStart, portEnd] every rotationDur. If portStart == portEnd, no hopping
-// occurs and packets go to the base port directly.
+// DefaultPortHopInterval is how often the destination port rotates when the
+// caller does not specify an interval.
+const DefaultPortHopInterval = 30 * time.Second
+
+// NewPortHoppingPacketConn wraps inner so writes rotate across [portStart,
+// portEnd] every rotationDur. baseAddr is the canonical server address returned
+// to the QUIC stack on every read. If the range collapses to a single port, the
+// wrapper simply forwards to that port with no hopping.
 func NewPortHoppingPacketConn(inner net.PacketConn, baseAddr *net.UDPAddr, portStart, portEnd int, rotationDur time.Duration) *PortHoppingPacketConn {
 	if portStart > portEnd {
 		portStart, portEnd = portEnd, portStart
 	}
-	src := mrand.NewPCG(mrand.Uint64(), mrand.Uint64())
+	if rotationDur <= 0 {
+		rotationDur = DefaultPortHopInterval
+	}
 	h := &PortHoppingPacketConn{
 		PacketConn:  inner,
 		baseAddr:    baseAddr,
 		portStart:   portStart,
 		portEnd:     portEnd,
 		rotationDur: rotationDur,
-		randSrc:     src,
-		currentPort: portStart,
 		lastRotate:  time.Now(),
 	}
-	if portStart < portEnd {
-		h.rotatePort()
-	}
+	h.currentPort = h.pick()
 	return h
 }
 
-// rotatePort picks a new random port in the range. Caller must hold wlock.
-func (h *PortHoppingPacketConn) rotatePort() {
-	if h.portStart == h.portEnd {
-		return
+// pick returns a random port within the range (or the single port if the range
+// is degenerate). The top-level math/rand/v2 helpers are safe for concurrent use.
+func (h *PortHoppingPacketConn) pick() int {
+	if h.portStart >= h.portEnd {
+		return h.portStart
 	}
-	rangeSize := h.portEnd - h.portStart + 1
-	h.currentPort = h.portStart + int(h.randSrc.Uint64()%uint64(rangeSize))
-	h.lastRotate = time.Now()
+	return h.portStart + mrand.IntN(h.portEnd-h.portStart+1)
 }
 
-// maybeRotateLocked checks if it's time to rotate and does so. Caller must hold lock.
-func (h *PortHoppingPacketConn) maybeRotateLocked() {
-	if h.portStart == h.portEnd {
-		return
-	}
-	if time.Since(h.lastRotate) >= h.rotationDur {
-		h.rotatePort()
-	}
-}
-
-// WriteTo rewrites the destination port to the current rotated port.
-func (h *PortHoppingPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
-	h.mu.RLock()
-	// Check rotation under read lock first (fast path)
-	needRotate := false
+// currentDstPort returns the port to send to, rotating it if the interval elapsed.
+func (h *PortHoppingPacketConn) currentDstPort() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	if h.portStart < h.portEnd && time.Since(h.lastRotate) >= h.rotationDur {
-		needRotate = true
+		h.currentPort = h.pick()
+		h.lastRotate = time.Now()
 	}
-	currentPort := h.currentPort
-	h.mu.RUnlock()
-
-	// Upgrade to write lock if rotation needed
-	if needRotate {
-		h.mu.Lock()
-		h.maybeRotateLocked()
-		currentPort = h.currentPort
-		h.mu.Unlock()
-	}
-
-	// Build the rotated address
-	var rotatedAddr *net.UDPAddr
-	if ua, ok := addr.(*net.UDPAddr); ok {
-		rotatedAddr = &net.UDPAddr{
-			IP:   ua.IP,
-			Port: currentPort,
-			Zone: ua.Zone,
-		}
-	} else {
-		// Fallback: use baseAddr with rotated port
-		rotatedAddr = &net.UDPAddr{
-			IP:   h.baseAddr.IP,
-			Port: currentPort,
-			Zone: h.baseAddr.Zone,
-		}
-	}
-
-	return h.PacketConn.WriteTo(p, rotatedAddr)
+	return h.currentPort
 }
 
-// ReadFrom normalizes the source address back to the canonical baseAddr
-// so quic-go never sees a "connection migration."
+// WriteTo sends p to the current rotated destination port, keeping the target IP.
+func (h *PortHoppingPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	port := h.currentDstPort()
+
+	ip := h.baseAddr.IP
+	zone := h.baseAddr.Zone
+	if ua, ok := addr.(*net.UDPAddr); ok {
+		ip, zone = ua.IP, ua.Zone
+	}
+	dst := &net.UDPAddr{IP: ip, Port: port, Zone: zone}
+
+	n, err := h.PacketConn.WriteTo(p, dst)
+	if n > len(p) {
+		// Report bytes of the caller's payload, never the rewritten framing.
+		n = len(p)
+	}
+	return n, err
+}
+
+// ReadFrom returns the canonical baseAddr so quic-go always sees a stable peer,
+// regardless of which port the reply actually arrived from.
 func (h *PortHoppingPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	n, _, err := h.PacketConn.ReadFrom(p)
 	if err != nil {
 		return n, nil, err
 	}
-	// Return the canonical baseAddr so the QUIC stack sees a stable peer
 	return n, h.baseAddr, nil
-}
-
-// Close closes the underlying PacketConn.
-func (h *PortHoppingPacketConn) Close() error {
-	return h.PacketConn.Close()
-}
-
-// LocalAddr returns the local address of the underlying connection.
-func (h *PortHoppingPacketConn) LocalAddr() net.Addr {
-	return h.PacketConn.LocalAddr()
-}
-
-// SetDeadline sets the read and write deadlines.
-func (h *PortHoppingPacketConn) SetDeadline(t time.Time) error {
-	return h.PacketConn.SetDeadline(t)
-}
-
-// SetReadDeadline sets the read deadline.
-func (h *PortHoppingPacketConn) SetReadDeadline(t time.Time) error {
-	return h.PacketConn.SetReadDeadline(t)
-}
-
-// SetWriteDeadline sets the write deadline.
-func (h *PortHoppingPacketConn) SetWriteDeadline(t time.Time) error {
-	return h.PacketConn.SetWriteDeadline(t)
 }
