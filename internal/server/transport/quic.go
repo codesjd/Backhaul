@@ -73,6 +73,10 @@ type QuicTransport struct {
 	h3            *http3.Server
 	fallbackProxy http.Handler
 
+	// lastNoTunnelLogNs throttles the "no active tunnel" warning: while the tunnel
+	// is down every public connection would otherwise log, flooding the output.
+	lastNoTunnelLogNs atomic.Int64
+
 	// conn is the current authenticated client connection. Public listeners
 	// open streams/datagrams on whatever is stored here; it is cleared when the
 	// connection dies so a stale conn is never used.
@@ -381,6 +385,21 @@ func (s *QuicTransport) authenticate(stream *quic.Stream) error {
 	return err
 }
 
+// warnNoTunnel logs that there's no tunnel to carry public connections, at most
+// once every 5s. Without the throttle a burst of client retries while the tunnel
+// is down floods the log with one line per dropped connection.
+func (s *QuicTransport) warnNoTunnel() {
+	const every = int64(5 * time.Second)
+	now := time.Now().UnixNano()
+	last := s.lastNoTunnelLogNs.Load()
+	if now-last < every {
+		return
+	}
+	if s.lastNoTunnelLogNs.CompareAndSwap(last, now) {
+		s.logger.Warn("quic: no active tunnel connection, dropping public connections (suppressing repeats for 5s)")
+	}
+}
+
 // currentConn returns the active tunnel connection, waiting briefly for a client
 // to (re)connect rather than failing a just-arrived public connection outright.
 func (s *QuicTransport) currentConn() *quic.Conn {
@@ -462,7 +481,7 @@ func (s *QuicTransport) tcpListener(localAddr, remoteAddr string) {
 func (s *QuicTransport) handleTCP(pub net.Conn, remoteAddr string) {
 	conn := s.currentConn()
 	if conn == nil {
-		s.logger.Warn("quic: no active tunnel connection, dropping tcp connection")
+		s.warnNoTunnel()
 		pub.Close()
 		return
 	}
