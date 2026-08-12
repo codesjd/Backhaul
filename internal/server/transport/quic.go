@@ -2,10 +2,12 @@ package transport
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,8 +20,14 @@ import (
 	"github.com/musix/backhaul/internal/web"
 
 	quic "github.com/sagernet/quic-go"
+	"github.com/sagernet/quic-go/http3"
 	"github.com/sirupsen/logrus"
 )
+
+// quicConnCtxKey keys the underlying *quic.Conn stashed into each HTTP/3 request
+// context (via http3.Server.ConnContext) so the masquerade handler can promote a
+// successfully-authenticated connection to the active tunnel.
+type quicConnCtxKey struct{}
 
 // authMagic prefixes the client's auth stream so a stray or probing connection
 // that speaks QUIC but not our protocol is rejected before the token is read.
@@ -44,6 +52,7 @@ type QuicConfig struct {
 	PortRange    []int
 	KeepAliveMin time.Duration
 	KeepAliveMax time.Duration
+	Fallback     string // masquerade: decoy backend (host:port) reverse-proxied to non-tunnel HTTP/3 requests
 }
 
 type QuicTransport struct {
@@ -59,6 +68,10 @@ type QuicTransport struct {
 	// natOnce guards installing the port-hopping NAT redirect exactly once across
 	// the transport's lifetime (Start runs again on every Restart).
 	natOnce sync.Once
+
+	// h3 serves the HTTP/3 decoy masquerade; nil unless quic_masquerade is on.
+	h3            *http3.Server
+	fallbackProxy http.Handler
 
 	// conn is the current authenticated client connection. Public listeners
 	// open streams/datagrams on whatever is stored here; it is cleared when the
@@ -109,9 +122,6 @@ func (s *QuicTransport) Start() {
 		s.logger.Fatalf("quic: %v", err)
 		return
 	}
-	if s.config.Masquerade {
-		s.logger.Info("quic: HTTP/3 ALPN masquerade enabled")
-	}
 	udpAddr, err := net.ResolveUDPAddr("udp", s.config.BindAddr)
 	if err != nil {
 		s.logger.Fatalf("quic: invalid bind address %s: %v", s.config.BindAddr, err)
@@ -161,6 +171,10 @@ func (s *QuicTransport) Start() {
 	}
 	s.listener = ln
 	s.logger.Infof("quic server listening on %s", s.config.BindAddr)
+
+	if s.config.Masquerade {
+		s.buildH3Server()
+	}
 
 	go s.acceptTunnelConns()
 	go s.parsePortMappings()
@@ -218,8 +232,86 @@ func (s *QuicTransport) acceptTunnelConns() {
 				continue
 			}
 		}
+		if s.h3 != nil {
+			// Masquerade: hand the connection to the HTTP/3 server. Tunnel clients
+			// authenticate with a token-bearing request that promotes the conn;
+			// everyone else is reverse-proxied to the decoy backend.
+			go func(c *quic.Conn) {
+				if err := s.h3.ServeQUICConn(c); err != nil {
+					s.logger.Debugf("quic: h3 conn from %s ended: %v", c.RemoteAddr(), err)
+				}
+			}(conn)
+			continue
+		}
 		go s.handleTunnelConn(conn)
 	}
+}
+
+// buildH3Server constructs the HTTP/3 decoy server used in masquerade mode. The
+// underlying *quic.Conn is stashed into each request's context so serveMasquerade
+// can promote an authenticated connection to the active tunnel.
+func (s *QuicTransport) buildH3Server() {
+	proxy, err := network.NewFallbackProxy(s.config.Fallback)
+	if err != nil {
+		s.logger.Warnf("quic: invalid masquerade fallback %q: %v; probes will get a generic page", s.config.Fallback, err)
+	}
+	s.fallbackProxy = network.DecoyHandler(proxy)
+	if s.config.Fallback != "" {
+		s.logger.Infof("quic: HTTP/3 decoy masquerade enabled; non-tunnel requests proxied to %s", s.config.Fallback)
+	} else {
+		s.logger.Info("quic: HTTP/3 decoy masquerade enabled; non-tunnel requests get a generic page")
+	}
+	s.h3 = &http3.Server{
+		EnableDatagrams: false, // keep raw QUIC datagrams for the UDP tunnel
+		Handler:         http.HandlerFunc(s.serveMasquerade),
+		ConnContext: func(ctx context.Context, c *quic.Conn) context.Context {
+			return context.WithValue(ctx, quicConnCtxKey{}, c)
+		},
+	}
+}
+
+// serveMasquerade authenticates tunnel clients by the shared token and reverse-
+// proxies everyone else to the decoy backend.
+func (s *QuicTransport) serveMasquerade(w http.ResponseWriter, r *http.Request) {
+	token := strings.TrimPrefix(r.Header.Get(network.H3AuthHeader), network.H3AuthScheme)
+	if token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(s.config.Token)) == 1 {
+		conn, _ := r.Context().Value(quicConnCtxKey{}).(*quic.Conn)
+		if conn == nil {
+			http.Error(w, "", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Length", "0")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		s.activateTunnel(conn)
+		// Hold the request goroutine open for the life of the connection; the
+		// tunnel's data streams and datagrams flow independently underneath.
+		<-conn.Context().Done()
+		return
+	}
+	s.fallbackProxy.ServeHTTP(w, r)
+}
+
+// activateTunnel promotes an authenticated connection to the active tunnel,
+// mirroring the post-auth path of handleTunnelConn.
+func (s *QuicTransport) activateTunnel(conn *quic.Conn) {
+	if s.config.UpMbps > 0 {
+		conn.SetCongestionControl(congestion.NewBrutalSender(uint64(s.config.UpMbps) * 1_000_000 / 8))
+	}
+	s.logger.Infof("quic: client authenticated from %s", conn.RemoteAddr())
+	s.config.TunnelStatus = "Connected (QUIC)"
+	if prev := s.conn.Swap(conn); prev != nil && prev != conn {
+		prev.CloseWithError(0, "superseded")
+	}
+	go s.datagramReturnLoop(conn)
+	go func() {
+		<-conn.Context().Done()
+		s.conn.CompareAndSwap(conn, nil)
+		s.config.TunnelStatus = "Disconnected (QUIC)"
+		s.logger.Infof("quic: client connection from %s closed", conn.RemoteAddr())
+	}()
 }
 
 func (s *QuicTransport) handleTunnelConn(conn *quic.Conn) {

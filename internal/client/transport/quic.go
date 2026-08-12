@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 
@@ -167,7 +168,14 @@ func (c *QuicTransport) connectAndServe() error {
 		packetConn.Close()
 		return fmt.Errorf("dial %s: %w", c.config.RemoteAddr, err)
 	}
-	if err := c.authenticate(conn); err != nil {
+	// Masquerade authenticates over HTTP/3 (an ordinary token-bearing request);
+	// otherwise the classic magic-prefixed auth stream is used.
+	if c.config.Masquerade {
+		if err := c.authenticateH3(conn); err != nil {
+			conn.CloseWithError(1, "auth failed")
+			return fmt.Errorf("h3 auth: %w", err)
+		}
+	} else if err := c.authenticate(conn); err != nil {
 		conn.CloseWithError(1, "auth failed")
 		return fmt.Errorf("auth: %w", err)
 	}
@@ -194,6 +202,51 @@ func (c *QuicTransport) connectAndServe() error {
 		}
 		go c.handleStream(conn, stream)
 	}
+}
+
+// authenticateH3 performs the masquerade handshake: it wraps the dialed QUIC
+// connection in a low-level HTTP/3 client, sends one token-bearing request, and
+// requires a 2xx response. The raw client conn (rather than a full RoundTrip)
+// lets us keep accepting the server's raw tunnel streams and QUIC datagrams on
+// the same connection afterwards; the goroutine draining server-opened
+// unidirectional streams keeps the HTTP/3 state machine (SETTINGS, QPACK) happy.
+func (c *QuicTransport) authenticateH3(conn *quic.Conn) error {
+	tr := network.NewH3ClientTransport()
+	rc := tr.NewRawClientConn(conn)
+
+	go func() {
+		for {
+			us, err := conn.AcceptUniStream(c.ctx)
+			if err != nil {
+				return
+			}
+			go rc.HandleUnidirectionalStream(us)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(c.ctx, c.config.DialTimeOut)
+	defer cancel()
+	rs, err := rc.OpenRequestStream(ctx)
+	if err != nil {
+		return fmt.Errorf("open request stream: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+c.config.RemoteAddr+"/", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set(network.H3AuthHeader, network.H3AuthScheme+c.config.Token)
+	if err := rs.SendRequestHeader(req); err != nil {
+		return fmt.Errorf("send auth request: %w", err)
+	}
+	_ = rs.Close() // no request body
+	resp, err := rs.ReadResponse()
+	if err != nil {
+		return fmt.Errorf("read auth response: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("server rejected token (status %d)", resp.StatusCode)
+	}
+	return nil
 }
 
 func (c *QuicTransport) authenticate(conn *quic.Conn) error {

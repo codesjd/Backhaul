@@ -182,6 +182,7 @@ func (s *Server) Start() {
 			PortRange:    s.config.QuicPortRange,
 			KeepAliveMin: time.Duration(s.config.QuicKeepaliveMin) * time.Second,
 			KeepAliveMax: time.Duration(s.config.QuicKeepaliveMax) * time.Second,
+			Fallback:     s.config.Fallback,
 		}
 
 		quicServer := transport.NewQuicServer(s.ctx, quicConfig, s.logger)
