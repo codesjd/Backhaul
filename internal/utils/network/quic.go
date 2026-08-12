@@ -58,6 +58,9 @@ const (
 	// MaxUDPFragPayload is how many bytes of the original UDP packet fit in one
 	// datagram after the framing header.
 	MaxUDPFragPayload = QuicMaxDatagramPayload - udpFragHeaderLen
+
+	// STUN magic cookie for protocol mimicry obfuscation
+	stunMagicCookie = 0x2112A442
 )
 
 // Server-opened stream types. The first byte of every stream the server opens to
