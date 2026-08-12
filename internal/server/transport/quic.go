@@ -40,6 +40,10 @@ type QuicConfig struct {
 	DownMbps     int
 	ObfsPassword string
 	Masquerade   bool
+	ObfsSTUN     bool
+	PortRange    []int
+	KeepAliveMin time.Duration
+	KeepAliveMax time.Duration
 }
 
 type QuicTransport struct {
@@ -116,10 +120,23 @@ func (s *QuicTransport) Start() {
 	}
 	var packetConn net.PacketConn = pc
 	if s.config.ObfsPassword != "" {
-		packetConn = network.NewObfsPacketConn(pc, s.config.ObfsPassword)
+		packetConn = network.NewObfsPacketConn(pc, s.config.ObfsPassword).WithSTUN(s.config.ObfsSTUN)
 		s.logger.Info("quic: Salamander packet obfuscation enabled")
+		if s.config.ObfsSTUN {
+			s.logger.Info("quic: STUN protocol-mimicry framing enabled")
+		}
 	}
-	ln, err := quic.Listen(packetConn, tlsConf, network.QuicConfig(s.config.DownMbps, s.config.Keepalive))
+	// Port hopping is enforced at the network layer: the server binds one socket
+	// and a firewall rule redirects the whole range to it. Surface a reminder so a
+	// configured range without the matching rule isn't silently ineffective.
+	if len(s.config.PortRange) == 2 && s.config.PortRange[0] > 0 && s.config.PortRange[1] > 0 {
+		s.logger.Infof("quic: port hopping expected on UDP %d-%d; ensure a redirect rule targets this listener, e.g. "+
+			"iptables -t nat -A PREROUTING -p udp --dport %d:%d -j REDIRECT --to-ports %d",
+			s.config.PortRange[0], s.config.PortRange[1],
+			s.config.PortRange[0], s.config.PortRange[1], udpAddr.Port)
+	}
+	keepalive := network.JitterKeepalive(s.config.Keepalive, s.config.KeepAliveMin, s.config.KeepAliveMax)
+	ln, err := quic.Listen(packetConn, tlsConf, network.QuicConfig(s.config.DownMbps, keepalive))
 	if err != nil {
 		s.logger.Fatalf("quic: failed to listen on %s: %v", s.config.BindAddr, err)
 		return

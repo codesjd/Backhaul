@@ -191,6 +191,10 @@ func (c *Client) Start() {
 			DownMbps:      c.config.QuicDownMbps,
 			ObfsPassword:  c.config.QuicObfs,
 			Masquerade:    c.config.QuicMasquerade,
+			ObfsSTUN:      c.config.QuicObfsSTUN,
+			PortRange:     c.config.QuicPortRange,
+			KeepAliveMin:  time.Duration(c.config.QuicKeepaliveMin) * time.Second,
+			KeepAliveMax:  time.Duration(c.config.QuicKeepaliveMax) * time.Second,
 		}
 
 		quicClient := transport.NewQuicClient(c.ctx, quicConfig, c.logger)

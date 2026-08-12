@@ -54,6 +54,10 @@ type ServerConfig struct {
 	QuicDownMbps         int           `toml:"quic_down_mbps"`     // quic: target download bandwidth in Mbps; sizes QUIC flow-control windows. 0 = default.
 	QuicObfs             string        `toml:"quic_obfs_password"` // quic: Salamander-style packet obfuscation password. Must match the client. Empty = plain QUIC.
 	QuicMasquerade       bool          `toml:"quic_masquerade"`    // quic: advertise ALPN "h3" so the handshake blends with HTTP/3 web traffic. Must match the client.
+	QuicPortRange        []int         `toml:"quic_port_range"`    // quic: [start, end] UDP port range for port hopping to defeat per-flow throttling. Server must accept this range (via iptables REDIRECT or native binding). Empty = single port.
+	QuicObfsSTUN         bool          `toml:"quic_obfs_stun"`     // quic: prepend a mimicked STUN header to obfuscated packets so they don't look full-entropy to the fully-encrypted-traffic classifier. Requires quic_obfs_password. Must match the client.
+	QuicKeepaliveMin     int           `toml:"quic_keepalive_min"` // quic: min seconds for the randomized (jittered) keep-alive period. 0 = derive from keepalive (default 15s).
+	QuicKeepaliveMax     int           `toml:"quic_keepalive_max"` // quic: max seconds for the randomized (jittered) keep-alive period. 0 = derive from keepalive (default 45s).
 }
 
 // ClientConfig represents the configuration for the client.
@@ -92,6 +96,10 @@ type ClientConfig struct {
 	QuicDownMbps         int           `toml:"quic_down_mbps"`     // quic: target download bandwidth in Mbps; sizes QUIC flow-control windows. 0 = default.
 	QuicObfs             string        `toml:"quic_obfs_password"` // quic: Salamander-style packet obfuscation password. Must match the server. Empty = plain QUIC.
 	QuicMasquerade       bool          `toml:"quic_masquerade"`    // quic: advertise ALPN "h3" so the handshake blends with HTTP/3 web traffic. Must match the server.
+	QuicPortRange        []int         `toml:"quic_port_range"`    // quic: [start, end] UDP port range for port hopping to defeat per-flow throttling. Client rotates destination port across this range. Empty = single port from remote_addr.
+	QuicObfsSTUN         bool          `toml:"quic_obfs_stun"`     // quic: prepend a mimicked STUN header to obfuscated packets so they don't look full-entropy to the fully-encrypted-traffic classifier. Requires quic_obfs_password. Must match the server.
+	QuicKeepaliveMin     int           `toml:"quic_keepalive_min"` // quic: min seconds for the randomized (jittered) keep-alive period. 0 = derive from keepalive (default 15s).
+	QuicKeepaliveMax     int           `toml:"quic_keepalive_max"` // quic: max seconds for the randomized (jittered) keep-alive period. 0 = derive from keepalive (default 45s).
 }
 
 // Config represents the complete configuration, including both server and client settings.
