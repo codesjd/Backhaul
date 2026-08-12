@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -118,6 +119,22 @@ func TestObfsSTUNRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(out[:n], plain) {
 		t.Fatal("STUN obfs round trip mismatch")
+	}
+}
+
+// TestPortHoppingRuleSpec checks the NAT rule spec and human-readable command
+// carry the right range and target port.
+func TestPortHoppingRuleSpec(t *testing.T) {
+	spec := portHoppingRuleSpec(20000, 50000, 443)
+	joined := strings.Join(spec, " ")
+	for _, want := range []string{"PREROUTING", "-p udp", "--dport 20000:50000", "-j REDIRECT", "--to-ports 443"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("rule spec missing %q: %s", want, joined)
+		}
+	}
+	cmd := PortHoppingRuleCommand(20000, 50000, 443)
+	if !strings.Contains(cmd, "iptables -t nat -A PREROUTING") || !strings.Contains(cmd, "--dport 20000:50000") || !strings.Contains(cmd, "--to-ports 443") {
+		t.Fatalf("unexpected command string: %s", cmd)
 	}
 }
 
