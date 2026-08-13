@@ -52,6 +52,7 @@ type QuicConfig struct {
 	PortRange    []int
 	KeepAliveMin time.Duration
 	KeepAliveMax time.Duration
+	IdleTimeout  time.Duration
 	Fallback     string // masquerade: decoy backend (host:port) reverse-proxied to non-tunnel HTTP/3 requests
 }
 
@@ -169,7 +170,7 @@ func (s *QuicTransport) Start() {
 	}
 	keepalive := network.JitterKeepalive(s.config.KeepAliveMin, s.config.KeepAliveMax)
 	overhead := network.ObfsOverhead(s.config.ObfsPassword != "", s.config.ObfsSTUN)
-	ln, err := quic.Listen(packetConn, tlsConf, network.QuicConfig(s.config.DownMbps, keepalive, overhead))
+	ln, err := quic.Listen(packetConn, tlsConf, network.QuicConfig(s.config.DownMbps, keepalive, s.config.IdleTimeout, overhead))
 	if err != nil {
 		s.logger.Fatalf("quic: failed to listen on %s: %v", s.config.BindAddr, err)
 		return

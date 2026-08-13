@@ -152,7 +152,19 @@ func ObfsOverhead(obfs, stun bool) int {
 	return obfsSaltLen
 }
 
-func QuicConfig(downMbps int, keepalive time.Duration, obfsOverhead int) *quic.Config {
+// DefaultQuicIdleTimeout is how long a QUIC connection tolerates receiving no
+// packets before quic-go declares it dead ("timeout: no recent network
+// activity"). It is deliberately generous: on a censored link the DPI regularly
+// throttles UDP into short quiet spells, and QUIC is built to ride through those
+// on the same connection (its connection ID survives the gap). A short timeout
+// tears the tunnel down on every such spell and resets every flow through it -
+// far more disruptive than the gap itself - then reconnects, adding still more
+// downtime. The trade-off is that a genuinely dead/restarted server also takes
+// this long to notice, but that is rare and the reconnect is automatic. Raise
+// quic_idle_timeout further for links with longer blackouts.
+const DefaultQuicIdleTimeout = 60 * time.Second
+
+func QuicConfig(downMbps int, keepalive, idleTimeout time.Duration, obfsOverhead int) *quic.Config {
 	if downMbps <= 0 {
 		downMbps = 100
 	}
@@ -167,22 +179,23 @@ func QuicConfig(downMbps int, keepalive time.Duration, obfsOverhead int) *quic.C
 	if window > maxWindow {
 		window = maxWindow
 	}
-	// A dead peer (e.g. the server process restarting) is only noticed after the
-	// idle timeout elapses with no packet received, so keep it short enough that
-	// the client reconnects promptly rather than hanging for a minute. The
+	// The idle timeout governs how long a transient quiet spell is ridden through
+	// before the connection is torn down (see DefaultQuicIdleTimeout). The
 	// keep-alive must stay comfortably below it, or a healthy but quiet link is
 	// torn down between pings; cap it at half the idle timeout as a safety net on
 	// top of the jitter window.
-	const maxIdle = 30 * time.Second
-	if keepalive <= 0 {
-		keepalive = 15 * time.Second
+	if idleTimeout <= 0 {
+		idleTimeout = DefaultQuicIdleTimeout
 	}
-	if keepalive > maxIdle/2 {
-		keepalive = maxIdle / 2
+	if keepalive <= 0 {
+		keepalive = 6 * time.Second
+	}
+	if keepalive > idleTimeout/2 {
+		keepalive = idleTimeout / 2
 	}
 	cfg := &quic.Config{
 		EnableDatagrams:                true,
-		MaxIdleTimeout:                 maxIdle,
+		MaxIdleTimeout:                 idleTimeout,
 		KeepAlivePeriod:                keepalive,
 		HandshakeIdleTimeout:           10 * time.Second,
 		InitialStreamReceiveWindow:     window / 2,

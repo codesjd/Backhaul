@@ -195,6 +195,7 @@ func (c *Client) Start() {
 			PortRange:     c.config.QuicPortRange,
 			KeepAliveMin:  time.Duration(c.config.QuicKeepaliveMin) * time.Second,
 			KeepAliveMax:  time.Duration(c.config.QuicKeepaliveMax) * time.Second,
+			IdleTimeout:   time.Duration(c.config.QuicIdleTimeout) * time.Second,
 		}
 
 		quicClient := transport.NewQuicClient(c.ctx, quicConfig, c.logger)
