@@ -40,6 +40,7 @@ type QuicConfig struct {
 	PortRange     []int
 	KeepAliveMin  time.Duration
 	KeepAliveMax  time.Duration
+	IdleTimeout   time.Duration
 }
 
 type QuicTransport struct {
@@ -163,7 +164,7 @@ func (c *QuicTransport) connectAndServe() error {
 	keepalive := network.JitterKeepalive(c.config.KeepAliveMin, c.config.KeepAliveMax)
 	dialCtx, cancel := context.WithTimeout(c.ctx, c.config.DialTimeOut)
 	overhead := network.ObfsOverhead(c.config.ObfsPassword != "", c.config.ObfsSTUN)
-	conn, err := quic.Dial(dialCtx, packetConn, serverAddr, tlsConf, network.QuicConfig(c.config.DownMbps, keepalive, overhead))
+	conn, err := quic.Dial(dialCtx, packetConn, serverAddr, tlsConf, network.QuicConfig(c.config.DownMbps, keepalive, c.config.IdleTimeout, overhead))
 	cancel()
 	if err != nil {
 		packetConn.Close()

@@ -196,12 +196,12 @@ func TestObfsOverheadInitialPacketSize(t *testing.T) {
 	}
 
 	// No obfs -> leave InitialPacketSize at quic-go's default (0 = unset).
-	if got := QuicConfig(100, 30*time.Second, 0).InitialPacketSize; got != 0 {
+	if got := QuicConfig(100, 30*time.Second, 0, 0).InitialPacketSize; got != 0 {
 		t.Fatalf("plain InitialPacketSize = %d, want 0 (default)", got)
 	}
 	// obfs+STUN -> default minus overhead, so QUIC packet + obfs == plain size.
 	wantStun := uint16(quicDefaultInitialPacketSize - (obfsSaltLen + stunHeaderLen))
-	if got := QuicConfig(100, 30*time.Second, obfsSaltLen+stunHeaderLen).InitialPacketSize; got != wantStun {
+	if got := QuicConfig(100, 30*time.Second, 0, obfsSaltLen+stunHeaderLen).InitialPacketSize; got != wantStun {
 		t.Fatalf("obfs+stun InitialPacketSize = %d, want %d", got, wantStun)
 	}
 }

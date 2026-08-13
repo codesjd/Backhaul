@@ -56,8 +56,9 @@ type ServerConfig struct {
 	QuicMasquerade       bool          `toml:"quic_masquerade"`    // quic: present as a real HTTP/3 origin (ALPN "h3"). The server runs an h3 server: tunnel clients authenticate with a token-bearing request, everyone else is reverse-proxied to `fallback` (or a generic page). Must match the client.
 	QuicPortRange        []int         `toml:"quic_port_range"`    // quic: [start, end] UDP port range for port hopping to defeat per-flow throttling. Server must accept this range (via iptables REDIRECT or native binding). Empty = single port.
 	QuicObfsSTUN         bool          `toml:"quic_obfs_stun"`     // quic: prepend a mimicked STUN header to obfuscated packets so they don't look full-entropy to the fully-encrypted-traffic classifier. Requires quic_obfs_password. Must match the client.
-	QuicKeepaliveMin     int           `toml:"quic_keepalive_min"` // quic: min seconds for the randomized (jittered) keep-alive period. 0 = derive from keepalive (default 15s).
-	QuicKeepaliveMax     int           `toml:"quic_keepalive_max"` // quic: max seconds for the randomized (jittered) keep-alive period. 0 = derive from keepalive (default 45s).
+	QuicKeepaliveMin     int           `toml:"quic_keepalive_min"` // quic: min seconds for the randomized (jittered) keep-alive period. 0 = default (4s).
+	QuicKeepaliveMax     int           `toml:"quic_keepalive_max"` // quic: max seconds for the randomized (jittered) keep-alive period. 0 = default (8s).
+	QuicIdleTimeout      int           `toml:"quic_idle_timeout"`  // quic: seconds a connection tolerates receiving no packets before it's declared dead. Higher rides through longer DPI quiet spells without tearing the tunnel down. 0 = default (60s).
 }
 
 // ClientConfig represents the configuration for the client.
@@ -98,8 +99,9 @@ type ClientConfig struct {
 	QuicMasquerade       bool          `toml:"quic_masquerade"`    // quic: authenticate over HTTP/3 (a token-bearing request) so the tunnel is indistinguishable from a real h3 client to an active probe. Must match the server.
 	QuicPortRange        []int         `toml:"quic_port_range"`    // quic: [start, end] UDP port range for port hopping to defeat per-flow throttling. Client rotates destination port across this range. Empty = single port from remote_addr.
 	QuicObfsSTUN         bool          `toml:"quic_obfs_stun"`     // quic: prepend a mimicked STUN header to obfuscated packets so they don't look full-entropy to the fully-encrypted-traffic classifier. Requires quic_obfs_password. Must match the server.
-	QuicKeepaliveMin     int           `toml:"quic_keepalive_min"` // quic: min seconds for the randomized (jittered) keep-alive period. 0 = derive from keepalive (default 15s).
-	QuicKeepaliveMax     int           `toml:"quic_keepalive_max"` // quic: max seconds for the randomized (jittered) keep-alive period. 0 = derive from keepalive (default 45s).
+	QuicKeepaliveMin     int           `toml:"quic_keepalive_min"` // quic: min seconds for the randomized (jittered) keep-alive period. 0 = default (4s).
+	QuicKeepaliveMax     int           `toml:"quic_keepalive_max"` // quic: max seconds for the randomized (jittered) keep-alive period. 0 = default (8s).
+	QuicIdleTimeout      int           `toml:"quic_idle_timeout"`  // quic: seconds a connection tolerates receiving no packets before it's declared dead. Higher rides through longer DPI quiet spells without tearing the tunnel down. 0 = default (60s).
 }
 
 // Config represents the complete configuration, including both server and client settings.
