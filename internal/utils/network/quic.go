@@ -204,15 +204,17 @@ func QuicConfig(downMbps int, keepalive time.Duration, obfsOverhead int) *quic.C
 
 // JitterKeepalive returns a randomized QUIC keep-alive period so the heartbeat
 // stops being a fixed metronome a censor can lock onto. When minD/maxD are both
-// unset it draws uniformly from a default [8s, 15s] window - deliberately kept
-// below QuicConfig's idle timeout so a healthy link is never torn down between
-// pings (QuicConfig also clamps as a safety net). When minD/maxD are set it draws
-// from [minD, maxD]. A fresh value is picked per connection, so reconnects don't
-// reveal a stable period either.
+// unset it draws uniformly from a default [4s, 8s] window - frequent enough that
+// several pings (each with quic-go's own PTO retries) fit inside the idle timeout,
+// so a lossy censored link doesn't drop an otherwise-healthy connection during a
+// quiet moment and force a reconnect (which also cold-starts congestion control).
+// Kept well below QuicConfig's idle timeout, which also clamps as a safety net.
+// When minD/maxD are set it draws from [minD, maxD]. A fresh value is picked per
+// connection, so reconnects don't reveal a stable period either.
 func JitterKeepalive(minD, maxD time.Duration) time.Duration {
 	if minD <= 0 || maxD <= 0 {
-		minD = 8 * time.Second
-		maxD = 15 * time.Second
+		minD = 4 * time.Second
+		maxD = 8 * time.Second
 	}
 	if minD > maxD {
 		minD, maxD = maxD, minD
