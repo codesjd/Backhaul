@@ -56,7 +56,7 @@ func TestPortHoppingForwardsBufferSizing(t *testing.T) {
 	base := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443}
 
 	direct := &bufRecordingConn{}
-	h := NewPortHoppingPacketConn(direct, base, 20000, 20010, time.Second)
+	h := NewPortHoppingPacketConn(direct, base, 20000, 20010)
 	_ = h.SetReadBuffer(1 << 20)
 	_ = h.SetWriteBuffer(2 << 20)
 	if direct.rbuf != 1<<20 || direct.wbuf != 2<<20 {
@@ -64,7 +64,7 @@ func TestPortHoppingForwardsBufferSizing(t *testing.T) {
 	}
 
 	chained := &bufRecordingConn{}
-	obfs := NewObfsPacketConn(NewPortHoppingPacketConn(chained, base, 20000, 20010, time.Second), "pw")
+	obfs := NewObfsPacketConn(NewPortHoppingPacketConn(chained, base, 20000, 20010), "pw")
 	_ = obfs.SetReadBuffer(3 << 20)
 	_ = obfs.SetWriteBuffer(4 << 20)
 	if chained.rbuf != 3<<20 || chained.wbuf != 4<<20 {
@@ -72,19 +72,19 @@ func TestPortHoppingForwardsBufferSizing(t *testing.T) {
 	}
 }
 
-// TestPortHoppingRewritesDestPort verifies writes land inside the configured
-// port range and keep the target IP, while reads report the canonical base
-// address so quic-go never sees a migration.
+// TestPortHoppingRewritesDestPort verifies writes land on a single per-connection
+// port inside the configured range and keep the target IP, and that the port
+// stays STABLE for the connection's life (no mid-connection rotation, which
+// churned NAT state). Reads report the canonical base address so quic-go never
+// sees a migration.
 func TestPortHoppingRewritesDestPort(t *testing.T) {
 	rec := &recordingPacketConn{local: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}}
 	base := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 5), Port: 443}
 	const start, end = 20000, 20010
-	// Zero rotation interval so every write picks a fresh port.
-	h := NewPortHoppingPacketConn(rec, base, start, end, time.Nanosecond)
+	h := NewPortHoppingPacketConn(rec, base, start, end)
 
 	seen := map[int]bool{}
 	for i := 0; i < 200; i++ {
-		time.Sleep(time.Microsecond)
 		if _, err := h.WriteTo([]byte("x"), base); err != nil {
 			t.Fatalf("write: %v", err)
 		}
@@ -102,8 +102,17 @@ func TestPortHoppingRewritesDestPort(t *testing.T) {
 		}
 		seen[ua.Port] = true
 	}
-	if len(seen) < 2 {
-		t.Fatalf("expected the destination port to hop; only saw %d distinct port(s)", len(seen))
+	if len(seen) != 1 {
+		t.Fatalf("port must be stable for the connection; saw %d distinct ports", len(seen))
+	}
+
+	// Two separate connections should generally pick from the range independently
+	// (spread across connections) - verify the picked port is always in range.
+	for i := 0; i < 50; i++ {
+		h2 := NewPortHoppingPacketConn(rec, base, start, end)
+		if h2.dstPort < start || h2.dstPort > end {
+			t.Fatalf("per-connection port %d outside range", h2.dstPort)
+		}
 	}
 
 	// ReadFrom must normalize the source back to the canonical base address.
@@ -116,17 +125,41 @@ func TestPortHoppingRewritesDestPort(t *testing.T) {
 	}
 }
 
-// TestPortHoppingSinglePort checks a degenerate range never rewrites the port.
+// TestValidPortRange checks normalization and rejection so the client and the
+// server's firewall rule always agree, and an out-of-range port can't be used.
+func TestValidPortRange(t *testing.T) {
+	cases := []struct {
+		in           []int
+		wantS, wantE int
+		wantOK       bool
+	}{
+		{[]int{20000, 50000}, 20000, 50000, true},
+		{[]int{50000, 20000}, 20000, 50000, true}, // reversed -> normalized
+		{[]int{443, 443}, 443, 443, true},
+		{[]int{20000, 70000}, 0, 0, false}, // > 65535
+		{[]int{0, 50000}, 0, 0, false},     // < 1
+		{[]int{20000}, 0, 0, false},        // wrong length
+		{nil, 0, 0, false},
+	}
+	for _, c := range cases {
+		s, e, ok := ValidPortRange(c.in)
+		if ok != c.wantOK || (ok && (s != c.wantS || e != c.wantE)) {
+			t.Fatalf("ValidPortRange(%v) = (%d,%d,%v), want (%d,%d,%v)", c.in, s, e, ok, c.wantS, c.wantE, c.wantOK)
+		}
+	}
+}
+
+// TestPortHoppingSinglePort checks a degenerate range always uses that one port.
 func TestPortHoppingSinglePort(t *testing.T) {
 	rec := &recordingPacketConn{local: &net.UDPAddr{}}
 	base := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 5), Port: 443}
-	h := NewPortHoppingPacketConn(rec, base, 443, 443, time.Nanosecond)
+	h := NewPortHoppingPacketConn(rec, base, 443, 443)
 	for i := 0; i < 10; i++ {
 		h.WriteTo([]byte("x"), base)
 	}
 	for _, d := range rec.dests {
 		if d.(*net.UDPAddr).Port != 443 {
-			t.Fatalf("single-port range hopped to %d", d.(*net.UDPAddr).Port)
+			t.Fatalf("single-port range used %d", d.(*net.UDPAddr).Port)
 		}
 	}
 }

@@ -144,13 +144,15 @@ func (s *QuicTransport) Start() {
 		if s.config.ObfsSTUN {
 			s.logger.Info("quic: STUN protocol-mimicry framing enabled")
 		}
+	} else if s.config.ObfsSTUN {
+		s.logger.Warn("quic: quic_obfs_stun is set but quic_obfs_password is empty; STUN mimicry needs the obfs layer and is therefore INACTIVE. Set quic_obfs_password to enable it.")
 	}
 	// Port hopping is enforced at the network layer: the server binds one socket
 	// and a NAT REDIRECT rule folds the client's rotating destination range back
 	// onto it. Install that rule automatically (best effort, like the TCP tuning),
 	// once per process, and tear it down on final shutdown.
-	if len(s.config.PortRange) == 2 && s.config.PortRange[0] > 0 && s.config.PortRange[1] > 0 {
-		start, end, toPort := s.config.PortRange[0], s.config.PortRange[1], udpAddr.Port
+	if start, end, ok := network.ValidPortRange(s.config.PortRange); ok {
+		toPort := udpAddr.Port
 		s.natOnce.Do(func() {
 			if err := network.EnsurePortHoppingRedirect(start, end, toPort); err != nil {
 				s.logger.Warnf("quic: could not auto-install port-hopping NAT rule (%v); add it manually: %s",
@@ -167,6 +169,8 @@ func (s *QuicTransport) Start() {
 				}
 			}()
 		})
+	} else if len(s.config.PortRange) > 0 {
+		s.logger.Warnf("quic: ignoring invalid quic_port_range %v (want [start, end] within 1-65535)", s.config.PortRange)
 	}
 	keepalive := network.JitterKeepalive(s.config.KeepAliveMin, s.config.KeepAliveMax)
 	overhead := network.ObfsOverhead(s.config.ObfsPassword != "", s.config.ObfsSTUN)
@@ -302,21 +306,39 @@ func (s *QuicTransport) serveMasquerade(w http.ResponseWriter, r *http.Request) 
 
 // activateTunnel promotes an authenticated connection to the active tunnel,
 // mirroring the post-auth path of handleTunnelConn.
-func (s *QuicTransport) activateTunnel(conn *quic.Conn) {
+// promoteTunnel makes an authenticated connection the active tunnel: it enables
+// Brutal CC for the server's send direction (if configured), records the status,
+// supersedes any previous connection, and starts the datagram return loop. Both
+// the masquerade (h3) and classic auth paths funnel through here so the
+// promotion sequence lives in one place.
+func (s *QuicTransport) promoteTunnel(conn *quic.Conn) {
 	if s.config.UpMbps > 0 {
 		conn.SetCongestionControl(congestion.NewBrutalSender(uint64(s.config.UpMbps) * 1_000_000 / 8))
 	}
 	s.logger.Infof("quic: client authenticated from %s", conn.RemoteAddr())
 	s.config.TunnelStatus = "Connected (QUIC)"
+	// Retire any previous connection - one client, one active tunnel.
 	if prev := s.conn.Swap(conn); prev != nil && prev != conn {
 		prev.CloseWithError(0, "superseded")
 	}
 	go s.datagramReturnLoop(conn)
+}
+
+// retireTunnel clears the active connection once it closes (only if it is still
+// the current one, so a superseding connection isn't cleared by the old one).
+func (s *QuicTransport) retireTunnel(conn *quic.Conn) {
+	s.conn.CompareAndSwap(conn, nil)
+	s.config.TunnelStatus = "Disconnected (QUIC)"
+	s.logger.Infof("quic: client connection from %s closed", conn.RemoteAddr())
+}
+
+// activateTunnel is the masquerade path's promotion: the h3 handler goroutine
+// stays parked on the request, so the close cleanup runs in its own goroutine.
+func (s *QuicTransport) activateTunnel(conn *quic.Conn) {
+	s.promoteTunnel(conn)
 	go func() {
 		<-conn.Context().Done()
-		s.conn.CompareAndSwap(conn, nil)
-		s.config.TunnelStatus = "Disconnected (QUIC)"
-		s.logger.Infof("quic: client connection from %s closed", conn.RemoteAddr())
+		s.retireTunnel(conn)
 	}()
 }
 
@@ -337,27 +359,10 @@ func (s *QuicTransport) handleTunnelConn(conn *quic.Conn) {
 	}
 	_ = stream.Close()
 
-	// Enable Brutal congestion control for the server's send direction (the
-	// download path to public clients) when a target bandwidth is configured.
-	if s.config.UpMbps > 0 {
-		conn.SetCongestionControl(congestion.NewBrutalSender(uint64(s.config.UpMbps) * 1_000_000 / 8))
-	}
-
-	s.logger.Infof("quic: client authenticated from %s", conn.RemoteAddr())
-	s.config.TunnelStatus = "Connected (QUIC)"
-
-	// Retire any previous connection - one client, one active tunnel.
-	if prev := s.conn.Swap(conn); prev != nil && prev != conn {
-		prev.CloseWithError(0, "superseded")
-	}
-
-	go s.datagramReturnLoop(conn)
+	s.promoteTunnel(conn)
 
 	<-conn.Context().Done()
-	// Only clear if this connection is still the active one.
-	s.conn.CompareAndSwap(conn, nil)
-	s.config.TunnelStatus = "Disconnected (QUIC)"
-	s.logger.Infof("quic: client connection from %s closed", conn.RemoteAddr())
+	s.retireTunnel(conn)
 }
 
 func (s *QuicTransport) authenticate(stream *quic.Stream) error {
