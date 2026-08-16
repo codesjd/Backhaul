@@ -78,6 +78,10 @@ type QuicTransport struct {
 	// is down every public connection would otherwise log, flooding the output.
 	lastNoTunnelLogNs atomic.Int64
 
+	// lastPromoteNs is when the active tunnel was last (re)promoted, used to detect
+	// a rapid supersede war (two clients sharing one token fighting each other).
+	lastPromoteNs atomic.Int64
+
 	// conn is the current authenticated client connection. Public listeners
 	// open streams/datagrams on whatever is stored here; it is cleared when the
 	// connection dies so a stale conn is never used.
@@ -320,7 +324,19 @@ func (s *QuicTransport) promoteTunnel(conn *quic.Conn) {
 	// Retire any previous connection - one client, one active tunnel.
 	if prev := s.conn.Swap(conn); prev != nil && prev != conn {
 		prev.CloseWithError(0, "superseded")
+		// A supersede is normal when a client reconnects. But if it keeps
+		// happening within seconds, the previous connection was still healthy -
+		// that means more than one client is running with the SAME token, each
+		// kicking the other off in an endless loop (the tunnel becomes unusable).
+		// Surface that clearly instead of leaving it as a silent churn.
+		now := time.Now().UnixNano()
+		if last := s.lastPromoteNs.Load(); last != 0 && now-last < int64(15*time.Second) {
+			s.logger.Warnf("quic: connection from %s superseded the active tunnel within %s of the last one - "+
+				"more than one client is likely running with the same token. Run only ONE client per token.",
+				conn.RemoteAddr(), time.Duration(now-last).Round(time.Second))
+		}
 	}
+	s.lastPromoteNs.Store(time.Now().UnixNano())
 	go s.datagramReturnLoop(conn)
 }
 
