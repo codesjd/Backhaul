@@ -123,6 +123,9 @@ func (c *QuicTransport) dialLoop() {
 	if !c.config.TLSVerify {
 		c.logger.Warn("SECURITY: quic server certificate verification is OFF (tls_verify=false); the auth token can be harvested by an on-path party via TLS MITM. Set tls_verify=true once the server presents a verifiable certificate.")
 	}
+	if c.config.ObfsSTUN && c.config.ObfsPassword == "" {
+		c.logger.Warn("quic: quic_obfs_stun is set but quic_obfs_password is empty; STUN mimicry needs the obfs layer and is therefore INACTIVE. Set quic_obfs_password (matching the server) to enable it.")
+	}
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -151,11 +154,15 @@ func (c *QuicTransport) connectAndServe() error {
 		return fmt.Errorf("open udp socket: %w", err)
 	}
 	var packetConn net.PacketConn = pc
-	// Port hopping (innermost, closest to the wire): rotate the destination UDP
-	// port so the tunnel never presents a stable 4-tuple for per-flow throttling.
-	if len(c.config.PortRange) == 2 && c.config.PortRange[0] > 0 && c.config.PortRange[1] > 0 {
-		packetConn = network.NewPortHoppingPacketConn(packetConn, serverAddr,
-			c.config.PortRange[0], c.config.PortRange[1], network.DefaultPortHopInterval)
+	// Port hopping (innermost, closest to the wire): pick a random destination UDP
+	// port within the range for this connection, so connections spread across the
+	// range instead of all hitting one blockable port. The port is fixed for the
+	// connection's life - rotating it mid-connection churned NAT/conntrack and
+	// periodically broke the tunnel.
+	if start, end, ok := network.ValidPortRange(c.config.PortRange); ok {
+		packetConn = network.NewPortHoppingPacketConn(packetConn, serverAddr, start, end)
+	} else if len(c.config.PortRange) > 0 {
+		c.logger.Warnf("quic: ignoring invalid quic_port_range %v (want [start, end] within 1-65535)", c.config.PortRange)
 	}
 	if c.config.ObfsPassword != "" {
 		packetConn = network.NewObfsPacketConn(packetConn, c.config.ObfsPassword).WithSTUN(c.config.ObfsSTUN)

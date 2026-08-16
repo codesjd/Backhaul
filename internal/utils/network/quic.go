@@ -225,8 +225,12 @@ func QuicConfig(downMbps int, keepalive, idleTimeout time.Duration, obfsOverhead
 // When minD/maxD are set it draws from [minD, maxD]. A fresh value is picked per
 // connection, so reconnects don't reveal a stable period either.
 func JitterKeepalive(minD, maxD time.Duration) time.Duration {
-	if minD <= 0 || maxD <= 0 {
+	// Fill each bound independently so setting only one (quic_keepalive_min or
+	// quic_keepalive_max) is honored instead of resetting both to the defaults.
+	if minD <= 0 {
 		minD = 4 * time.Second
+	}
+	if maxD <= 0 {
 		maxD = 8 * time.Second
 	}
 	if minD > maxD {

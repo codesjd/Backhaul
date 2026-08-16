@@ -1,13 +1,19 @@
 package network
 
-// PortHoppingPacketConn wraps a net.PacketConn to rotate the destination UDP
-// port on a timer, defeating per-flow DPI throttling that targets a stable
-// 4-tuple. Every write goes to a rotating port within a configured range; on
-// read the source address is normalized back to the canonical server address
-// so the QUIC stack never observes a "connection migration."
+// PortHoppingPacketConn wraps a net.PacketConn to send to a randomly chosen
+// destination UDP port within a configured range, so different tunnel
+// connections land on different ports and a censor can't simply block the one
+// well-known port. On read the source address is normalized back to the
+// canonical server address so the QUIC stack never observes a "connection
+// migration."
 //
-// This is the core technique Hysteria2 uses to survive in Iran: with no stable
-// flow, the censor's DPI can't build per-flow throttle state against the tunnel.
+// The port is chosen ONCE, when the connection is established, and kept for the
+// life of that connection. An earlier version rotated the port on a 30s timer
+// mid-connection; that churned the server's NAT/conntrack state (every rotation
+// created a new REDIRECT flow while the old one expired) and periodically broke
+// the return path, tearing the tunnel down every ~30s. Rotating only per
+// connection keeps the port spread across the range without destabilizing a live
+// connection; a fresh port is picked naturally on every reconnect.
 //
 // Server-side deployment needs no application change - bind one socket and let a
 // firewall rule redirect the whole range to it:
@@ -17,82 +23,65 @@ package network
 // conntrack rewrites the replies back to the port the client actually hit.
 import (
 	"net"
-	"sync"
-	"time"
 
 	mrand "math/rand/v2"
 )
 
-// PortHoppingPacketConn rewrites the destination port of every outgoing packet.
-type PortHoppingPacketConn struct {
-	net.PacketConn
-	baseAddr    *net.UDPAddr
-	portStart   int
-	portEnd     int
-	rotationDur time.Duration
-
-	mu          sync.Mutex
-	currentPort int
-	lastRotate  time.Time
+// ValidPortRange validates a [start, end] port-range config value. It returns the
+// normalized (ascending) bounds and ok=true only when the slice has exactly two
+// entries, both within [1, 65535]. A reversed range is swapped so the client and
+// the server's firewall rule agree on the same bounds; anything else (wrong
+// length, zero, or > 65535) is rejected so a misconfigured range can't silently
+// send to an invalid port (EINVAL on every packet) or install a broken rule.
+func ValidPortRange(r []int) (start, end int, ok bool) {
+	if len(r) != 2 {
+		return 0, 0, false
+	}
+	start, end = r[0], r[1]
+	if start > end {
+		start, end = end, start
+	}
+	if start < 1 || end > 65535 {
+		return 0, 0, false
+	}
+	return start, end, true
 }
 
-// DefaultPortHopInterval is how often the destination port rotates when the
-// caller does not specify an interval.
-const DefaultPortHopInterval = 30 * time.Second
+// PortHoppingPacketConn rewrites the destination port of every outgoing packet
+// to a per-connection random port within the configured range.
+type PortHoppingPacketConn struct {
+	net.PacketConn
+	baseAddr *net.UDPAddr
+	dstPort  int // chosen once at construction; stable for the connection's life
+}
 
-// NewPortHoppingPacketConn wraps inner so writes rotate across [portStart,
-// portEnd] every rotationDur. baseAddr is the canonical server address returned
-// to the QUIC stack on every read. If the range collapses to a single port, the
-// wrapper simply forwards to that port with no hopping.
-func NewPortHoppingPacketConn(inner net.PacketConn, baseAddr *net.UDPAddr, portStart, portEnd int, rotationDur time.Duration) *PortHoppingPacketConn {
+// NewPortHoppingPacketConn wraps inner so writes go to a random port within
+// [portStart, portEnd], chosen once for this connection. baseAddr is the
+// canonical server address returned to the QUIC stack on every read. If the
+// range collapses to a single port, that port is used.
+func NewPortHoppingPacketConn(inner net.PacketConn, baseAddr *net.UDPAddr, portStart, portEnd int) *PortHoppingPacketConn {
 	if portStart > portEnd {
 		portStart, portEnd = portEnd, portStart
 	}
-	if rotationDur <= 0 {
-		rotationDur = DefaultPortHopInterval
+	dstPort := portStart
+	if portStart < portEnd {
+		dstPort = portStart + mrand.IntN(portEnd-portStart+1)
 	}
-	h := &PortHoppingPacketConn{
-		PacketConn:  inner,
-		baseAddr:    baseAddr,
-		portStart:   portStart,
-		portEnd:     portEnd,
-		rotationDur: rotationDur,
-		lastRotate:  time.Now(),
+	return &PortHoppingPacketConn{
+		PacketConn: inner,
+		baseAddr:   baseAddr,
+		dstPort:    dstPort,
 	}
-	h.currentPort = h.pick()
-	return h
 }
 
-// pick returns a random port within the range (or the single port if the range
-// is degenerate). The top-level math/rand/v2 helpers are safe for concurrent use.
-func (h *PortHoppingPacketConn) pick() int {
-	if h.portStart >= h.portEnd {
-		return h.portStart
-	}
-	return h.portStart + mrand.IntN(h.portEnd-h.portStart+1)
-}
-
-// currentDstPort returns the port to send to, rotating it if the interval elapsed.
-func (h *PortHoppingPacketConn) currentDstPort() int {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.portStart < h.portEnd && time.Since(h.lastRotate) >= h.rotationDur {
-		h.currentPort = h.pick()
-		h.lastRotate = time.Now()
-	}
-	return h.currentPort
-}
-
-// WriteTo sends p to the current rotated destination port, keeping the target IP.
+// WriteTo sends p to this connection's destination port, keeping the target IP.
 func (h *PortHoppingPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
-	port := h.currentDstPort()
-
 	ip := h.baseAddr.IP
 	zone := h.baseAddr.Zone
 	if ua, ok := addr.(*net.UDPAddr); ok {
 		ip, zone = ua.IP, ua.Zone
 	}
-	dst := &net.UDPAddr{IP: ip, Port: port, Zone: zone}
+	dst := &net.UDPAddr{IP: ip, Port: h.dstPort, Zone: zone}
 
 	n, err := h.PacketConn.WriteTo(p, dst)
 	if n > len(p) {
