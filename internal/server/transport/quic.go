@@ -41,7 +41,6 @@ type QuicConfig struct {
 	WebPort      int
 	SnifferLog   string
 	TunnelStatus string
-	Keepalive    time.Duration
 	TLSCertFile  string
 	TLSKeyFile   string
 	UpMbps       int
@@ -88,9 +87,11 @@ type QuicTransport struct {
 	conn atomic.Pointer[quic.Conn]
 
 	// udp session routing: sessionID -> session, for delivering return datagrams
-	// back to the right public UDP client.
+	// back to the right public UDP client. udpByClient indexes the same sessions by
+	// public client address so the inbound path is O(1) instead of scanning.
 	udpMu       sync.Mutex
 	udpSessions map[uint32]*quicUDPSession
+	udpByClient map[string]*quicUDPSession
 	udpSeq      uint32
 	reassembler *network.UDPReassembler
 }
@@ -116,6 +117,7 @@ func NewQuicServer(parentCtx context.Context, config *QuicConfig, logger *logrus
 		logger:       logger,
 		usageMonitor: web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), ctx, config.SnifferLog, config.Sniffer, &config.TunnelStatus, logger),
 		udpSessions:  make(map[uint32]*quicUDPSession),
+		udpByClient:  make(map[string]*quicUDPSession),
 		reassembler:  network.NewUDPReassembler(),
 	}
 }
@@ -144,7 +146,7 @@ func (s *QuicTransport) Start() {
 	var packetConn net.PacketConn = pc
 	if s.config.ObfsPassword != "" {
 		packetConn = network.NewObfsPacketConn(pc, s.config.ObfsPassword).WithSTUN(s.config.ObfsSTUN)
-		s.logger.Info("quic: Salamander packet obfuscation enabled")
+		s.logger.Info("quic: Salamander packet obfuscation enabled (per-packet XOR; this disables kernel UDP GSO/GRO batching, so expect higher CPU and lower throughput than plain QUIC - the cost of not looking like QUIC on the wire)")
 		if s.config.ObfsSTUN {
 			s.logger.Info("quic: STUN protocol-mimicry framing enabled")
 		}
@@ -159,7 +161,7 @@ func (s *QuicTransport) Start() {
 		toPort := udpAddr.Port
 		s.natOnce.Do(func() {
 			if err := network.EnsurePortHoppingRedirect(start, end, toPort); err != nil {
-				s.logger.Warnf("quic: could not auto-install port-hopping NAT rule (%v); add it manually: %s",
+				s.logger.Errorf("quic: PORT HOPPING WILL NOT WORK: could not install the NAT redirect (%v); clients using quic_port_range hit a random port in the range with nothing behind it and just time out (looks exactly like an unreachable server); fix privileges/iptables, or add the rule manually: %s",
 					err, network.PortHoppingRuleCommand(start, end, toPort))
 			} else {
 				s.logger.Infof("quic: port hopping enabled; installed NAT redirect UDP %d-%d -> %d", start, end, toPort)
@@ -184,6 +186,18 @@ func (s *QuicTransport) Start() {
 		return
 	}
 	s.listener = ln
+	// Release the listen socket on shutdown/reload. quic.Listen was given a
+	// packetConn we opened, so quic-go's createdConn is false and it never closes
+	// the socket for us (Transport.Close only closes conns it dialed itself). If we
+	// don't close pc here, the UDP port stays bound after ctx is cancelled and the
+	// next instance - the config hot-reload spins up a fresh one - dies on the
+	// rebind with "address already in use". Close the listener first to stop the
+	// accept loop, then the raw socket to free the port.
+	go func() {
+		<-s.ctx.Done()
+		ln.Close()
+		pc.Close()
+	}()
 	s.logger.Infof("quic server listening on %s", s.config.BindAddr)
 
 	if s.config.Masquerade {
@@ -226,6 +240,7 @@ func (s *QuicTransport) Restart() {
 
 	s.udpMu.Lock()
 	s.udpSessions = make(map[uint32]*quicUDPSession)
+	s.udpByClient = make(map[string]*quicUDPSession)
 	s.udpMu.Unlock()
 
 	s.logger.SetLevel(level)
@@ -315,9 +330,20 @@ func (s *QuicTransport) serveMasquerade(w http.ResponseWriter, r *http.Request) 
 // supersedes any previous connection, and starts the datagram return loop. Both
 // the masquerade (h3) and classic auth paths funnel through here so the
 // promotion sequence lives in one place.
-func (s *QuicTransport) promoteTunnel(conn *quic.Conn) {
-	if s.config.UpMbps > 0 {
-		conn.SetCongestionControl(congestion.NewBrutalSender(uint64(s.config.UpMbps) * 1_000_000 / 8))
+func (s *QuicTransport) promoteTunnel(conn *quic.Conn, peerDownMbps int) {
+	// Pace the server's send direction with Brutal, but only when the SERVER
+	// operator opted in via quic_up_mbps. Brutal ignores loss, so enabling it is the
+	// operator's choice, not the peer's - mirroring the client side, which enables
+	// Brutal only when its own quic_up_mbps is set. The client's declared download
+	// (peerDownMbps, from the bandwidth handshake; 0 on the masquerade path) can only
+	// LOWER an already-enabled rate so the server doesn't outrun a slow client - it
+	// can never enable Brutal on its own.
+	rate := s.config.UpMbps
+	if rate > 0 && peerDownMbps > 0 && peerDownMbps < rate {
+		rate = peerDownMbps
+	}
+	if rate > 0 {
+		conn.SetCongestionControl(congestion.NewBrutalSender(uint64(rate) * 1_000_000 / 8))
 	}
 	s.logger.Infof("quic: client authenticated from %s", conn.RemoteAddr())
 	s.config.TunnelStatus = "Connected (QUIC)"
@@ -351,7 +377,7 @@ func (s *QuicTransport) retireTunnel(conn *quic.Conn) {
 // activateTunnel is the masquerade path's promotion: the h3 handler goroutine
 // stays parked on the request, so the close cleanup runs in its own goroutine.
 func (s *QuicTransport) activateTunnel(conn *quic.Conn) {
-	s.promoteTunnel(conn)
+	s.promoteTunnel(conn, 0)
 	go func() {
 		<-conn.Context().Done()
 		s.retireTunnel(conn)
@@ -367,7 +393,8 @@ func (s *QuicTransport) handleTunnelConn(conn *quic.Conn) {
 		conn.CloseWithError(1, "auth timeout")
 		return
 	}
-	if err := s.authenticate(stream); err != nil {
+	peerDownMbps, err := s.authenticate(stream)
+	if err != nil {
 		s.logger.Warnf("quic: auth from %s failed: %v", conn.RemoteAddr(), err)
 		_ = stream.Close()
 		conn.CloseWithError(1, "auth failed")
@@ -375,36 +402,42 @@ func (s *QuicTransport) handleTunnelConn(conn *quic.Conn) {
 	}
 	_ = stream.Close()
 
-	s.promoteTunnel(conn)
+	s.promoteTunnel(conn, peerDownMbps)
 
 	<-conn.Context().Done()
 	s.retireTunnel(conn)
 }
 
-func (s *QuicTransport) authenticate(stream *quic.Stream) error {
+// authenticate validates the client's auth stream and returns the client's
+// declared download bandwidth in Mbps (0 if unset), which the caller uses to pace
+// the server's Brutal send rate.
+func (s *QuicTransport) authenticate(stream *quic.Stream) (int, error) {
 	_ = stream.SetReadDeadline(time.Now().Add(10 * time.Second))
 	var magic [4]byte
 	if _, err := io.ReadFull(stream, magic[:]); err != nil {
-		return fmt.Errorf("read magic: %w", err)
+		return 0, fmt.Errorf("read magic: %w", err)
 	}
 	if magic != authMagic {
-		return fmt.Errorf("bad magic")
+		return 0, fmt.Errorf("bad magic")
 	}
 	token, err := network.ReadLPString(stream)
 	if err != nil {
-		return fmt.Errorf("read token: %w", err)
+		return 0, fmt.Errorf("read token: %w", err)
 	}
 	var bw [8]byte
 	if _, err := io.ReadFull(stream, bw[:]); err != nil {
-		return fmt.Errorf("read bandwidth: %w", err)
+		return 0, fmt.Errorf("read bandwidth: %w", err)
 	}
-	if token != s.config.Token {
+	if subtle.ConstantTimeCompare([]byte(token), []byte(s.config.Token)) != 1 {
 		_, _ = stream.Write([]byte{0})
-		return fmt.Errorf("invalid token")
+		return 0, fmt.Errorf("invalid token")
 	}
 	_ = stream.SetReadDeadline(time.Time{})
-	_, err = stream.Write([]byte{1})
-	return err
+	if _, err = stream.Write([]byte{1}); err != nil {
+		return 0, err
+	}
+	// bw is [uint32 up][uint32 down]; the client's declared download is our send ceiling.
+	return int(binary.BigEndian.Uint32(bw[4:8])), nil
 }
 
 // warnNoTunnel logs that there's no tunnel to carry public connections, at most
@@ -567,7 +600,12 @@ func (s *QuicTransport) udpListener(localAddr, remoteAddr string) {
 }
 
 func (s *QuicTransport) forwardUDP(pc *net.UDPConn, src *net.UDPAddr, remoteAddr string, data []byte) {
-	conn := s.currentConn()
+	// Non-blocking load, not currentConn(): this runs once per inbound datagram
+	// straight off the UDP read loop. currentConn blocks up to 5s waiting for a
+	// tunnel to (re)connect, which would stall the read loop and drop every packet
+	// queued behind it while the tunnel is down. UDP is lossy anyway - if there's
+	// no tunnel this instant, drop the datagram and read the next one.
+	conn := s.conn.Load()
 	if conn == nil {
 		return
 	}
@@ -602,6 +640,7 @@ func (s *QuicTransport) forwardUDP(pc *net.UDPConn, src *net.UDPAddr, remoteAddr
 			sess = &quicUDPSession{id: id, clientAddr: src, pubConn: pc, stream: stream}
 			sess.lastActive.Store(time.Now().UnixNano())
 			s.udpSessions[id] = sess
+			s.udpByClient[key] = sess
 			s.udpMu.Unlock()
 
 			// Header writes can also block on flow control - keep them off the lock.
@@ -641,12 +680,7 @@ func (s *QuicTransport) forwardUDP(pc *net.UDPConn, src *net.UDPAddr, remoteAddr
 // udpSessionByClient finds an existing session for a public client address.
 // Caller holds udpMu.
 func (s *QuicTransport) udpSessionByClient(key string) *quicUDPSession {
-	for _, sess := range s.udpSessions {
-		if sess.clientAddr.String() == key {
-			return sess
-		}
-	}
-	return nil
+	return s.udpByClient[key]
 }
 
 func (s *QuicTransport) closeUDPSession(id uint32) {
@@ -654,6 +688,11 @@ func (s *QuicTransport) closeUDPSession(id uint32) {
 	sess, ok := s.udpSessions[id]
 	if ok {
 		delete(s.udpSessions, id)
+		// Only drop the by-client entry if it still points at THIS session, so a
+		// late teardown of an old session can't evict a newer one for the same client.
+		if key := sess.clientAddr.String(); s.udpByClient[key] == sess {
+			delete(s.udpByClient, key)
+		}
 	}
 	s.udpMu.Unlock()
 	if ok && sess.stream != nil {

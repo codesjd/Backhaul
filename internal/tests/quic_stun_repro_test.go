@@ -30,7 +30,6 @@ func TestQuicSTUNThroughRealHandshake(t *testing.T) {
 		BindAddr:     fmt.Sprintf("127.0.0.1:%d", serverPort),
 		Token:        token,
 		Ports:        []string{fmt.Sprintf("%d=%d", pubPort, echoPort)},
-		Keepalive:    30 * time.Second,
 		ObfsPassword: obfs,
 		ObfsSTUN:     true,
 	}, quietLogger())
@@ -39,7 +38,6 @@ func TestQuicSTUNThroughRealHandshake(t *testing.T) {
 	cli := ctransport.NewQuicClient(ctx, &ctransport.QuicConfig{
 		RemoteAddr:    fmt.Sprintf("127.0.0.1:%d", serverPort),
 		Token:         token,
-		KeepAlive:     30 * time.Second,
 		DialTimeOut:   5 * time.Second,
 		RetryInterval: 500 * time.Millisecond,
 		ObfsPassword:  obfs,
@@ -93,7 +91,6 @@ func TestQuicSTUNPlusMasquerade(t *testing.T) {
 		BindAddr:     fmt.Sprintf("127.0.0.1:%d", serverPort),
 		Token:        token,
 		Ports:        []string{fmt.Sprintf("%d=%d", pubPort, echoPort)},
-		Keepalive:    30 * time.Second,
 		ObfsPassword: obfs,
 		ObfsSTUN:     true,
 		Masquerade:   true,
@@ -103,7 +100,6 @@ func TestQuicSTUNPlusMasquerade(t *testing.T) {
 	cli := ctransport.NewQuicClient(ctx, &ctransport.QuicConfig{
 		RemoteAddr:    fmt.Sprintf("127.0.0.1:%d", serverPort),
 		Token:         token,
-		KeepAlive:     30 * time.Second,
 		DialTimeOut:   5 * time.Second,
 		RetryInterval: 500 * time.Millisecond,
 		ObfsPassword:  obfs,

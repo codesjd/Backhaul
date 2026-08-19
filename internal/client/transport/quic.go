@@ -7,7 +7,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/musix/backhaul/internal/utils/congestion"
@@ -28,7 +30,6 @@ type QuicConfig struct {
 	TunnelStatus  string
 	Sniffer       bool
 	WebPort       int
-	KeepAlive     time.Duration
 	DialTimeOut   time.Duration
 	RetryInterval time.Duration
 	TLSVerify     bool
@@ -52,7 +53,9 @@ type QuicTransport struct {
 	usageMonitor *web.Usage
 	restartMutex sync.Mutex
 
-	conn *quic.Conn
+	// conn is the current control connection. Written by connectAndServe (dial
+	// goroutine) and read by Restart; atomic so those don't race.
+	conn atomic.Pointer[quic.Conn]
 
 	// udpSessions maps a server-assigned session id to the local UDP socket
 	// dialed to the target service.
@@ -97,8 +100,8 @@ func (c *QuicTransport) Restart() {
 	if c.cancel != nil {
 		c.cancel()
 	}
-	if c.conn != nil {
-		c.conn.CloseWithError(0, "restart")
+	if cn := c.conn.Load(); cn != nil {
+		cn.CloseWithError(0, "restart")
 	}
 	time.Sleep(2 * time.Second)
 
@@ -153,6 +156,13 @@ func (c *QuicTransport) connectAndServe() error {
 	if err != nil {
 		return fmt.Errorf("open udp socket: %w", err)
 	}
+	// We own this socket for the whole call: quic.Dial gets a packetConn we opened,
+	// so quic-go's createdConn is false and it never closes it for us. connectAndServe
+	// only returns once the connection is finished (dial error, auth failure, or the
+	// accept loop exiting when the conn dies), so closing here on every return path
+	// frees the fd - previously only the dial-error path did, leaking one socket per
+	// reconnect on auth failure and normal disconnect.
+	defer pc.Close()
 	var packetConn net.PacketConn = pc
 	// Port hopping (innermost, closest to the wire): pick a random destination UDP
 	// port within the range for this connection, so connections spread across the
@@ -174,7 +184,6 @@ func (c *QuicTransport) connectAndServe() error {
 	conn, err := quic.Dial(dialCtx, packetConn, serverAddr, tlsConf, network.QuicConfig(c.config.DownMbps, keepalive, c.config.IdleTimeout, overhead))
 	cancel()
 	if err != nil {
-		packetConn.Close()
 		// A dial timeout with obfuscation options on is almost always the server
 		// silently dropping our packets because it isn't running the same options.
 		// These must match on both ends: an obfs/STUN/masquerade mismatch looks
@@ -202,7 +211,7 @@ func (c *QuicTransport) connectAndServe() error {
 	if c.config.UpMbps > 0 {
 		conn.SetCongestionControl(congestion.NewBrutalSender(uint64(c.config.UpMbps) * 1_000_000 / 8))
 	}
-	c.conn = conn
+	c.conn.Store(conn)
 	c.config.TunnelStatus = "Connected (QUIC)"
 	c.logger.Info("quic: control connection established successfully")
 
@@ -220,20 +229,29 @@ func (c *QuicTransport) connectAndServe() error {
 	}
 }
 
-// mismatchHint returns a human hint for a dial failure when obfuscation options
-// are enabled, since a mismatched option on the server drops our packets and is
-// indistinguishable from an unreachable server.
+// mismatchHint returns a human hint for a dial failure when options that would
+// silently drop our packets on a mismatch are enabled. Any of port hopping,
+// obfuscation, or masquerade makes a misconfigured server look identical to an
+// unreachable one, so list every one that's active rather than just the first.
 func (c *QuicTransport) mismatchHint() string {
+	var reasons []string
+	if _, _, ok := network.ValidPortRange(c.config.PortRange); ok {
+		reasons = append(reasons, "quic_port_range needs the NAT redirect installed on the server "+
+			"(Linux + iptables + CAP_NET_ADMIN); without it the hopped destination port reaches nothing and the dial just times out")
+	}
 	switch {
 	case c.config.ObfsPassword != "" && c.config.ObfsSTUN:
-		return " (server must run the same build with matching quic_obfs_password AND quic_obfs_stun)"
+		reasons = append(reasons, "matching quic_obfs_password AND quic_obfs_stun")
 	case c.config.ObfsPassword != "":
-		return " (server must run matching quic_obfs_password)"
-	case c.config.Masquerade:
-		return " (server must run the same build with quic_masquerade = true)"
-	default:
+		reasons = append(reasons, "matching quic_obfs_password")
+	}
+	if c.config.Masquerade {
+		reasons = append(reasons, "quic_masquerade = true")
+	}
+	if len(reasons) == 0 {
 		return ""
 	}
+	return " (server must run the same build with: " + strings.Join(reasons, "; ") + ")"
 }
 
 // authenticateH3 performs the masquerade handshake: it wraps the dialed QUIC

@@ -183,7 +183,6 @@ func (c *Client) Start() {
 			Sniffer:       c.config.Sniffer,
 			WebPort:       c.config.WebPort,
 			SnifferLog:    c.config.SnifferLog,
-			KeepAlive:     time.Duration(c.config.Keepalive) * time.Second,
 			DialTimeOut:   time.Duration(c.config.DialTimeout) * time.Second,
 			RetryInterval: time.Duration(c.config.RetryInterval) * time.Second,
 			TLSVerify:     c.config.TLSVerify,

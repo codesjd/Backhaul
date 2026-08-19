@@ -656,7 +656,11 @@ func (o *ObfsPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		if plainLen > len(p) {
 			plainLen = len(p)
 		}
-		xorWithKey(p[:plainLen], o.readBuf[hdr+obfsSaltLen:n], &key)
+		// XOR only the first plainLen bytes: the keystream is per-byte independent, so
+		// this yields the correct leading plaintext even when the datagram is larger
+		// than the caller's buffer. Slicing src to plainLen too (not the full n) keeps
+		// xorWithKey - which iterates over len(src) - from writing past p[:plainLen].
+		xorWithKey(p[:plainLen], o.readBuf[hdr+obfsSaltLen:hdr+obfsSaltLen+plainLen], &key)
 		return plainLen, addr, nil
 	}
 }
