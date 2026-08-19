@@ -131,7 +131,6 @@ func TestQuicTunnelTCPAndUDP(t *testing.T) {
 		// Bare-port target ("pub=9000", not "pub=127.0.0.1:9000") exercises the
 		// client's ResolveRemoteAddr normalization (a bare port -> 127.0.0.1:port).
 		Ports:        []string{fmt.Sprintf("%d=%d", pubPort, echoPort)},
-		Keepalive:    30 * time.Second,
 		ObfsPassword: obfs,
 		UpMbps:       100, // exercise Brutal congestion control on both directions
 		DownMbps:     100,
@@ -143,7 +142,6 @@ func TestQuicTunnelTCPAndUDP(t *testing.T) {
 	cliCfg := &ctransport.QuicConfig{
 		RemoteAddr:    fmt.Sprintf("127.0.0.1:%d", serverPort),
 		Token:         token,
-		KeepAlive:     30 * time.Second,
 		DialTimeOut:   5 * time.Second,
 		RetryInterval: 500 * time.Millisecond,
 		ObfsPassword:  obfs,

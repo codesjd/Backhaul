@@ -112,13 +112,13 @@ func TestQuicConnChurn(t *testing.T) {
 
 	srv := stransport.NewQuicServer(ctx, &stransport.QuicConfig{
 		BindAddr: fmt.Sprintf("127.0.0.1:%d", serverPort), Token: "t",
-		Ports:     []string{fmt.Sprintf("%d=%d", pubPort, echoPort)},
-		Keepalive: 30 * time.Second, ObfsPassword: obfs, ObfsSTUN: true, Masquerade: true,
+		Ports:        []string{fmt.Sprintf("%d=%d", pubPort, echoPort)},
+		ObfsPassword: obfs, ObfsSTUN: true, Masquerade: true,
 	}, quietLogger())
 	go srv.Start()
 	cli := ctransport.NewQuicClient(ctx, &ctransport.QuicConfig{
 		RemoteAddr: fmt.Sprintf("127.0.0.1:%d", serverPort), Token: "t",
-		KeepAlive: 30 * time.Second, DialTimeOut: 5 * time.Second, RetryInterval: 500 * time.Millisecond,
+		DialTimeOut: 5 * time.Second, RetryInterval: 500 * time.Millisecond,
 		ObfsPassword: obfs, ObfsSTUN: true, Masquerade: true,
 	}, quietLogger())
 	go cli.Start()
@@ -172,13 +172,13 @@ func TestQuicBulkUploadObfs(t *testing.T) {
 	runBulkUpload(t,
 		&stransport.QuicConfig{
 			BindAddr: fmt.Sprintf("127.0.0.1:%d", serverPort), Token: "t",
-			Ports:     []string{fmt.Sprintf("%d=%d", pubPort, sinkPort)},
-			Keepalive: 30 * time.Second, ObfsPassword: obfs,
-			UpMbps: 100, DownMbps: 100,
+			Ports:        []string{fmt.Sprintf("%d=%d", pubPort, sinkPort)},
+			ObfsPassword: obfs,
+			UpMbps:       100, DownMbps: 100,
 		},
 		&ctransport.QuicConfig{
 			RemoteAddr: fmt.Sprintf("127.0.0.1:%d", serverPort), Token: "t",
-			KeepAlive: 30 * time.Second, DialTimeOut: 5 * time.Second, RetryInterval: 500 * time.Millisecond,
+			DialTimeOut: 5 * time.Second, RetryInterval: 500 * time.Millisecond,
 			ObfsPassword: obfs, UpMbps: 100, DownMbps: 100,
 		},
 		pubPort, sinkPort, 32*1024*1024)
@@ -194,13 +194,13 @@ func TestQuicBulkUploadMasquerade(t *testing.T) {
 	runBulkUpload(t,
 		&stransport.QuicConfig{
 			BindAddr: fmt.Sprintf("127.0.0.1:%d", serverPort), Token: "t",
-			Ports:     []string{fmt.Sprintf("%d=%d", pubPort, sinkPort)},
-			Keepalive: 30 * time.Second, ObfsPassword: obfs, ObfsSTUN: true, Masquerade: true,
+			Ports:        []string{fmt.Sprintf("%d=%d", pubPort, sinkPort)},
+			ObfsPassword: obfs, ObfsSTUN: true, Masquerade: true,
 			UpMbps: 100, DownMbps: 100,
 		},
 		&ctransport.QuicConfig{
 			RemoteAddr: fmt.Sprintf("127.0.0.1:%d", serverPort), Token: "t",
-			KeepAlive: 30 * time.Second, DialTimeOut: 5 * time.Second, RetryInterval: 500 * time.Millisecond,
+			DialTimeOut: 5 * time.Second, RetryInterval: 500 * time.Millisecond,
 			ObfsPassword: obfs, ObfsSTUN: true, Masquerade: true, UpMbps: 100, DownMbps: 100,
 		},
 		pubPort, sinkPort, 32*1024*1024)

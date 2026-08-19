@@ -66,41 +66,10 @@ func attemptTcpDialer(
 	// Options
 	dialer := &net.Dialer{
 		Control: func(network, address string, s syscall.RawConn) error {
-			err := ReusePortControl(network, address, s)
-			if err != nil {
+			if err := ReusePortControl(network, address, s); err != nil {
 				return err
 			}
-
-			if SO_RCVBUF > 0 {
-				err = s.Control(func(fd uintptr) {
-					if err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, SO_RCVBUF); err != nil {
-						err = fmt.Errorf("failed to set SO_RCVBUF: %v", err)
-					}
-				})
-			}
-			if err != nil {
-				return err
-			}
-
-			if SO_SNDBUF > 0 {
-				err = s.Control(func(fd uintptr) {
-					if err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, SO_SNDBUF); err != nil {
-						err = fmt.Errorf("failed to set SO_SNDBUF: %v", err)
-					}
-				})
-			}
-
-			// Set MSS (Maximum Segment Size)
-			if mss > 0 {
-				err = s.Control(func(fd uintptr) {
-					if err = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_MAXSEG, mss); err != nil {
-						err = fmt.Errorf("failed to set MSS: %v", err)
-					}
-				})
-			}
-
-			return err
-
+			return setDialerSockOpts(s, SO_RCVBUF, SO_SNDBUF, mss)
 		},
 		Timeout:         timeout, // Set the connection timeout
 		KeepAliveConfig: net.KeepAliveConfig{Enable: true, Interval: keepAlive, Count: 9, Idle: 0},

@@ -31,10 +31,9 @@ func TestQuicTunnelNoMasquerade(t *testing.T) {
 	tcpEcho(t, ctx, echoPort)
 
 	srv := stransport.NewQuicServer(ctx, &stransport.QuicConfig{
-		BindAddr:  fmt.Sprintf("127.0.0.1:%d", serverPort),
-		Token:     token,
-		Ports:     []string{fmt.Sprintf("%d=%d", pubPort, echoPort)},
-		Keepalive: 30 * time.Second,
+		BindAddr: fmt.Sprintf("127.0.0.1:%d", serverPort),
+		Token:    token,
+		Ports:    []string{fmt.Sprintf("%d=%d", pubPort, echoPort)},
 		// Masquerade off: exercise the raw auth-stream path.
 	}, quietLogger())
 	go srv.Start()
@@ -42,7 +41,6 @@ func TestQuicTunnelNoMasquerade(t *testing.T) {
 	cli := ctransport.NewQuicClient(ctx, &ctransport.QuicConfig{
 		RemoteAddr:    fmt.Sprintf("127.0.0.1:%d", serverPort),
 		Token:         token,
-		KeepAlive:     30 * time.Second,
 		DialTimeOut:   5 * time.Second,
 		RetryInterval: 500 * time.Millisecond,
 	}, quietLogger())
@@ -95,7 +93,6 @@ func TestQuicMasqueradeDecoy(t *testing.T) {
 	srvCfg := &stransport.QuicConfig{
 		BindAddr:   fmt.Sprintf("127.0.0.1:%d", serverPort),
 		Token:      "the-real-secret",
-		Keepalive:  30 * time.Second,
 		Masquerade: true,
 		Fallback:   backend.Listener.Addr().String(), // reverse-proxy probes here
 	}
@@ -145,7 +142,6 @@ func TestQuicMasqueradeDefaultPage(t *testing.T) {
 	srvCfg := &stransport.QuicConfig{
 		BindAddr:   fmt.Sprintf("127.0.0.1:%d", serverPort),
 		Token:      "secret",
-		Keepalive:  30 * time.Second,
 		Masquerade: true, // no Fallback
 	}
 	srv := stransport.NewQuicServer(ctx, srvCfg, quietLogger())

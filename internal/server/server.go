@@ -171,7 +171,6 @@ func (s *Server) Start() {
 			Sniffer:      s.config.Sniffer,
 			WebPort:      s.config.WebPort,
 			SnifferLog:   s.config.SnifferLog,
-			Keepalive:    time.Duration(s.config.Keepalive) * time.Second,
 			TLSCertFile:  s.config.TLSCertFile,
 			TLSKeyFile:   s.config.TLSKeyFile,
 			UpMbps:       s.config.QuicUpMbps,
