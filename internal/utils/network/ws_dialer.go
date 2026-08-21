@@ -1,8 +1,10 @@
 package network
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"net/http"
@@ -124,8 +126,23 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 	}
 
 	// Dial to the WebSocket server
-	tunnelWSConn, _, err := dialer.Dial(wsURL, headers)
+	tunnelWSConn, resp, err := dialer.Dial(wsURL, headers)
 	if err != nil {
+		// On a bad handshake, gorilla still hands back the HTTP response the
+		// server (or an on-path proxy/WAF/DPI) sent instead of the 101
+		// Switching Protocols we expected. That status code and body are the
+		// only clue to *why* the upgrade was rejected - e.g. a 403 from a
+		// CDN's bot/DPI filter looks identical to a plain "bad handshake"
+		// otherwise. The caller owns resp.Body once returned, so read and
+		// close it here rather than leaking it.
+		if resp != nil {
+			defer resp.Body.Close()
+			body, readErr := io.ReadAll(io.LimitReader(resp.Body, 512))
+			if readErr == nil && len(bytes.TrimSpace(body)) > 0 {
+				return nil, fmt.Errorf("%w (http status: %s, body: %q)", err, resp.Status, bytes.TrimSpace(body))
+			}
+			return nil, fmt.Errorf("%w (http status: %s)", err, resp.Status)
+		}
 		return nil, err
 	}
 	return tunnelWSConn, nil
