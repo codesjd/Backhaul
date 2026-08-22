@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"net"
 	"sync"
@@ -99,4 +100,17 @@ func acceptWithBackoff(ctx context.Context, listener net.Listener, logger *logru
 		case <-time.After(delay):
 		}
 	}
+}
+
+// authorizedToken compares an Authorization header against the expected value
+// in constant time.
+//
+// Plain string != stops at the first differing byte, so the time it takes to
+// reject a request reveals how much of the token the guess got right - which
+// turns a brute force from "guess the whole secret" into "guess it one byte at
+// a time". This check is the only thing between the internet and the tunnel, so
+// it is worth the constant-time compare even though a network round trip hides
+// most of the signal.
+func authorizedToken(authHeader, expected string) bool {
+	return subtle.ConstantTimeCompare([]byte(authHeader), []byte(expected)) == 1
 }

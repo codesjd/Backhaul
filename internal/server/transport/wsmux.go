@@ -362,6 +362,10 @@ func (s *WsMuxTransport) tunnelListener() {
 		},
 	}
 
+	// Built once rather than per request: this ran through fmt.Sprintf on
+	// every probe that reached the listener.
+	expectedAuth := "Bearer " + s.config.Token
+
 	// Create an HTTP server
 	server := &http.Server{
 		Addr: addr,
@@ -382,8 +386,7 @@ func (s *WsMuxTransport) tunnelListener() {
 			// the origin looks like an ordinary website, otherwise it is
 			// rejected as before.
 			isTunnelPath := r.URL.Path == channelPath || strings.HasPrefix(r.URL.Path, tunnelPathPrefix)
-			authHeader := r.Header.Get("Authorization")
-			if authHeader != fmt.Sprintf("Bearer %v", s.config.Token) || !isTunnelPath {
+			if !authorizedToken(r.Header.Get("Authorization"), expectedAuth) || !isTunnelPath {
 				if s.fallbackProxy != nil {
 					s.logger.Debugf("serving fallback for %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
 					s.fallbackProxy.ServeHTTP(w, r)
