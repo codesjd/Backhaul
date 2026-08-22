@@ -570,6 +570,13 @@ func (s *WsTransport) handleLoop() {
 					return
 				case tunnelConnection := <-s.tunnelChannel:
 					close(tunnelConnection.ping)
+					// Taken and deliberately never released: from here the
+					// connection belongs to WSConnectionHandler, and the
+					// keepAlive goroutine must never write another ping into the
+					// middle of that data stream. It TryLocks and gives up, so
+					// holding this forever is the handover. The mutex dies with
+					// the per-connection struct, so nothing leaks - do not
+					// "balance" it with an Unlock.
 					tunnelConnection.mu.Lock()
 					if err := tunnelConnection.conn.WriteMessage(websocket.TextMessage, []byte(localConn.remoteAddr)); err != nil {
 						s.logger.Debugf("%v", err) // failed to send port number
