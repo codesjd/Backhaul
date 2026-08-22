@@ -39,7 +39,13 @@ type WsMuxTransport struct {
 	restartMutex   sync.Mutex
 	streamCounter  int32
 	sessionCounter int32
-	stripedFlows   int32 // in-flight striped flows, bounded by the pool's stream budget
+	// admittedSessions counts every pool session ever admitted and is never
+	// decremented. Rotation compares it against a mark taken when it asked for
+	// a replacement, which is how it knows a replacement actually arrived - the
+	// live sessionCounter cannot tell "replacement is up" from "another
+	// connection died at the same moment".
+	admittedSessions int32
+	stripedFlows     int32 // in-flight striped flows, bounded by the pool's stream budget
 
 	// sessions is a live registry of pool sessions, used only when
 	// StripeFactor > 1 so the striped dispatcher can pick several sessions
@@ -51,6 +57,13 @@ type WsMuxTransport struct {
 	stripeGroupID  uint32
 
 	fallbackProxy http.Handler
+
+	// controlMu guards controlChannel, handlersStarted and graceTimer. The
+	// HTTP handler goroutine may be adopting a reattached control channel at
+	// the same moment a dying channelHandler is clearing the old one.
+	controlMu       sync.Mutex
+	handlersStarted bool
+	graceTimer      *time.Timer
 }
 
 type WsMuxConfig struct {
@@ -79,8 +92,9 @@ type WsMuxConfig struct {
 	Path                 string
 	MuxKeepaliveDisabled bool
 	StripeFactor         int
-	Fallback             string // decoy backend for non-tunnel requests (host:port), optional
-	TLSEngine            string // "go" (default) or "openssl" for wssmux TLS termination
+	Fallback             string        // decoy backend for non-tunnel requests (host:port), optional
+	TLSEngine            string        // "go" (default) or "openssl" for wssmux TLS termination
+	MaxConnAge           time.Duration // retire pool connections at this age (0 = never); see retireSession
 }
 
 func NewWSMuxServer(parentCtx context.Context, config *WsMuxConfig, logger *logrus.Logger) *WsMuxTransport {
@@ -152,10 +166,20 @@ func (s *WsMuxTransport) Restart() {
 		s.cancel()
 	}
 
-	// Close control channel connection
+	// Close the control channel and reset the reattach state, so the next
+	// control channel to arrive counts as a first one and starts the pool
+	// machinery again.
+	s.controlMu.Lock()
+	if s.graceTimer != nil {
+		s.graceTimer.Stop()
+		s.graceTimer = nil
+	}
 	if s.controlChannel != nil {
 		s.controlChannel.Close()
 	}
+	s.controlChannel = nil
+	s.handlersStarted = false
+	s.controlMu.Unlock()
 
 	time.Sleep(2 * time.Second)
 
@@ -167,11 +191,11 @@ func (s *WsMuxTransport) Restart() {
 	s.tunnelChannel = make(chan *smux.Session, s.config.ChannelSize)
 	s.localChannel = make(chan LocalTCPConn, s.config.ChannelSize)
 	s.reqNewConnChan = make(chan struct{}, s.config.ChannelSize)
-	s.controlChannel = nil
 	s.usageMonitor = web.NewDataStore(fmt.Sprintf(":%v", s.config.WebPort), ctx, s.config.SnifferLog, s.config.Sniffer, &s.config.TunnelStatus, s.logger)
 	s.config.TunnelStatus = ""
 	s.streamCounter = 0
 	s.sessionCounter = 0
+	s.admittedSessions = 0
 	// Reset the in-flight striped-flow count too. Left stale, acquireStripedSlot
 	// would see active*StripeFactor already over the budget of a fresh, empty
 	// pool and busy-wait (or hang) until leftover goroutines from the previous
@@ -188,7 +212,12 @@ func (s *WsMuxTransport) Restart() {
 	go s.Start()
 }
 
-func (s *WsMuxTransport) channelHandler() {
+// channelHandler drives one control channel. It takes the connection as an
+// argument rather than reading s.controlChannel on every use: once a dropped
+// channel can be replaced without restarting the transport, a handler for a
+// dead connection must never touch the shared pointer that now holds its
+// successor.
+func (s *WsMuxTransport) channelHandler(conn *websocket.Conn) {
 	// A jittered timer (instead of a fixed-period ticker) so the heartbeat
 	// cadence isn't perfectly periodic, which is an easy fingerprint for
 	// traffic-pattern based DPI.
@@ -206,13 +235,15 @@ func (s *WsMuxTransport) channelHandler() {
 				return
 
 			default:
-				_, msg, err := s.controlChannel.ReadMessage()
+				_, msg, err := conn.ReadMessage()
 				// Exit if there's an error
 				if err != nil {
-					if s.cancel != nil {
-						s.logger.Error("failed to read from channel connection. ", err)
-						go s.Restart()
-					}
+					s.logger.Warn("control channel read failed. ", err)
+					// The control channel carries no user data - only
+					// heartbeats and new-connection requests - so losing it
+					// must not take the pool, and every flow running on it,
+					// down as well. Hold everything and wait for a reattach.
+					go s.onControlLost(conn)
 					return
 				}
 				// A zero-length binary frame (or padding-only payload) would
@@ -228,21 +259,21 @@ func (s *WsMuxTransport) channelHandler() {
 	for {
 		select {
 		case <-s.ctx.Done():
-			_ = utils.WriteControlSignal(s.controlChannel, utils.SG_Closed)
+			_ = utils.WriteControlSignal(conn, utils.SG_Closed)
 			return
 		case <-s.reqNewConnChan:
-			err := utils.WriteControlSignal(s.controlChannel, utils.SG_Chan)
+			err := utils.WriteControlSignal(conn, utils.SG_Chan)
 			if err != nil {
-				s.logger.Error("failed to send request new connection signal. ", err)
-				go s.Restart()
+				s.logger.Warn("failed to send request new connection signal. ", err)
+				go s.onControlLost(conn)
 				return
 			}
 
 		case <-heartbeatTimer.C:
-			err := utils.WriteControlSignal(s.controlChannel, utils.SG_HB)
+			err := utils.WriteControlSignal(conn, utils.SG_HB)
 			if err != nil {
-				s.logger.Errorf("failed to send heartbeat signal. Error: %v.", err)
-				go s.Restart()
+				s.logger.Warnf("failed to send heartbeat signal. Error: %v.", err)
+				go s.onControlLost(conn)
 				return
 			}
 			s.logger.Debug("heartbeat signal sent successfully")
@@ -272,6 +303,51 @@ func (s *WsMuxTransport) channelHandler() {
 	}
 }
 
+// controlGraceWindow is how long the pool is kept alive after the control
+// channel drops while waiting for the client to reattach: long enough to ride
+// out a CDN max-age reset plus a few dial retries, short enough that a client
+// which really is gone doesn't leave a stale pool serving nothing.
+// ponytail: a constant, not a knob - nothing to tune until a deployment needs
+// a different window.
+const controlGraceWindow = 30 * time.Second
+
+// onControlLost handles a control channel that died on its own, as opposed to
+// the client deliberately going away. Everything that actually carries traffic
+// - the pool sessions, the port listeners, the handle loops - is independent of
+// the control channel, so it all stays up and only the control channel is
+// dropped. If the client hasn't reattached one within controlGraceWindow, fall
+// back to the old behaviour and rebuild the whole transport.
+func (s *WsMuxTransport) onControlLost(conn *websocket.Conn) {
+	s.controlMu.Lock()
+	if s.controlChannel != conn {
+		// Already cleared, or the client has since reattached: this is a late
+		// error from a connection nothing uses any more.
+		s.controlMu.Unlock()
+		conn.Close()
+		return
+	}
+	s.controlChannel = nil
+
+	if s.graceTimer != nil {
+		s.graceTimer.Stop()
+	}
+	s.graceTimer = time.AfterFunc(controlGraceWindow, func() {
+		s.controlMu.Lock()
+		reattached := s.controlChannel != nil
+		s.controlMu.Unlock()
+		if reattached {
+			return
+		}
+		s.logger.Warn("control channel did not reattach within the grace window, restarting server")
+		s.Restart()
+	})
+	s.controlMu.Unlock()
+
+	conn.Close()
+	s.config.TunnelStatus = fmt.Sprintf("Reconnecting (%s)", s.config.Mode)
+	s.logger.Warnf("control channel lost, holding the pool for up to %s for the client to reattach", controlGraceWindow)
+}
+
 func (s *WsMuxTransport) tunnelListener() {
 	addr := s.config.BindAddr
 	basePath := network.NormalizeBasePath(s.config.Path)
@@ -285,6 +361,10 @@ func (s *WsMuxTransport) tunnelListener() {
 			return true
 		},
 	}
+
+	// Built once rather than per request: this ran through fmt.Sprintf on
+	// every probe that reached the listener.
+	expectedAuth := "Bearer " + s.config.Token
 
 	// Create an HTTP server
 	server := &http.Server{
@@ -306,8 +386,7 @@ func (s *WsMuxTransport) tunnelListener() {
 			// the origin looks like an ordinary website, otherwise it is
 			// rejected as before.
 			isTunnelPath := r.URL.Path == channelPath || strings.HasPrefix(r.URL.Path, tunnelPathPrefix)
-			authHeader := r.Header.Get("Authorization")
-			if authHeader != fmt.Sprintf("Bearer %v", s.config.Token) || !isTunnelPath {
+			if !authorizedToken(r.Header.Get("Authorization"), expectedAuth) || !isTunnelPath {
 				if s.fallbackProxy != nil {
 					s.logger.Debugf("serving fallback for %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
 					s.fallbackProxy.ServeHTTP(w, r)
@@ -325,15 +404,42 @@ func (s *WsMuxTransport) tunnelListener() {
 			}
 
 			if r.URL.Path == channelPath {
-				if s.controlChannel != nil {
-					s.logger.Warn("new control channel requested.")
-					s.controlChannel.Close()
-					conn.Close()
-					go s.Restart()
+				s.controlMu.Lock()
+				// A control channel arriving while one is still registered is
+				// not a second client - it is the same client reattaching after
+				// a drop this side has not noticed yet. A one-way reset (the
+				// common CDN failure) leaves the server's read blocked and
+				// controlChannel non-nil, so the client re-dials before
+				// onControlLost ever runs. Restarting here would tear down the
+				// pool and every flow on it, which is exactly what the reattach
+				// path exists to avoid, so adopt the new connection and drop the
+				// stale one. Its handler exits by itself: onControlLost bails
+				// out when controlChannel is no longer the conn it was called
+				// for.
+				if old := s.controlChannel; old != nil {
+					s.logger.Warn("control channel replaced while the previous one was still registered")
+					old.Close()
+				}
+				// The first control channel starts the pool machinery. One
+				// arriving after a drop is a reattach: the handle loops, port
+				// listeners and pool sessions are all still running, and
+				// starting them again would double every listener.
+				first := !s.handlersStarted
+				s.handlersStarted = true
+				s.controlChannel = conn
+				if s.graceTimer != nil {
+					s.graceTimer.Stop()
+					s.graceTimer = nil
+				}
+				s.controlMu.Unlock()
+
+				go s.channelHandler(conn)
+
+				if !first {
+					s.logger.Info("control channel reattached successfully, pool preserved")
+					s.config.TunnelStatus = fmt.Sprintf("Connected (%s)", s.config.Mode)
 					return
 				}
-
-				s.controlChannel = conn
 
 				s.logger.Info("control channel established successfully")
 
@@ -342,7 +448,6 @@ func (s *WsMuxTransport) tunnelListener() {
 					numCPU = 4 // Max allowed handler is 4
 				}
 
-				go s.channelHandler()
 				go s.parsePortMappings()
 
 				s.logger.Infof("starting %d handle loops on each CPU thread", numCPU)
@@ -412,9 +517,11 @@ func (s *WsMuxTransport) tunnelListener() {
 	<-s.ctx.Done()
 
 	// close connection
+	s.controlMu.Lock()
 	if s.controlChannel != nil {
 		s.controlChannel.Close()
 	}
+	s.controlMu.Unlock()
 
 	// Gracefully shutdown the server
 	s.logger.Infof("shutting down the websocket server on %s", addr)
@@ -538,10 +645,9 @@ func (s *WsMuxTransport) acceptLocalConn(listener net.Listener, remoteAddr strin
 			return
 
 		default:
-			conn, err := listener.Accept()
-			if err != nil {
-				s.logger.Debugf("failed to accept connection on %s: %v", listener.Addr().String(), err)
-				continue
+			conn := acceptWithBackoff(s.ctx, listener, s.logger)
+			if conn == nil {
+				return
 			}
 
 			// discard any non-tcp connection
@@ -606,6 +712,7 @@ func (s *WsMuxTransport) handleLoop() {
 		case session := <-s.tunnelChannel:
 			// +1 for session counter
 			atomic.AddInt32(&s.sessionCounter, 1)
+			atomic.AddInt32(&s.admittedSessions, 1)
 
 			if s.config.StripeFactor > 1 {
 				s.registerSession(session)
@@ -614,6 +721,9 @@ func (s *WsMuxTransport) handleLoop() {
 					s.unregisterSession(sess)
 					atomic.AddInt32(&s.sessionCounter, -1)
 				}(session)
+				if s.config.MaxConnAge > 0 {
+					go s.rotateStripedSession(session)
+				}
 				continue
 			}
 
@@ -824,8 +934,23 @@ func (s *WsMuxTransport) requeueOrDrop(incomingConn LocalTCPConn) {
 
 func (s *WsMuxTransport) handleSession(session *smux.Session) {
 	counter := make(chan struct{}, s.config.MuxCon)
-	defer session.Close()
+	defer session.Close() // runs after retireSession below has drained the session
 	defer close(counter)
+
+	// Retire this session before it gets old enough for the CDN's own max-age
+	// reset to land on it. The age is jittered because the initial pool is
+	// dialled all at once - on a fixed age every connection would rotate in the
+	// same second, which is both a reconnect storm and a nice periodic
+	// signature. A nil channel (rotation disabled) blocks forever in the select.
+	var rotate <-chan time.Time
+	if s.config.MaxConnAge > 0 {
+		rotateTimer := time.NewTimer(utils.JitterDuration(s.config.MaxConnAge))
+		defer rotateTimer.Stop()
+		rotate = rotateTimer.C
+	}
+	// replaced closes once a replacement pool connection has actually been
+	// admitted. Nil until rotation starts, so the select ignores it.
+	var replaced chan struct{}
 
 	for {
 		// +1 for mux connection counter
@@ -833,6 +958,29 @@ func (s *WsMuxTransport) handleSession(session *smux.Session) {
 
 		select {
 		case <-s.ctx.Done():
+			return
+
+		case <-rotate:
+			<-counter // hand back the slot reserved above; no connection used it
+			rotate = nil
+
+			// Make before break: order the replacement, but keep serving on this
+			// connection until it is actually up. That is the point of waiting -
+			// if the client cannot dial (edge IP blackholed, CDN refusing the
+			// upgrade) an aging connection still carries traffic until the CDN
+			// resets it, while a closed one carries nothing.
+			replaced = make(chan struct{})
+			go func(ch chan struct{}) {
+				if s.awaitReplacement(session) {
+					close(ch)
+				}
+			}(replaced)
+			continue
+
+		case <-replaced:
+			<-counter // hand back the slot reserved above; no connection used it
+			atomic.AddInt32(&s.sessionCounter, -1)
+			s.retireSession(session)
 			return
 
 		case incomingConn := <-s.localChannel:
@@ -876,6 +1024,120 @@ func (s *WsMuxTransport) handleSession(session *smux.Session) {
 				atomic.AddInt32(&s.streamCounter, -1)
 				<-counter // read signal from the channel
 			}()
+		}
+	}
+}
+
+// rotateRetryInterval is how long rotation waits before re-checking for the
+// replacement connection it asked for. Deliberately unhurried: the connection
+// is only aging, and the client may be unable to dial at all for minutes.
+const rotateRetryInterval = 30 * time.Second
+
+// requestReplacement asks the client to bring up one more pool connection.
+func (s *WsMuxTransport) requestReplacement() {
+	select {
+	case s.reqNewConnChan <- struct{}{}:
+	default:
+		s.logger.Warn("failed to request a replacement connection for rotation. channel is full")
+	}
+}
+
+// retireSession takes a pool session out of service before it is old enough
+// for a CDN/LB max-age reset to kill it mid-flow, waiting for the streams
+// already running on it to finish. Callers only get here once a replacement
+// connection has actually joined the pool (see requestReplacement), so this
+// never shrinks the pool. The caller closes the session once this returns.
+//
+// Draining is the point: a long-lived flow - an SSH session, a large download -
+// is pinned to one connection because smux cannot migrate a live stream, so
+// cutting the connection at rotation time would cut the flow. Instead the
+// retiring connection takes no new streams and stays up until its last one
+// ends. That buys such a flow the whole window up to the CDN's hard limit; the
+// limit itself is not something client-side code can extend.
+func (s *WsMuxTransport) retireSession(session *smux.Session) {
+	s.logger.Debugf("retiring pool session at max_conn_age, %d live stream(s) to drain", session.NumStreams())
+
+	// ponytail: poll for drain rather than wiring per-stream completion
+	// signalling; a 1s tick is plenty for a connection on its way out.
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for {
+		if session.IsClosed() {
+			return
+		}
+		if session.NumStreams() == 0 {
+			s.logger.Debug("retired pool session drained, closing")
+			return
+		}
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// rotateStripedSession is the striped path's equivalent of the rotation branch
+// in handleSession: at max_conn_age the session is pulled out of the leg pool
+// so no new stripe legs land on it, then drained and closed. The sessionCounter
+// decrement is left to the CloseChan watcher registered in handleLoop.
+func (s *WsMuxTransport) rotateStripedSession(session *smux.Session) {
+	rotateTimer := time.NewTimer(utils.JitterDuration(s.config.MaxConnAge))
+	defer rotateTimer.Stop()
+
+	select {
+	case <-s.ctx.Done():
+		return
+	case <-session.CloseChan():
+		return
+	case <-rotateTimer.C:
+	}
+
+	// Make before break. Unlike the non-striped path this can block: the session
+	// keeps serving legs from the registry until unregisterSession below, so
+	// waiting here costs no capacity.
+	if !s.awaitReplacement(session) {
+		return
+	}
+
+	s.unregisterSession(session)
+	s.retireSession(session)
+	session.Close()
+}
+
+// awaitReplacement asks for a replacement pool connection and waits until one
+// has actually been admitted, re-asking on every retry because the client's
+// tunnelDialer abandons a failed dial for good. Returns false if the context
+// ended or the session died while waiting - in both cases there is nothing left
+// to rotate. It never gives up otherwise: retiring a connection the pool has no
+// replacement for would leave less capacity than before rotation started.
+func (s *WsMuxTransport) awaitReplacement(session *smux.Session) bool {
+	// Mark first, ask second: a replacement admitted from here on counts.
+	mark := atomic.LoadInt32(&s.admittedSessions)
+	s.requestReplacement()
+
+	// ponytail: poll the counter instead of signalling admissions to whoever is
+	// waiting. Rotation is not latency-sensitive - a second either way is noise
+	// against a max_conn_age measured in minutes.
+	poll := time.NewTicker(time.Second)
+	defer poll.Stop()
+	reask := time.NewTicker(utils.JitterDuration(rotateRetryInterval))
+	defer reask.Stop()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			return false
+		case <-session.CloseChan():
+			return false
+		case <-reask.C:
+			s.logger.Debugf("rotation deferred: replacement pool connection is not up, keeping the aging one in service (re-asking every ~%s)", rotateRetryInterval)
+			s.requestReplacement()
+		case <-poll.C:
+		}
+		if atomic.LoadInt32(&s.admittedSessions) > mark {
+			return true
 		}
 	}
 }

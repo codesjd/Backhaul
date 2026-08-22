@@ -7,26 +7,34 @@ import (
 	"net"
 )
 
-func WriteProxyProtocol(from, to net.Conn) error {
-	// Add Proxy Protocol v2 header to the connection
-	srcAddr, ok := from.RemoteAddr().(*net.TCPAddr)
+// ProxyProtocolHeader builds the v2 header describing a src->dst flow. Kept
+// separate from WriteProxyProtocol because a WebSocket tunnel leg is not an
+// io.Writer - the header has to leave as a binary frame, not a raw write.
+func ProxyProtocolHeader(src, dst net.Addr) ([]byte, error) {
+	srcAddr, ok := src.(*net.TCPAddr)
 	if !ok {
-		return fmt.Errorf("source connection address is not a TCP address")
+		return nil, fmt.Errorf("source connection address is not a TCP address")
 	}
-	dstAddr, ok := to.RemoteAddr().(*net.TCPAddr)
+	dstAddr, ok := dst.(*net.TCPAddr)
 	if !ok {
-		return fmt.Errorf("destination connection address is not a TCP address")
+		return nil, fmt.Errorf("destination connection address is not a TCP address")
 	}
 
 	header, err := buildProxyProtocolV2Header(srcAddr.IP.String(), dstAddr.IP.String(), srcAddr.Port, dstAddr.Port)
 	if err != nil {
-		return fmt.Errorf("failed to build Proxy Protocol v2 header: %v", err)
+		return nil, fmt.Errorf("failed to build Proxy Protocol v2 header: %v", err)
+	}
+	return header, nil
+}
 
+func WriteProxyProtocol(from, to net.Conn) error {
+	header, err := ProxyProtocolHeader(from.RemoteAddr(), to.RemoteAddr())
+	if err != nil {
+		return err
 	}
 
 	// Send the Proxy Protocol v2 header
-	_, err = to.Write(header)
-	if err != nil {
+	if _, err := to.Write(header); err != nil {
 		return fmt.Errorf("failed to send Proxy Protocol v2 header: %v", err)
 	}
 	return nil

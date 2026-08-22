@@ -92,24 +92,25 @@ func (s *Server) Start() {
 
 	case config.WS, config.WSS:
 		wsConfig := &transport.WsConfig{
-			BindAddr:    s.config.BindAddr,
-			Nodelay:     s.config.Nodelay,
-			KeepAlive:   time.Duration(s.config.Keepalive) * time.Second,
-			Heartbeat:   time.Duration(s.config.Heartbeat) * time.Second,
-			Token:       s.config.Token,
-			ChannelSize: s.config.ChannelSize,
-			Ports:       s.config.Ports,
-			Sniffer:     s.config.Sniffer,
-			WebPort:     s.config.WebPort,
-			SnifferLog:  s.config.SnifferLog,
-			Mode:        s.config.Transport,
-			TLSCertFile: s.config.TLSCertFile,
-			TLSKeyFile:  s.config.TLSKeyFile,
-			TLSCerts:    s.config.TLSCerts,
-			TLSKeys:     s.config.TLSKeys,
-			Path:        s.config.Path,
-			Fallback:    s.config.Fallback,
-			TLSEngine:   s.config.TLSEngine,
+			BindAddr:      s.config.BindAddr,
+			Nodelay:       s.config.Nodelay,
+			KeepAlive:     time.Duration(s.config.Keepalive) * time.Second,
+			Heartbeat:     time.Duration(s.config.Heartbeat) * time.Second,
+			Token:         s.config.Token,
+			ChannelSize:   s.config.ChannelSize,
+			Ports:         s.config.Ports,
+			Sniffer:       s.config.Sniffer,
+			WebPort:       s.config.WebPort,
+			SnifferLog:    s.config.SnifferLog,
+			Mode:          s.config.Transport,
+			TLSCertFile:   s.config.TLSCertFile,
+			TLSKeyFile:    s.config.TLSKeyFile,
+			TLSCerts:      s.config.TLSCerts,
+			TLSKeys:       s.config.TLSKeys,
+			Path:          s.config.Path,
+			Fallback:      s.config.Fallback,
+			TLSEngine:     s.config.TLSEngine,
+			ProxyProtocol: s.config.ProxyProtocol,
 		}
 
 		wsServer := transport.NewWSServer(s.ctx, wsConfig, s.logger)
@@ -143,6 +144,7 @@ func (s *Server) Start() {
 			Path:                 s.config.Path,
 			Fallback:             s.config.Fallback,
 			TLSEngine:            s.config.TLSEngine,
+			MaxConnAge:           time.Duration(s.config.MaxConnAge) * time.Second,
 		}
 
 		wsMuxServer := transport.NewWSMuxServer(s.ctx, wsMuxConfig, s.logger)
