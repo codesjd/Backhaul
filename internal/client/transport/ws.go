@@ -20,12 +20,17 @@ import (
 )
 
 type WsTransport struct {
-	config          *WsConfig
-	parentctx       context.Context
-	ctx             context.Context
-	cancel          context.CancelFunc
-	logger          *logrus.Logger
-	controlChannel  *websocket.Conn
+	config         *WsConfig
+	parentctx      context.Context
+	ctx            context.Context
+	cancel         context.CancelFunc
+	logger         *logrus.Logger
+	controlChannel *websocket.Conn
+	// controlMu guards controlChannel. The dialer installs it, the channel
+	// handler reads it on every heartbeat and Restart clears it, all from
+	// different goroutines - unsynchronized that is a data race, and Restart
+	// nilling the pointer while the handler dereferences it is a crash.
+	controlMu       sync.Mutex
 	restartMutex    sync.Mutex
 	usageMonitor    *web.Usage
 	poolConnections int32
@@ -108,9 +113,12 @@ func (c *WsTransport) Restart() {
 	}
 
 	// close control channel connection
+	c.controlMu.Lock()
 	if c.controlChannel != nil {
 		c.controlChannel.Close()
 	}
+	c.controlChannel = nil
+	c.controlMu.Unlock()
 
 	time.Sleep(2 * time.Second)
 
@@ -119,7 +127,6 @@ func (c *WsTransport) Restart() {
 	c.cancel = cancel
 
 	// Re-initialize variables
-	c.controlChannel = nil
 	c.usageMonitor = web.NewDataStore(fmt.Sprintf(":%v", c.config.WebPort), ctx, c.config.SnifferLog, c.config.Sniffer, &c.config.TunnelStatus, c.logger)
 	c.config.TunnelStatus = ""
 	c.poolConnections = 0
@@ -146,13 +153,15 @@ func (c *WsTransport) channelDialer() {
 				time.Sleep(c.config.RetryInterval)
 				continue
 			}
+			c.controlMu.Lock()
 			c.controlChannel = tunnelWSConn
+			c.controlMu.Unlock()
 			c.logger.Info("control channel established successfully")
 
 			c.config.TunnelStatus = fmt.Sprintf("Connected (%s)", c.config.Mode)
 
 			go c.poolMaintainer()
-			go c.channelHandler()
+			go c.channelHandler(tunnelWSConn)
 
 			return
 		}
@@ -224,7 +233,11 @@ func (c *WsTransport) poolMaintainer() {
 
 }
 
-func (c *WsTransport) channelHandler() {
+// channelHandler drives one control channel. It takes the connection as an
+// argument rather than reading c.controlChannel on every use: the field is
+// shared with the dialer and Restart, so a handler whose connection has died
+// must not touch a pointer that by then may hold something else.
+func (c *WsTransport) channelHandler(conn *websocket.Conn) {
 	msgChan := make(chan byte, 1000)
 
 	// Goroutine to handle the blocking ReceiveBinaryString
@@ -235,7 +248,7 @@ func (c *WsTransport) channelHandler() {
 				return
 
 			default:
-				_, msg, err := c.controlChannel.ReadMessage()
+				_, msg, err := conn.ReadMessage()
 				if err != nil {
 					if c.cancel != nil {
 						c.logger.Error("failed to read from channel connection. ", err)
@@ -258,7 +271,7 @@ func (c *WsTransport) channelHandler() {
 	for {
 		select {
 		case <-c.ctx.Done():
-			_ = c.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_Closed})
+			_ = conn.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_Closed})
 			return
 
 		case msg := <-msgChan:
@@ -276,7 +289,7 @@ func (c *WsTransport) channelHandler() {
 			case utils.SG_HB:
 				c.logger.Debug("heartbeat signal received successfully")
 				// send heartbeat back
-				err := c.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_HB})
+				err := conn.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_HB})
 				if err != nil {
 					c.logger.Errorf("failed to send heartbeat: %v", msg)
 					go c.Restart()

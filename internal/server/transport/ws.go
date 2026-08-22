@@ -31,9 +31,15 @@ type WsTransport struct {
 	localChannel   chan LocalTCPConn
 	reqNewConnChan chan struct{}
 	controlChannel *websocket.Conn
-	restartMutex   sync.Mutex
-	usageMonitor   *web.Usage
-	fallbackProxy  http.Handler
+	// controlMu guards controlChannel. The HTTP handler installs it, the
+	// channel handler reads it on every heartbeat and Restart clears it, all
+	// from different goroutines - unsynchronized that is a data race, and
+	// Restart nilling the pointer while the handler dereferences it is a
+	// crash.
+	controlMu     sync.Mutex
+	restartMutex  sync.Mutex
+	usageMonitor  *web.Usage
+	fallbackProxy http.Handler
 }
 
 type WsConfig struct {
@@ -115,9 +121,12 @@ func (s *WsTransport) Restart() {
 	}
 
 	// Close control channel connection
+	s.controlMu.Lock()
 	if s.controlChannel != nil {
 		s.controlChannel.Close()
 	}
+	s.controlChannel = nil
+	s.controlMu.Unlock()
 
 	time.Sleep(2 * time.Second)
 
@@ -129,7 +138,6 @@ func (s *WsTransport) Restart() {
 	s.tunnelChannel = make(chan TunnelChannel, s.config.ChannelSize)
 	s.localChannel = make(chan LocalTCPConn, s.config.ChannelSize)
 	s.reqNewConnChan = make(chan struct{}, s.config.ChannelSize)
-	s.controlChannel = nil
 	s.usageMonitor = web.NewDataStore(fmt.Sprintf(":%v", s.config.WebPort), ctx, s.config.SnifferLog, s.config.Sniffer, &s.config.TunnelStatus, s.logger)
 	s.config.TunnelStatus = ""
 
@@ -139,7 +147,11 @@ func (s *WsTransport) Restart() {
 	go s.Start()
 }
 
-func (s *WsTransport) channelHandler() {
+// channelHandler drives one control channel. It takes the connection as an
+// argument rather than reading s.controlChannel on every use: the field is
+// shared with the HTTP handler and Restart, so a handler whose connection has
+// died must not touch a pointer that by then may hold something else.
+func (s *WsTransport) channelHandler(conn *websocket.Conn) {
 	ticker := time.NewTicker(s.config.Heartbeat)
 	defer ticker.Stop()
 
@@ -154,7 +166,7 @@ func (s *WsTransport) channelHandler() {
 				return
 
 			default:
-				_, msg, err := s.controlChannel.ReadMessage()
+				_, msg, err := conn.ReadMessage()
 				// Exit if there's an error
 				if err != nil {
 					if s.cancel != nil {
@@ -176,10 +188,10 @@ func (s *WsTransport) channelHandler() {
 	for {
 		select {
 		case <-s.ctx.Done():
-			_ = s.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_Closed})
+			_ = conn.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_Closed})
 			return
 		case <-s.reqNewConnChan:
-			err := s.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_Chan})
+			err := conn.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_Chan})
 			if err != nil {
 				s.logger.Error("failed to send request new connection signal. ", err)
 				go s.Restart()
@@ -187,7 +199,7 @@ func (s *WsTransport) channelHandler() {
 			}
 
 		case <-ticker.C:
-			err := s.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_HB})
+			err := conn.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_HB})
 			if err != nil {
 				s.logger.Errorf("failed to send heartbeat signal. Error: %v.", err)
 				go s.Restart()
@@ -272,14 +284,17 @@ func (s *WsTransport) tunnelListener() {
 			}
 
 			if r.URL.Path == channelPath {
-				if s.controlChannel != nil {
+				s.controlMu.Lock()
+				if old := s.controlChannel; old != nil {
+					s.controlMu.Unlock()
 					s.logger.Warn("new control channel requested.")
-					s.controlChannel.Close()
+					old.Close()
 					conn.Close()
 					go s.Restart()
 					return
 				}
 				s.controlChannel = conn
+				s.controlMu.Unlock()
 
 				s.logger.Info("control channel established successfully")
 
@@ -288,7 +303,7 @@ func (s *WsTransport) tunnelListener() {
 					numCPU = 4 // Max allowed handler is 4
 				}
 
-				go s.channelHandler()
+				go s.channelHandler(conn)
 				go s.parsePortMappings()
 
 				s.logger.Infof("starting %d handle loops on each CPU thread", numCPU)
@@ -320,9 +335,7 @@ func (s *WsTransport) tunnelListener() {
 	if s.config.Mode == config.WS {
 		go func() {
 			s.logger.Infof("ws server starting, listening on %s", addr)
-			if s.controlChannel == nil {
-				s.logger.Info("waiting for ws control channel connection")
-			}
+			s.logger.Info("waiting for ws control channel connection")
 			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				s.logger.Fatalf("failed to listen on %s: %v", addr, err)
 			}
@@ -334,9 +347,7 @@ func (s *WsTransport) tunnelListener() {
 				engine = network.TLSEngineGo
 			}
 			s.logger.Infof("wss server starting, listening on %s (tls engine: %s)", addr, engine)
-			if s.controlChannel == nil {
-				s.logger.Info("waiting for wss control channel connection")
-			}
+			s.logger.Info("waiting for wss control channel connection")
 			certs, keys := network.ResolveCertPairs(s.config.TLSCertFile, s.config.TLSKeyFile, s.config.TLSCerts, s.config.TLSKeys)
 			ln, err := network.NewTLSListener(s.config.TLSEngine, addr, certs, keys)
 			if err != nil {
@@ -356,10 +367,11 @@ func (s *WsTransport) tunnelListener() {
 		s.logger.Errorf("Failed to gracefully shutdown the server: %v", err)
 	}
 
+	s.controlMu.Lock()
 	if s.controlChannel != nil {
 		s.controlChannel.Close()
 	}
-
+	s.controlMu.Unlock()
 }
 
 func (s *WsTransport) parsePortMappings() {
