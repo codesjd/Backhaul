@@ -11,7 +11,7 @@ const ( // Default values
 	// authenticate any tokenless deployment with a value that is public in this
 	// repo, turning it into an open relay attributable to the host. A token must
 	// be configured explicitly (enforced in cmd.Run).
-	defaultChannelSize = 2048
+	defaultChannelSize    = 2048
 	defaultRetryInterval  = 3 // only for client
 	defaultConnectionPool = 8
 	defaultLogLevel       = "info"
@@ -127,6 +127,13 @@ func applyDefaults(cfg *config.Config) {
 	// Mux concurrancy
 	if cfg.Server.MuxCon < 1 {
 		cfg.Server.MuxCon = defaultMuxCon
+	}
+
+	// Connection rotation age stays off unless set: it has to sit below the
+	// max age of whatever CDN/LB fronts the server, and a guessed value just
+	// churns connections for nothing.
+	if cfg.Server.MaxConnAge < 0 {
+		cfg.Server.MaxConnAge = 0
 	}
 
 	// Stripe factor - how many pooled connections a single flow is split

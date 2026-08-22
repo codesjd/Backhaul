@@ -143,6 +143,7 @@ func (s *Server) Start() {
 			Path:                 s.config.Path,
 			Fallback:             s.config.Fallback,
 			TLSEngine:            s.config.TLSEngine,
+			MaxConnAge:           time.Duration(s.config.MaxConnAge) * time.Second,
 		}
 
 		wsMuxServer := transport.NewWSMuxServer(s.ctx, wsMuxConfig, s.logger)

@@ -23,13 +23,17 @@ import (
 )
 
 type WsMuxTransport struct {
-	config          *WsMuxConfig
-	smuxConfig      *smux.Config
-	parentctx       context.Context
-	ctx             context.Context
-	cancel          context.CancelFunc
-	logger          *logrus.Logger
-	controlChannel  *websocket.Conn
+	config         *WsMuxConfig
+	smuxConfig     *smux.Config
+	parentctx      context.Context
+	ctx            context.Context
+	cancel         context.CancelFunc
+	logger         *logrus.Logger
+	controlChannel *websocket.Conn
+	// controlMu guards controlChannel: it is now swapped in place on a
+	// reconnect, so the dialer, a dying channelHandler and Restart can all
+	// touch it at once.
+	controlMu       sync.Mutex
 	usageMonitor    *web.Usage
 	restartMutex    sync.Mutex
 	poolConnections int32
@@ -190,9 +194,12 @@ func (c *WsMuxTransport) Restart() {
 	}
 
 	// close control channel connection
+	c.controlMu.Lock()
 	if c.controlChannel != nil {
 		c.controlChannel.Close()
 	}
+	c.controlChannel = nil
+	c.controlMu.Unlock()
 
 	time.Sleep(2 * time.Second)
 
@@ -201,7 +208,6 @@ func (c *WsMuxTransport) Restart() {
 	c.cancel = cancel
 
 	// Re-initialize variables
-	c.controlChannel = nil
 	c.usageMonitor = web.NewDataStore(fmt.Sprintf(":%v", c.config.WebPort), ctx, c.config.SnifferLog, c.config.Sniffer, &c.config.TunnelStatus, c.logger)
 	c.config.TunnelStatus = ""
 	c.poolConnections = 0
@@ -242,13 +248,15 @@ func (c *WsMuxTransport) channelDialer() {
 				time.Sleep(c.config.RetryInterval)
 				continue
 			}
+			c.controlMu.Lock()
 			c.controlChannel = tunnelWSConn
+			c.controlMu.Unlock()
 			c.logger.Info("control channel established successfully")
 
 			c.config.TunnelStatus = fmt.Sprintf("Connected (%s)", c.config.Mode)
 
 			go c.poolMaintainer()
-			go c.channelHandler()
+			go c.channelHandler(tunnelWSConn)
 
 			return
 		}
@@ -331,7 +339,11 @@ func (c *WsMuxTransport) poolMaintainer() {
 
 }
 
-func (c *WsMuxTransport) channelHandler() {
+// channelHandler drives one control channel. It takes the connection as an
+// argument rather than reading c.controlChannel on every use: a handler whose
+// connection has died must not touch the shared pointer that by then may hold
+// its replacement.
+func (c *WsMuxTransport) channelHandler(conn *websocket.Conn) {
 	msgChan := make(chan byte, 1000)
 
 	// Goroutine to handle the blocking ReceiveBinaryString
@@ -342,12 +354,13 @@ func (c *WsMuxTransport) channelHandler() {
 				return
 
 			default:
-				_, msg, err := c.controlChannel.ReadMessage()
+				_, msg, err := conn.ReadMessage()
 				if err != nil {
-					if c.cancel != nil {
-						c.logger.Error("failed to read from channel connection. ", err)
-						go c.Restart()
-					}
+					c.logger.Warn("control channel read failed. ", err)
+					// Not fatal: the control channel carries only heartbeats
+					// and new-connection requests, so it is re-dialled without
+					// touching the pool or the flows running on it.
+					go c.reconnectControl(conn)
 					return
 				}
 				// A zero-length binary frame (or padding-only payload) would
@@ -363,7 +376,7 @@ func (c *WsMuxTransport) channelHandler() {
 	for {
 		select {
 		case <-c.ctx.Done():
-			_ = utils.WriteControlSignal(c.controlChannel, utils.SG_Closed)
+			_ = utils.WriteControlSignal(conn, utils.SG_Closed)
 			return
 
 		case msg := <-msgChan:
@@ -380,10 +393,10 @@ func (c *WsMuxTransport) channelHandler() {
 
 			case utils.SG_HB:
 				c.logger.Debug("heartbeat received successfully")
-				err := utils.WriteControlSignal(c.controlChannel, utils.SG_HB)
+				err := utils.WriteControlSignal(conn, utils.SG_HB)
 				if err != nil {
-					c.logger.Errorf("failed to send heartbeat: %v", msg)
-					go c.Restart()
+					c.logger.Warnf("failed to send heartbeat: %v", err)
+					go c.reconnectControl(conn)
 					return
 				}
 				c.logger.Trace("heartbeat signal sent successfully")
@@ -399,6 +412,78 @@ func (c *WsMuxTransport) channelHandler() {
 				return
 			}
 
+		}
+	}
+}
+
+// controlReconnectWindow bounds how long a dropped control channel is re-dialled
+// while the pool is kept alive. It matches the server's grace window: past that
+// the server gives up on the reattach and rebuilds its own side anyway, so there
+// is nothing left to preserve and a full restart is the honest fallback.
+const controlReconnectWindow = 30 * time.Second
+
+// reconnectControl re-dials the control channel after it dropped, deliberately
+// without cancelling ctx. The pool connections and every flow on them are
+// independent of the control channel, which carries nothing but heartbeats and
+// new-connection requests - so a CDN resetting the control connection (the
+// oldest, longest-lived one, and therefore the first to hit a max-age limit)
+// becomes a brief pause in *new* connection setup instead of a dropped tunnel.
+//
+// Restart, which tears everything down, stays as the fallback for a control
+// channel that cannot be re-established at all.
+func (c *WsMuxTransport) reconnectControl(old *websocket.Conn) {
+	c.controlMu.Lock()
+	if c.controlChannel != old {
+		// Another goroutine already handled this drop, or a restart is under way.
+		c.controlMu.Unlock()
+		return
+	}
+	c.controlChannel = nil
+	c.controlMu.Unlock()
+	old.Close()
+
+	c.config.TunnelStatus = fmt.Sprintf("Reconnecting (%s)", c.config.Mode)
+	c.logger.Warn("control channel dropped, re-dialing without tearing down the pool")
+
+	deadline := time.Now().Add(controlReconnectWindow)
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		default:
+		}
+
+		// retry=1: the dialer's own retry loop would spend most of the window
+		// backing off against one endpoint, and each failure is worth logging.
+		ep := c.nextEndpoint()
+		conn, err := network.WebSocketDialer(c.ctx, ep.addr, ep.edgeIP, network.NormalizeBasePath(c.config.Path)+"/channel", c.config.DialTimeOut, c.config.KeepAlive, true, c.config.Token, c.userAgent, c.config.Mode, 1, 0, 0, 0, c.config.TLSVerify)
+		if err == nil {
+			c.controlMu.Lock()
+			c.controlChannel = conn
+			c.controlMu.Unlock()
+
+			c.config.TunnelStatus = fmt.Sprintf("Connected (%s)", c.config.Mode)
+			c.logger.Info("control channel re-established, pool preserved")
+
+			// Only the handler restarts here - poolMaintainer is still running
+			// under the same context and starting a second one would double the
+			// pool management.
+			go c.channelHandler(conn)
+			return
+		}
+
+		c.logger.Errorf("control channel re-dial: %v", err)
+
+		if time.Now().After(deadline) {
+			c.logger.Warn("control channel could not be re-established within the grace window, falling back to a full restart")
+			c.Restart()
+			return
+		}
+
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-time.After(c.config.RetryInterval):
 		}
 	}
 }
