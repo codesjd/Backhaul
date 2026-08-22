@@ -43,26 +43,26 @@ type WsTransport struct {
 }
 
 type WsConfig struct {
-	BindAddr     string
-	SnifferLog   string
-	TLSCertFile  string   // Path to the TLS certificate file
-	TLSKeyFile   string   // Path to the TLS key file
-	TLSCerts     []string // Optional: multiple cert files for SNI (multi-domain)
-	TLSKeys      []string // Optional: key files aligned with TLSCerts
-	TunnelStatus string
-	Token        string
-	Ports        []string
+	BindAddr      string
+	SnifferLog    string
+	TLSCertFile   string   // Path to the TLS certificate file
+	TLSKeyFile    string   // Path to the TLS key file
+	TLSCerts      []string // Optional: multiple cert files for SNI (multi-domain)
+	TLSKeys       []string // Optional: key files aligned with TLSCerts
+	TunnelStatus  string
+	Token         string
+	Ports         []string
 	Nodelay       bool
 	Sniffer       bool
 	ProxyProtocol bool
-	KeepAlive    time.Duration
-	Heartbeat    time.Duration // in seconds
-	ChannelSize  int
-	WebPort      int
-	Mode         config.TransportType // ws or wss
-	Path         string
-	Fallback     string // decoy backend for non-tunnel requests (host:port), optional
-	TLSEngine    string // "go" (default) or "openssl" for wss TLS termination
+	KeepAlive     time.Duration
+	Heartbeat     time.Duration // in seconds
+	ChannelSize   int
+	WebPort       int
+	Mode          config.TransportType // ws or wss
+	Path          string
+	Fallback      string // decoy backend for non-tunnel requests (host:port), optional
+	TLSEngine     string // "go" (default) or "openssl" for wss TLS termination
 }
 
 func NewWSServer(parentCtx context.Context, config *WsConfig, logger *logrus.Logger) *WsTransport {
@@ -153,8 +153,11 @@ func (s *WsTransport) Restart() {
 // shared with the HTTP handler and Restart, so a handler whose connection has
 // died must not touch a pointer that by then may hold something else.
 func (s *WsTransport) channelHandler(conn *websocket.Conn) {
-	ticker := time.NewTicker(s.config.Heartbeat)
-	defer ticker.Stop()
+	// A jittered timer (instead of a fixed-period ticker) so the heartbeat
+	// cadence isn't perfectly periodic, which is an easy fingerprint for
+	// traffic-pattern based DPI. wsmux/wssmux already do this.
+	heartbeatTimer := time.NewTimer(utils.JitterDuration(s.config.Heartbeat))
+	defer heartbeatTimer.Stop()
 
 	// Channel to receive the message or error
 	messageChan := make(chan byte, 10)
@@ -189,24 +192,25 @@ func (s *WsTransport) channelHandler(conn *websocket.Conn) {
 	for {
 		select {
 		case <-s.ctx.Done():
-			_ = conn.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_Closed})
+			_ = utils.WriteControlSignal(conn, utils.SG_Closed)
 			return
 		case <-s.reqNewConnChan:
-			err := conn.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_Chan})
+			err := utils.WriteControlSignal(conn, utils.SG_Chan)
 			if err != nil {
 				s.logger.Error("failed to send request new connection signal. ", err)
 				go s.Restart()
 				return
 			}
 
-		case <-ticker.C:
-			err := conn.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_HB})
+		case <-heartbeatTimer.C:
+			err := utils.WriteControlSignal(conn, utils.SG_HB)
 			if err != nil {
 				s.logger.Errorf("failed to send heartbeat signal. Error: %v.", err)
 				go s.Restart()
 				return
 			}
 			s.logger.Debug("heartbeat signal sent successfully")
+			heartbeatTimer.Reset(utils.JitterDuration(s.config.Heartbeat))
 
 		case msg, ok := <-messageChan:
 			if !ok {
@@ -579,9 +583,13 @@ func (s *WsTransport) handleLoop() {
 }
 
 func (s *WsTransport) keepAlive(conn *TunnelChannel) {
-	ticker := time.NewTicker(s.config.Heartbeat) // Send periodic pings to the client
+	// Jittered like the control channel heartbeat: a pool of idle connections
+	// all pinging on the same fixed period is a strong traffic fingerprint. The
+	// payload deliberately stays a bare SG_Ping byte - clients match this frame
+	// exactly, so padding it would break every client older than this change.
+	pingTimer := time.NewTimer(utils.JitterDuration(s.config.Heartbeat))
 
-	defer ticker.Stop()
+	defer pingTimer.Stop()
 
 	for {
 		select {
@@ -591,7 +599,9 @@ func (s *WsTransport) keepAlive(conn *TunnelChannel) {
 		case <-conn.ping:
 			s.logger.Trace("ping channel closed")
 			return
-		case <-ticker.C:
+		case <-pingTimer.C:
+			pingTimer.Reset(utils.JitterDuration(s.config.Heartbeat))
+
 			// Try to acquire the lock without blocking
 			locked := conn.mu.TryLock()
 			if !locked {

@@ -1,7 +1,6 @@
 package transport
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"math/rand"
@@ -284,7 +283,7 @@ func (c *WsTransport) channelHandler(conn *websocket.Conn) {
 	for {
 		select {
 		case <-c.ctx.Done():
-			_ = conn.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_Closed})
+			_ = utils.WriteControlSignal(conn, utils.SG_Closed)
 			return
 
 		case msg := <-msgChan:
@@ -302,7 +301,7 @@ func (c *WsTransport) channelHandler(conn *websocket.Conn) {
 			case utils.SG_HB:
 				c.logger.Debug("heartbeat signal received successfully")
 				// send heartbeat back
-				err := conn.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_HB})
+				err := utils.WriteControlSignal(conn, utils.SG_HB)
 				if err != nil {
 					c.logger.Errorf("failed to send heartbeat: %v", err)
 					go c.Restart()
@@ -354,7 +353,7 @@ func (c *WsTransport) tunnelDialer() {
 				return
 			}
 
-			if bytes.Equal(remoteAddrBytes, []byte{utils.SG_Ping}) {
+			if len(remoteAddrBytes) > 0 && remoteAddrBytes[0] == utils.SG_Ping {
 				c.logger.Trace("ping received from the server")
 				continue
 			}
