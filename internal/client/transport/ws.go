@@ -291,7 +291,7 @@ func (c *WsTransport) channelHandler(conn *websocket.Conn) {
 				// send heartbeat back
 				err := conn.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_HB})
 				if err != nil {
-					c.logger.Errorf("failed to send heartbeat: %v", msg)
+					c.logger.Errorf("failed to send heartbeat: %v", err)
 					go c.Restart()
 					return
 				}
