@@ -41,7 +41,30 @@ type onlyWriter struct {
 // socket with unread data that full close is an RST, which discards the
 // buffered tail: the same silent reply truncation that TCPConnectionHandler was
 // fixed for, still live on ws/wss because this handler never got the fix.
-func WSConnectionHandler(ctx context.Context, wsConn *websocket.Conn, tcpConn net.Conn, logger *logrus.Logger, usage *web.Usage, remotePort int, sniffer bool) {
+func WSConnectionHandler(ctx context.Context, proxyProtocol bool, wsConn *websocket.Conn, tcpConn net.Conn, logger *logrus.Logger, usage *web.Usage, remotePort int, sniffer bool) {
+	// Write Proxy Protocol V2 Header. proxy_protocol was accepted and silently
+	// ignored on ws/wss - the local service saw the tunnel's address as the
+	// client's on every request, which for anything doing per-IP rate limiting,
+	// geo, or audit logging is worse than the option not existing.
+	if proxyProtocol {
+		header, err := ProxyProtocolHeader(tcpConn.RemoteAddr(), wsConn.RemoteAddr())
+		if err != nil {
+			logger.Error(err)
+			wsConn.Close()
+			tcpConn.Close()
+			return
+		}
+		// Sent as a frame rather than written to the socket: the peer reads this
+		// leg with NextReader, so a raw write would land mid-frame and corrupt
+		// the stream.
+		if err := wsConn.WriteMessage(websocket.BinaryMessage, header); err != nil {
+			logger.Errorf("failed to send Proxy Protocol v2 header: %v", err)
+			wsConn.Close()
+			tcpConn.Close()
+			return
+		}
+	}
+
 	done := make(chan struct{})
 
 	// Close both ends as soon as the transport context is cancelled (e.g. on a

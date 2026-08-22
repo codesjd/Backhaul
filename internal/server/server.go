@@ -107,9 +107,10 @@ func (s *Server) Start() {
 			TLSKeyFile:  s.config.TLSKeyFile,
 			TLSCerts:    s.config.TLSCerts,
 			TLSKeys:     s.config.TLSKeys,
-			Path:        s.config.Path,
-			Fallback:    s.config.Fallback,
-			TLSEngine:   s.config.TLSEngine,
+			Path:          s.config.Path,
+			Fallback:      s.config.Fallback,
+			TLSEngine:     s.config.TLSEngine,
+			ProxyProtocol: s.config.ProxyProtocol,
 		}
 
 		wsServer := transport.NewWSServer(s.ctx, wsConfig, s.logger)

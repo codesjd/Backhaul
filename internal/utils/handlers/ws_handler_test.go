@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"io"
 	"net"
 	"net/http"
@@ -80,7 +81,7 @@ func TestWSConnectionHandlerHalfCloseKeepsReplyIntact(t *testing.T) {
 	clientDone := make(chan struct{})
 	go func() {
 		defer close(clientDone)
-		WSConnectionHandler(context.Background(), wsClient, localConn, testLogger(), clientUsage, 5555, true)
+		WSConnectionHandler(context.Background(), false, wsClient, localConn, testLogger(), clientUsage, 5555, true)
 	}()
 
 	// Server side of the tunnel: the user's connection <-> ws leg.
@@ -108,7 +109,7 @@ func TestWSConnectionHandlerHalfCloseKeepsReplyIntact(t *testing.T) {
 	serverDone := make(chan struct{})
 	go func() {
 		defer close(serverDone)
-		WSConnectionHandler(context.Background(), wsServer, accepted, testLogger(), serverUsage, 6666, true)
+		WSConnectionHandler(context.Background(), false, wsServer, accepted, testLogger(), serverUsage, 6666, true)
 	}()
 
 	// Drive the user side: upload, half-close, then read the reply to EOF.
@@ -168,7 +169,7 @@ func TestWSConnectionHandlerReturnsWhenTunnelDies(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		WSConnectionHandler(context.Background(), wsClient, local, testLogger(), usage, 1234, false)
+		WSConnectionHandler(context.Background(), false, wsClient, local, testLogger(), usage, 1234, false)
 	}()
 
 	wsServer.Close()
@@ -192,7 +193,7 @@ func TestWSConnectionHandlerReturnsOnContextCancel(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		WSConnectionHandler(ctx, wsClient, local, testLogger(), usage, 1234, false)
+		WSConnectionHandler(ctx, false, wsClient, local, testLogger(), usage, 1234, false)
 	}()
 
 	cancel()
@@ -201,5 +202,71 @@ func TestWSConnectionHandlerReturnsOnContextCancel(t *testing.T) {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("handler did not return after the context was cancelled")
+	}
+}
+
+// TestWSConnectionHandlerWritesProxyProtocol pins the ws/wss side of
+// proxy_protocol: the option used to be accepted and silently ignored here, so
+// the local service saw the tunnel's own address as every client's.
+//
+// The header has to arrive as its own frame - the peer reads this leg with
+// NextReader, so a raw socket write would land mid-frame and desync the stream.
+func TestWSConnectionHandlerWritesProxyProtocol(t *testing.T) {
+	payload := []byte("hello from the user")
+
+	wsClient, wsServer := wsPair(t)
+
+	userLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer userLn.Close()
+
+	acceptedCh := make(chan net.Conn, 1)
+	go func() {
+		if conn, err := userLn.Accept(); err == nil {
+			acceptedCh <- conn
+		}
+	}()
+
+	userConn, err := net.Dial("tcp", userLn.Addr().String())
+	if err != nil {
+		t.Fatalf("dial user listener: %v", err)
+	}
+	defer userConn.Close()
+	accepted := <-acceptedCh
+
+	go WSConnectionHandler(context.Background(), true, wsServer, accepted, testLogger(), testUsage(t), 6666, false)
+
+	if err := wsClient.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+
+	_, header, err := wsClient.ReadMessage()
+	if err != nil {
+		t.Fatalf("read proxy protocol header: %v", err)
+	}
+
+	magic := []byte{0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a}
+	if len(header) != 28 || !bytes.HasPrefix(header, magic) {
+		t.Fatalf("first frame is not a v2 header: % x", header)
+	}
+	// src port sits after magic(12) + ver/cmd(1) + family(1) + len(2) + addrs(8).
+	gotPort := int(binary.BigEndian.Uint16(header[24:26]))
+	wantPort := userConn.LocalAddr().(*net.TCPAddr).Port
+	if gotPort != wantPort {
+		t.Fatalf("header source port %d, want the user's own port %d", gotPort, wantPort)
+	}
+
+	// ...and the data still follows it intact.
+	if _, err := userConn.Write(payload); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+	_, got, err := wsClient.ReadMessage()
+	if err != nil {
+		t.Fatalf("read payload: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("payload after the header is %q, want %q", got, payload)
 	}
 }

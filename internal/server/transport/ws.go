@@ -52,8 +52,9 @@ type WsConfig struct {
 	TunnelStatus string
 	Token        string
 	Ports        []string
-	Nodelay      bool
-	Sniffer      bool
+	Nodelay       bool
+	Sniffer       bool
+	ProxyProtocol bool
 	KeepAlive    time.Duration
 	Heartbeat    time.Duration // in seconds
 	ChannelSize  int
@@ -569,7 +570,7 @@ func (s *WsTransport) handleLoop() {
 						continue loop
 					}
 					// Handle data exchange between connections
-					go handlers.WSConnectionHandler(s.ctx, tunnelConnection.conn, localConn.conn, s.logger, s.usageMonitor, localConn.conn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
+					go handlers.WSConnectionHandler(s.ctx, s.config.ProxyProtocol, tunnelConnection.conn, localConn.conn, s.logger, s.usageMonitor, localConn.conn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
 					break loop
 				}
 			}
