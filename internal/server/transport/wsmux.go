@@ -402,13 +402,20 @@ func (s *WsMuxTransport) tunnelListener() {
 
 			if r.URL.Path == channelPath {
 				s.controlMu.Lock()
+				// A control channel arriving while one is still registered is
+				// not a second client - it is the same client reattaching after
+				// a drop this side has not noticed yet. A one-way reset (the
+				// common CDN failure) leaves the server's read blocked and
+				// controlChannel non-nil, so the client re-dials before
+				// onControlLost ever runs. Restarting here would tear down the
+				// pool and every flow on it, which is exactly what the reattach
+				// path exists to avoid, so adopt the new connection and drop the
+				// stale one. Its handler exits by itself: onControlLost bails
+				// out when controlChannel is no longer the conn it was called
+				// for.
 				if old := s.controlChannel; old != nil {
-					s.controlMu.Unlock()
-					s.logger.Warn("new control channel requested.")
+					s.logger.Warn("control channel replaced while the previous one was still registered")
 					old.Close()
-					conn.Close()
-					go s.Restart()
-					return
 				}
 				// The first control channel starts the pool machinery. One
 				// arriving after a drop is a reattach: the handle loops, port
