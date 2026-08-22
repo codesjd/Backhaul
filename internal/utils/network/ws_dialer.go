@@ -36,8 +36,16 @@ func WebSocketDialer(ctx context.Context, addr string, edgeIP string, path strin
 			break
 		}
 
-		// Log the retry attempt and wait before retrying
-		time.Sleep(backoff)
+		// Wait before retrying, but abandon the wait if the transport is
+		// already shutting down. An unconditional Sleep here held a restart for
+		// up to 1+2=3 seconds per in-flight dial (longer with a higher retry
+		// count), and every pool connection dialing at once meant a restart
+		// waited on all of them.
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoff):
+		}
 		backoff *= 2 // Exponential backoff (double the wait time after each failure)
 	}
 
