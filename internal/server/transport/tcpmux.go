@@ -317,10 +317,9 @@ func (s *TcpMuxTransport) acceptTunnelConn(listener net.Listener) {
 			return
 		default:
 			s.logger.Debugf("waiting for accept incoming tunnel connection on %s", listener.Addr().String())
-			conn, err := listener.Accept()
-			if err != nil {
-				s.logger.Debugf("failed to accept tunnel connection on %s: %v", listener.Addr().String(), err)
-				continue
+			conn := acceptWithBackoff(s.ctx, listener, s.logger)
+			if conn == nil {
+				return
 			}
 
 			//discard any non tcp connection
@@ -501,10 +500,9 @@ func (s *TcpMuxTransport) acceptLocalConn(listener net.Listener, remoteAddr stri
 			return
 
 		default:
-			conn, err := listener.Accept()
-			if err != nil {
-				s.logger.Debugf("failed to accept connection on %s: %v", listener.Addr().String(), err)
-				continue
+			conn := acceptWithBackoff(s.ctx, listener, s.logger)
+			if conn == nil {
+				return
 			}
 
 			// discard any non-tcp connection

@@ -134,10 +134,9 @@ loop:
 		case <-s.ctx.Done():
 			return
 		default:
-			conn, err := listener.Accept()
-			if err != nil {
-				s.logger.Debugf("failed to accept control channel connection on %s: %v", listener.Addr().String(), err)
-				continue
+			conn := acceptWithBackoff(s.ctx, listener, s.logger)
+			if conn == nil {
+				return
 			}
 
 			// Set a read deadline for the token response

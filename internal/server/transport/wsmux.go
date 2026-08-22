@@ -642,10 +642,9 @@ func (s *WsMuxTransport) acceptLocalConn(listener net.Listener, remoteAddr strin
 			return
 
 		default:
-			conn, err := listener.Accept()
-			if err != nil {
-				s.logger.Debugf("failed to accept connection on %s: %v", listener.Addr().String(), err)
-				continue
+			conn := acceptWithBackoff(s.ctx, listener, s.logger)
+			if conn == nil {
+				return
 			}
 
 			// discard any non-tcp connection
