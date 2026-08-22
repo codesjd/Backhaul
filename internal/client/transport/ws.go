@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math/rand"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -169,8 +170,20 @@ func (c *WsTransport) channelDialer() {
 }
 
 func (c *WsTransport) poolMaintainer() {
+	// Stagger the initial pool fill instead of firing every dial at once - a
+	// burst of ConnPoolSize near-simultaneous handshakes to the same host is a
+	// distinctive connection pattern real browser traffic doesn't produce, and
+	// a CDN that rate-limits the burst fails the whole pool at once instead of
+	// one connection. Same stagger wsmux/wssmux already use.
 	for i := 0; i < c.config.ConnPoolSize; i++ { //initial pool filling
 		go c.tunnelDialer()
+		if i < c.config.ConnPoolSize-1 {
+			select {
+			case <-c.ctx.Done():
+				return
+			case <-time.After(time.Duration(50+rand.Intn(200)) * time.Millisecond):
+			}
+		}
 	}
 
 	// factors
