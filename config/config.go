@@ -31,6 +31,7 @@ type ServerConfig struct {
 	MaxStreamBuffer      int           `toml:"mux_streambuffer"`
 	MuxKeepaliveDisabled bool          `toml:"mux_keepalive_disabled"`
 	StripeFactor         int           `toml:"mux_stripe"`
+	StripeParity         int           `toml:"mux_stripe_parity"` // Reed-Solomon parity legs added on top of mux_stripe (0 disables FEC); tolerates that many pool legs dying mid-flow without losing the flow. Only meaningful with mux_stripe > 1.
 	Sniffer              bool          `toml:"sniffer"`
 	WebPort              int           `toml:"web_port"`
 	SnifferLog           string        `toml:"sniffer_log"`
@@ -72,6 +73,7 @@ type ClientConfig struct {
 	MaxStreamBuffer      int           `toml:"mux_streambuffer"`
 	MuxKeepaliveDisabled bool          `toml:"mux_keepalive_disabled"`
 	StripeFactor         int           `toml:"mux_stripe"`
+	StripeParity         int           `toml:"mux_stripe_parity"` // Reed-Solomon parity legs added on top of mux_stripe (0 disables FEC); tolerates that many pool legs dying mid-flow without losing the flow. Only meaningful with mux_stripe > 1.
 	Sniffer              bool          `toml:"sniffer"`
 	WebPort              int           `toml:"web_port"`
 	SnifferLog           string        `toml:"sniffer_log"`

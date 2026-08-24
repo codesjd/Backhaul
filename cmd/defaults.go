@@ -145,4 +145,14 @@ func applyDefaults(cfg *config.Config) {
 	if cfg.Client.StripeFactor < 1 {
 		cfg.Client.StripeFactor = defaultMuxStripe
 	}
+
+	// Stripe parity - Reed-Solomon parity legs added on top of the stripe
+	// factor. 0 (the default) disables FEC entirely; a negative value is
+	// just a stray config typo, not "disable more than disabled".
+	if cfg.Server.StripeParity < 0 {
+		cfg.Server.StripeParity = 0
+	}
+	if cfg.Client.StripeParity < 0 {
+		cfg.Client.StripeParity = 0
+	}
 }
