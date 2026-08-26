@@ -117,10 +117,10 @@ func (c *Client) Start() {
 			SO_RCVBUF:      c.config.SO_RCVBUF,
 			SO_SNDBUF:      c.config.SO_SNDBUF,
 			MSS:            c.config.MSS,
-			TLSVerify:      c.config.TLSVerify,
+			TLSVerify:      *c.config.TLSVerify,
 		}
-		if c.config.Transport == config.WSS && !c.config.TLSVerify {
-			c.logger.Warn("SECURITY: wss server certificate verification is OFF (tls_verify=false); the auth token can be harvested by an on-path party via TLS MITM. Set tls_verify=true once the server presents a verifiable certificate.")
+		if c.config.Transport == config.WSS && !*c.config.TLSVerify {
+			c.logger.Warn("SECURITY: wss server certificate verification is OFF (tls_verify=false); the auth token can be harvested by an on-path party via TLS MITM.")
 		}
 		WsClient := transport.NewWSClient(c.ctx, WsConfig, c.logger)
 		go WsClient.Start()
@@ -152,10 +152,10 @@ func (c *Client) Start() {
 			AggressivePool:       c.config.AggressivePool,
 			EdgeIP:               c.config.EdgeIP,
 			Path:                 c.config.Path,
-			TLSVerify:            c.config.TLSVerify,
+			TLSVerify:            *c.config.TLSVerify,
 		}
-		if c.config.Transport == config.WSSMUX && !c.config.TLSVerify {
-			c.logger.Warn("SECURITY: wssmux server certificate verification is OFF (tls_verify=false); the auth token can be harvested by an on-path party via TLS MITM. Set tls_verify=true once the server presents a verifiable certificate.")
+		if c.config.Transport == config.WSSMUX && !*c.config.TLSVerify {
+			c.logger.Warn("SECURITY: wssmux server certificate verification is OFF (tls_verify=false); the auth token can be harvested by an on-path party via TLS MITM.")
 		}
 		wsMuxClient := transport.NewWSMuxClient(c.ctx, wsMuxConfig, c.logger)
 		go wsMuxClient.Start()

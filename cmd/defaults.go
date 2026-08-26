@@ -145,4 +145,10 @@ func applyDefaults(cfg *config.Config) {
 	if cfg.Client.StripeFactor < 1 {
 		cfg.Client.StripeFactor = defaultMuxStripe
 	}
+
+	// TLS verify
+	if cfg.Client.TLSVerify == nil {
+		t := true
+		cfg.Client.TLSVerify = &t
+	}
 }
