@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"io"
 	"net"
 	"sync"
@@ -196,4 +197,141 @@ func TestTCPConnectionHandlerNonTCPLeg(t *testing.T) {
 func portUsageTotal(u *web.Usage, port int) uint64 {
 	total, _ := u.GetPortUsage(port)
 	return total
+}
+
+// TestTCPConnectionHandlerWritesProxyProtocol verifies that TCPConnectionHandler
+// writes a correct Proxy Protocol v2 header when the proxyProtocol flag is true.
+func TestTCPConnectionHandlerWritesProxyProtocol(t *testing.T) {
+	upPayload := []byte("hello from the user via TCP")
+	downPayload := []byte("hello from the target via TCP")
+	remotePort := 4243
+
+	// 1. Set up a target listener to act as the destination server.
+	targetLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen target: %v", err)
+	}
+	defer targetLn.Close()
+
+	targetSideCh := make(chan net.Conn, 1)
+	go func() {
+		conn, err := targetLn.Accept()
+		if err == nil {
+			targetSideCh <- conn
+		}
+	}()
+
+	targetConn, err := net.Dial("tcp", targetLn.Addr().String())
+	if err != nil {
+		t.Fatalf("dial target listener: %v", err)
+	}
+	defer targetConn.Close()
+	targetServerConn := <-targetSideCh
+	defer targetServerConn.Close()
+
+	// 2. Set up a client listener to act as the user.
+	clientLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen client: %v", err)
+	}
+	defer clientLn.Close()
+
+	clientSideCh := make(chan net.Conn, 1)
+	go func() {
+		conn, err := clientLn.Accept()
+		if err == nil {
+			clientSideCh <- conn
+		}
+	}()
+
+	clientConn, err := net.Dial("tcp", clientLn.Addr().String())
+	if err != nil {
+		t.Fatalf("dial client listener: %v", err)
+	}
+	defer clientConn.Close()
+	fromConn := <-clientSideCh
+
+	// 3. Run the TCPConnectionHandler
+	usage := testUsage(t)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// Enable proxyProtocol (true)
+		TCPConnectionHandler(context.Background(), true, fromConn, targetConn, testLogger(), usage, remotePort, true)
+	}()
+
+	// Start a goroutine to read the response on the client side
+	var gotDown []byte
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		gotDown, _ = io.ReadAll(clientConn)
+	}()
+
+	// 4. Verify Proxy Protocol v2 header on the target side
+	if err := targetServerConn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+
+	header := make([]byte, 28) // Proxy Protocol v2 header for IPv4 is 28 bytes
+	_, err = io.ReadFull(targetServerConn, header)
+	if err != nil {
+		t.Fatalf("read proxy protocol header: %v", err)
+	}
+
+	magic := []byte{0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a}
+	if !bytes.HasPrefix(header, magic) {
+		t.Fatalf("first frame is not a v2 header: % x", header)
+	}
+
+	// Check the source port in the header
+	// In the proxy protocol v2 header for IPv4 (28 bytes total):
+	// 12 bytes magic + 1 byte ver/cmd + 1 byte family/proto + 2 bytes len + 4 bytes srcIP + 4 bytes dstIP + 2 bytes srcPort + 2 bytes dstPort
+	// srcPort starts at offset 12 + 1 + 1 + 2 + 4 + 4 = 24
+	gotPort := int(binary.BigEndian.Uint16(header[24:26]))
+	wantPort := clientConn.LocalAddr().(*net.TCPAddr).Port
+	if gotPort != wantPort {
+		t.Fatalf("header source port %d, want the user's own port %d", gotPort, wantPort)
+	}
+
+	// 5. Verify bidirectional data flow
+	// Write upPayload to client
+	if _, err := clientConn.Write(upPayload); err != nil {
+		t.Fatalf("write upPayload: %v", err)
+	}
+	clientConn.(*net.TCPConn).CloseWrite() // half-close upload
+
+	gotUp := make([]byte, len(upPayload))
+	_, err = io.ReadFull(targetServerConn, gotUp)
+	if err != nil {
+		t.Fatalf("read upPayload: %v", err)
+	}
+	if !bytes.Equal(gotUp, upPayload) {
+		t.Fatalf("upPayload after the header is %q, want %q", gotUp, upPayload)
+	}
+
+	// Write downPayload to target
+	if _, err := targetServerConn.Write(downPayload); err != nil {
+		t.Fatalf("write downPayload: %v", err)
+	}
+	targetServerConn.(*net.TCPConn).CloseWrite() // half-close download
+
+	wg.Wait()
+	if !bytes.Equal(gotDown, downPayload) {
+		t.Fatalf("client got %q, want %q", gotDown, downPayload)
+	}
+
+	// Make sure handler returns
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("TCPConnectionHandler did not return")
+	}
+
+	// 6. Verify usage tracking
+	wantTotal := uint64(len(upPayload) + len(downPayload))
+	if got := portUsageTotal(usage, remotePort); got != wantTotal {
+		t.Fatalf("sniffer recorded %d bytes, want %d", got, wantTotal)
+	}
 }
