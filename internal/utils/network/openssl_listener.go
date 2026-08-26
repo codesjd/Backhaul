@@ -36,6 +36,7 @@ import (
 //     parity drop `http2` from any nginx you benchmark against.
 //   - The TLS 1.3 ciphersuite list is left at OpenSSL's default on purpose - it
 //     already leads with AES-256-GCM exactly as nginx does.
+//
 // newConfiguredCtx builds an SSL_CTX for one cert/key pair, tuned to mirror a
 // stock nginx (see the type comment above). Each SNI-selectable certificate
 // gets its own ctx; they are configured identically apart from the keypair.
