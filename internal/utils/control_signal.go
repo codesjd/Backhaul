@@ -1,6 +1,8 @@
 package utils
 
 import (
+	crand "crypto/rand"
+	"math/big"
 	"math/rand"
 	"time"
 
@@ -23,11 +25,15 @@ const heartbeatJitterFraction = 0.3
 // on-wire size. Readers only ever look at the first byte of a control
 // message, so the padding is transparent to them.
 func WriteControlSignal(conn *websocket.Conn, signal byte) error {
-	padLen := rand.Intn(maxControlPadding + 1)
+	padBig, err := crand.Int(crand.Reader, big.NewInt(maxControlPadding+1))
+	if err != nil {
+		return err
+	}
+	padLen := int(padBig.Int64())
 	buf := make([]byte, 1+padLen)
 	buf[0] = signal
 	if padLen > 0 {
-		rand.Read(buf[1:])
+		crand.Read(buf[1:])
 	}
 	return conn.WriteMessage(websocket.BinaryMessage, buf)
 }
