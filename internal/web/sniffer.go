@@ -169,19 +169,20 @@ func (m *Usage) GetPortUsage(port int) (uint64, bool) {
 }
 
 func (m *Usage) AddOrUpdatePort(port int, usage uint64) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Retrieve current usage data for the port
-	value, ok := m.dataStore.Load(port)
-	if ok {
-		// Port exists, update usage
-		portUsage := value.(PortUsage)
-		portUsage.Usage += usage
-		m.dataStore.Store(port, portUsage)
-	} else {
-		// Port does not exist, create new entry
-		m.dataStore.Store(port, PortUsage{Port: port, Usage: usage})
+	for {
+		value, ok := m.dataStore.Load(port)
+		if ok {
+			portUsage := value.(PortUsage)
+			newUsage := portUsage
+			newUsage.Usage += usage
+			if m.dataStore.CompareAndSwap(port, value, newUsage) {
+				break
+			}
+		} else {
+			if _, loaded := m.dataStore.LoadOrStore(port, PortUsage{Port: port, Usage: usage}); !loaded {
+				break
+			}
+		}
 	}
 }
 
