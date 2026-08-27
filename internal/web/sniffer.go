@@ -32,6 +32,7 @@ type Usage struct {
 	mu              sync.Mutex
 	totalTraffic    uint64
 	tunnelStatus    *string
+	indexTmpl       *template.Template
 	cachedUsageData []PortUsage
 	cachedUsageMu   sync.RWMutex
 }
@@ -57,6 +58,14 @@ type SystemStats struct {
 
 func NewDataStore(listenAddr string, shutdownCtx context.Context, snifferLog string, sniffer bool, tunnelStatus *string, logger *logrus.Logger) *Usage {
 	ctx, cancel := context.WithCancel(shutdownCtx)
+
+	tmpl, err := template.ParseFS(indexHTML, "index.html")
+	if err != nil {
+		logger.Errorf("error parsing template at startup: %v", err)
+		// We could panic here, but logging it allows the app to start
+		// albeit handleIndex will fail later.
+	}
+
 	u := &Usage{
 		listenAddr:   listenAddr,
 		shutdownCtx:  ctx,
@@ -67,6 +76,7 @@ func NewDataStore(listenAddr string, shutdownCtx context.Context, snifferLog str
 		tunnelStatus: tunnelStatus,
 		mu:           sync.Mutex{},
 		totalTraffic: 0,
+		indexTmpl:    tmpl,
 	}
 	if sniffer {
 		u.loadInitialData()
@@ -180,13 +190,13 @@ func (m *Usage) handleIndex(w http.ResponseWriter, r *http.Request) {
 	usageData := m.getUsageData()
 	readableData := m.usageDataWithReadableUsage(usageData)
 
-	tmpl, err := template.ParseFS(indexHTML, "index.html")
-	if err != nil {
-		m.logger.Errorf("error parsing template: %v", err)
+	if m.indexTmpl == nil {
+		m.logger.Errorf("template not initialized")
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
-	err = tmpl.Execute(w, readableData)
+	err := m.indexTmpl.Execute(w, readableData)
 	if err != nil {
 		m.logger.Errorf("error executing template: %v", err)
 	}
@@ -226,19 +236,20 @@ func (m *Usage) GetPortUsage(port int) (uint64, bool) {
 }
 
 func (m *Usage) AddOrUpdatePort(port int, usage uint64) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Retrieve current usage data for the port
-	value, ok := m.dataStore.Load(port)
-	if ok {
-		// Port exists, update usage
-		portUsage := value.(PortUsage)
-		portUsage.Usage += usage
-		m.dataStore.Store(port, portUsage)
-	} else {
-		// Port does not exist, create new entry
-		m.dataStore.Store(port, PortUsage{Port: port, Usage: usage})
+	for {
+		value, ok := m.dataStore.Load(port)
+		if ok {
+			portUsage := value.(PortUsage)
+			newUsage := portUsage
+			newUsage.Usage += usage
+			if m.dataStore.CompareAndSwap(port, value, newUsage) {
+				break
+			}
+		} else {
+			if _, loaded := m.dataStore.LoadOrStore(port, PortUsage{Port: port, Usage: usage}); !loaded {
+				break
+			}
+		}
 	}
 }
 
