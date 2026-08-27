@@ -1,6 +1,9 @@
 package network
 
-import "math/rand"
+import (
+	"crypto/rand"
+	"math/big"
+)
 
 // browserUserAgents is a pool of realistic User-Agent strings from various
 // browsers/platforms, used to avoid a single static, easily fingerprinted
@@ -45,5 +48,9 @@ var browserUserAgents = []string{
 
 // RandomUserAgent returns a random entry from browserUserAgents.
 func RandomUserAgent() string {
-	return browserUserAgents[rand.Intn(len(browserUserAgents))]
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(len(browserUserAgents))))
+	if err != nil {
+		return browserUserAgents[0]
+	}
+	return browserUserAgents[n.Int64()]
 }

@@ -3,9 +3,10 @@ package network
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"fmt"
 	"io"
-	"math/rand"
+	"math/big"
 	"net"
 	"net/http"
 	"strconv"
@@ -54,7 +55,11 @@ func WebSocketDialer(ctx context.Context, addr string, edgeIP string, path strin
 
 func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path string, timeout time.Duration, keepalive time.Duration, nodelay bool, token string, userAgent string, mode config.TransportType, SO_RCVBUF int, SO_SNDBUF int, mss int, tlsVerify bool) (*websocket.Conn, error) {
 	// Generate a random X-user-id
-	randomUserID := rand.Int31() // Generate a random int64 number
+	n, err := rand.Int(rand.Reader, big.NewInt(1<<31))
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate random user ID: %w", err)
+	}
+	randomUserID := int32(n.Int64())
 
 	// Setup headers with authorization and X-user-id
 	headers := http.Header{}

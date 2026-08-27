@@ -95,8 +95,16 @@ func Run(configPath string, ctx context.Context) {
 // loadConfig loads and parses the TOML configuration file.
 func loadConfig(configPath string) (*config.Config, error) {
 	var cfg config.Config
-	if _, err := toml.DecodeFile(configPath, &cfg); err != nil {
+	meta, err := toml.DecodeFile(configPath, &cfg)
+	if err != nil {
 		return &cfg, err
 	}
+
+	// SEC: Secure by default. If the user omitted tls_verify from the
+	// configuration, default it to true to prevent unintentional MITM.
+	if !meta.IsDefined("client", "tls_verify") {
+		cfg.Client.TLSVerify = true
+	}
+
 	return &cfg, nil
 }

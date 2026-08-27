@@ -21,20 +21,23 @@ import (
 )
 
 type Usage struct {
-	dataStore     sync.Map
-	listenAddr    string
-	shutdownCtx   context.Context
-	cancelFunc    context.CancelFunc
-	server        *http.Server
-	logger        *logrus.Logger
-	sniffer       bool
-	snifferLog    string
-	mu            sync.Mutex
-	totalTraffic  uint64
-	tunnelStatus  *string
-	lastNetStats  *net.IOCountersStat
-	uploadSpeed   float64
-	downloadSpeed float64
+	dataStore       sync.Map
+	listenAddr      string
+	shutdownCtx     context.Context
+	cancelFunc      context.CancelFunc
+	server          *http.Server
+	logger          *logrus.Logger
+	sniffer         bool
+	snifferLog      string
+	mu              sync.Mutex
+	totalTraffic    uint64
+	tunnelStatus    *string
+	indexTmpl       *template.Template
+	cachedUsageData []PortUsage
+	cachedUsageMu   sync.RWMutex
+	lastNetStats    *net.IOCountersStat
+	uploadSpeed     float64
+	downloadSpeed   float64
 }
 
 type PortUsage struct {
@@ -58,6 +61,14 @@ type SystemStats struct {
 
 func NewDataStore(listenAddr string, shutdownCtx context.Context, snifferLog string, sniffer bool, tunnelStatus *string, logger *logrus.Logger) *Usage {
 	ctx, cancel := context.WithCancel(shutdownCtx)
+
+	tmpl, err := template.ParseFS(indexHTML, "index.html")
+	if err != nil {
+		logger.Errorf("error parsing template at startup: %v", err)
+		// We could panic here, but logging it allows the app to start
+		// albeit handleIndex will fail later.
+	}
+
 	u := &Usage{
 		listenAddr:   listenAddr,
 		shutdownCtx:  ctx,
@@ -68,6 +79,10 @@ func NewDataStore(listenAddr string, shutdownCtx context.Context, snifferLog str
 		tunnelStatus: tunnelStatus,
 		mu:           sync.Mutex{},
 		totalTraffic: 0,
+		indexTmpl:    tmpl,
+	}
+	if sniffer {
+		u.loadInitialData()
 	}
 
 	// Initialize lastNetStats
@@ -77,6 +92,58 @@ func NewDataStore(listenAddr string, shutdownCtx context.Context, snifferLog str
 	}
 
 	return u
+}
+
+func (m *Usage) loadInitialData() {
+	var usageData []PortUsage
+
+	// Check if the file exists
+	if _, err := os.Stat(m.snifferLog); os.IsNotExist(err) {
+		// If the file does not exist, create it and write "null"
+		file, err := os.OpenFile(m.snifferLog, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+		if err != nil {
+			m.logger.Errorf("error creating file: %v", err)
+			return
+		}
+
+		// Write "null" to the new file
+		if _, err := file.Write([]byte("null")); err != nil {
+			m.logger.Errorf("error writing 'null' to the file: %v", err)
+			file.Close()
+			return
+		}
+		file.Close()
+	} else {
+		// Open the JSON file
+		file, err := os.Open(m.snifferLog)
+		if err != nil {
+			m.logger.Errorf("error opening JSON file: %v", err)
+			return
+		}
+		defer file.Close()
+
+		// Decode the JSON file into the usageData slice
+		err = json.NewDecoder(file).Decode(&usageData)
+		if err != nil {
+			m.logger.Errorf("error decoding JSON data: %v", err)
+			return
+		}
+	}
+
+	// Sort usageData by Port in ascending order
+	sort.Slice(usageData, func(i, j int) bool {
+		return usageData[i].Port < usageData[j].Port
+	})
+
+	var totalTraffic uint64
+	for _, pu := range usageData {
+		totalTraffic += pu.Usage
+	}
+
+	m.cachedUsageMu.Lock()
+	m.cachedUsageData = usageData
+	m.totalTraffic = totalTraffic
+	m.cachedUsageMu.Unlock()
 }
 
 func (m *Usage) Monitor() {
@@ -157,23 +224,23 @@ func (m *Usage) Monitor() {
 var indexHTML embed.FS
 
 func (m *Usage) handleIndex(w http.ResponseWriter, r *http.Request) {
-	usageData := m.getUsageFromFile()
+	usageData := m.getUsageData()
 	readableData := m.usageDataWithReadableUsage(usageData)
 
-	tmpl, err := template.ParseFS(indexHTML, "index.html")
-	if err != nil {
-		m.logger.Errorf("error parsing template: %v", err)
+	if m.indexTmpl == nil {
+		m.logger.Errorf("template not initialized")
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
-	err = tmpl.Execute(w, readableData)
+	err := m.indexTmpl.Execute(w, readableData)
 	if err != nil {
 		m.logger.Errorf("error executing template: %v", err)
 	}
 }
 
 func (m *Usage) handleData(w http.ResponseWriter, r *http.Request) {
-	usageData := m.getUsageFromFile()
+	usageData := m.getUsageData()
 	readableData := m.usageDataWithReadableUsage(usageData)
 
 	w.Header().Set("Content-Type", "application/json")
@@ -206,50 +273,39 @@ func (m *Usage) GetPortUsage(port int) (uint64, bool) {
 }
 
 func (m *Usage) AddOrUpdatePort(port int, usage uint64) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Retrieve current usage data for the port
-	value, ok := m.dataStore.Load(port)
-	if ok {
-		// Port exists, update usage
-		portUsage := value.(PortUsage)
-		portUsage.Usage += usage
-		m.dataStore.Store(port, portUsage)
-	} else {
-		// Port does not exist, create new entry
-		m.dataStore.Store(port, PortUsage{Port: port, Usage: usage})
+	for {
+		value, ok := m.dataStore.Load(port)
+		if ok {
+			portUsage := value.(PortUsage)
+			newUsage := portUsage
+			newUsage.Usage += usage
+			if m.dataStore.CompareAndSwap(port, value, newUsage) {
+				break
+			}
+		} else {
+			if _, loaded := m.dataStore.LoadOrStore(port, PortUsage{Port: port, Usage: usage}); !loaded {
+				break
+			}
+		}
 	}
 }
 
 func (m *Usage) saveUsageData() {
-	// Step 1: Load existing usage data from the JSON file
-	var existingUsageData []PortUsage
-	file, err := os.Open(m.snifferLog)
-	if err == nil {
-		// If the file exists, decode the JSON data into existingUsageData
-		defer file.Close()
-		err = json.NewDecoder(file).Decode(&existingUsageData)
-		if err != nil {
-			m.logger.Errorf("error decoding JSON data: %v", err)
-			return
-		}
-	} else if !os.IsNotExist(err) {
-		// Log any error except file not existing
-		m.logger.Errorf("error opening JSON file: %v", err)
-		return
+	// Step 1: Get current usage data from sync.Map
+	currentUsageData := m.collectUsageDataFromSyncMap()
+	if len(currentUsageData) == 0 {
+		return // No new data to save
 	}
 
-	// Step 2: Get current usage data from sync.Map
-	currentUsageData := m.collectUsageDataFromSyncMap()
-
-	// Step 3: Merge the existing and current usage data into a map to avoid duplicates
+	// Step 2: Merge the existing cached data and current usage data into a map to avoid duplicates
 	usageMap := make(map[int]PortUsage)
 
+	m.cachedUsageMu.RLock()
 	// Add existing usage data to the map
-	for _, usage := range existingUsageData {
+	for _, usage := range m.cachedUsageData {
 		usageMap[usage.Port] = usage
 	}
+	m.cachedUsageMu.RUnlock()
 
 	// Append or update current usage data in the map
 	for _, usage := range currentUsageData {
@@ -263,14 +319,24 @@ func (m *Usage) saveUsageData() {
 		}
 	}
 
-	m.totalTraffic = 0
-
-	// Step 4: Convert the map back to a slice
+	// Step 3: Convert the map back to a slice
 	var mergedUsageData []PortUsage
+	var totalTraffic uint64
 	for _, usage := range usageMap {
 		mergedUsageData = append(mergedUsageData, usage)
-		m.totalTraffic += usage.Usage
+		totalTraffic += usage.Usage
 	}
+
+	// Sort mergedUsageData by Port in ascending order
+	sort.Slice(mergedUsageData, func(i, j int) bool {
+		return mergedUsageData[i].Port < mergedUsageData[j].Port
+	})
+
+	// Step 4: Update the cache and total traffic
+	m.cachedUsageMu.Lock()
+	m.cachedUsageData = mergedUsageData
+	m.totalTraffic = totalTraffic
+	m.cachedUsageMu.Unlock()
 
 	// Step 5: Convert merged data to JSON
 	data, err := json.MarshalIndent(mergedUsageData, "", "  ")
@@ -286,49 +352,14 @@ func (m *Usage) saveUsageData() {
 	}
 }
 
-func (m *Usage) getUsageFromFile() []PortUsage {
-	// Check if the file exists
-	if _, err := os.Stat(m.snifferLog); os.IsNotExist(err) {
-		// If the file does not exist, create it and write "null"
-		file, err := os.OpenFile(m.snifferLog, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
-		if err != nil {
-			m.logger.Errorf("error creating file: %v", err)
-			return nil
-		}
+func (m *Usage) getUsageData() []PortUsage {
+	m.cachedUsageMu.RLock()
+	defer m.cachedUsageMu.RUnlock()
 
-		// Write "null" to the new file
-		if _, err := file.Write([]byte("null")); err != nil {
-			m.logger.Errorf("error writing 'null' to the file: %v", err)
-			file.Close()
-			return nil
-		}
-
-		return nil
-	}
-
-	var usageData []PortUsage
-
-	// Open the JSON file
-	file, err := os.Open(m.snifferLog)
-	if err != nil {
-		m.logger.Errorf("error opening JSON file: %v", err)
-		return nil
-	}
-	defer file.Close()
-
-	// Decode the JSON file into the usageData slice
-	err = json.NewDecoder(file).Decode(&usageData)
-	if err != nil {
-		m.logger.Errorf("error decoding JSON data: %v", err)
-		return nil
-	}
-
-	// Sort usageData by Port in ascending order
-	sort.Slice(usageData, func(i, j int) bool {
-		return usageData[i].Port < usageData[j].Port
-	})
-
-	return usageData
+	// Create a copy to prevent data races if the caller modifies the slice
+	copyData := make([]PortUsage, len(m.cachedUsageData))
+	copy(copyData, m.cachedUsageData)
+	return copyData
 }
 
 // converts the byte usage to a human-readable format
