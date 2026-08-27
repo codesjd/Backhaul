@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"github.com/musix/backhaul/internal/utils/network"
 	"context"
 	"crypto/subtle"
 	"errors"
@@ -9,12 +10,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gorilla/websocket"
+
 	"github.com/sirupsen/logrus"
 )
 
 type TunnelChannel struct { // for websocket
-	conn *websocket.Conn
+	conn *network.WebSocketConn
 	ping chan struct{}
 	mu   *sync.Mutex
 }

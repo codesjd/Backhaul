@@ -1,11 +1,9 @@
 package network
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"fmt"
-	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -13,12 +11,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gorilla/websocket"
+
 	"github.com/musix/backhaul/config"
+	"github.com/gobwas/ws"
+
 )
 
-func WebSocketDialer(ctx context.Context, addr string, edgeIP string, path string, timeout time.Duration, keepalive time.Duration, nodelay bool, token string, userAgent string, mode config.TransportType, retry int, SO_RCVBUF int, SO_SNDBUF int, mss int, tlsVerify bool) (*websocket.Conn, error) {
-	var tunnelWSConn *websocket.Conn
+func WebSocketDialer(ctx context.Context, addr string, edgeIP string, path string, timeout time.Duration, keepalive time.Duration, nodelay bool, token string, userAgent string, mode config.TransportType, retry int, SO_RCVBUF int, SO_SNDBUF int, mss int, tlsVerify bool) (*WebSocketConn, error) {
+	var tunnelWSConn *WebSocketConn
 	var err error
 
 	retries := retry           // Number of retries
@@ -53,7 +53,7 @@ func WebSocketDialer(ctx context.Context, addr string, edgeIP string, path strin
 	return nil, err
 }
 
-func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path string, timeout time.Duration, keepalive time.Duration, nodelay bool, token string, userAgent string, mode config.TransportType, SO_RCVBUF int, SO_SNDBUF int, mss int, tlsVerify bool) (*websocket.Conn, error) {
+func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path string, timeout time.Duration, keepalive time.Duration, nodelay bool, token string, userAgent string, mode config.TransportType, SO_RCVBUF int, SO_SNDBUF int, mss int, tlsVerify bool) (*WebSocketConn, error) {
 	// Generate a random X-user-id
 	n, err := rand.Int(rand.Reader, big.NewInt(1<<31))
 	if err != nil {
@@ -68,7 +68,7 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 	headers.Add("User-Agent", userAgent)
 
 	var wsURL string
-	dialer := websocket.Dialer{}
+	dialer := ws.Dialer{Header: ws.HandshakeHeaderHTTP(http.Header{})}
 
 	// Handle edgeIP assignment
 	if edgeIP != "" {
@@ -92,15 +92,10 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 	case config.WS, config.WSMUX:
 		wsURL = fmt.Sprintf("ws://%s%s", addr, path)
 
-		dialer = websocket.Dialer{
-			// Tunnel traffic underneath is smux/TLS binary that doesn't
-			// compress, so permessage-deflate only burns CPU (and adds latency
-			// if ever negotiated). The server upgrader doesn't enable it either.
-			EnableCompression: false,
-			HandshakeTimeout:  45 * time.Second, // default handshake timeout
-			ReadBufferSize:    64 * 1024,        // match server upgrader; avoids falling back to gorilla's 4KB default
-			WriteBufferSize:   64 * 1024,        // ditto, reduces syscall/copy overhead for large mux frames
-			NetDial: func(_, addr string) (net.Conn, error) {
+		dialer = ws.Dialer{
+			Header: ws.HandshakeHeaderHTTP(headers),
+			Timeout:  45 * time.Second,
+			NetDial: func(ctx context.Context, _, addr string) (net.Conn, error) {
 				conn, err := TcpDialer(ctx, edgeIP, "", timeout, keepalive, nodelay, 1, SO_RCVBUF, SO_SNDBUF, mss)
 				if err != nil {
 					return nil, err
@@ -109,26 +104,17 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 			},
 		}
 	case config.WSS, config.WSSMUX:
-		wsURL = fmt.Sprintf("wss://%s%s", addr, path)
+		wsURL = fmt.Sprintf("ws://%s%s", addr, path) // gobwas will double-wrap if wss:// is used
 
 		sniHost, _, err := net.SplitHostPort(addr)
 		if err != nil {
 			sniHost = addr
 		}
 
-		dialer = websocket.Dialer{
-			// Tunnel traffic underneath is smux/TLS binary that doesn't
-			// compress, so permessage-deflate only burns CPU (and adds latency
-			// if ever negotiated). The server upgrader doesn't enable it either.
-			EnableCompression: false,
-			HandshakeTimeout:  45 * time.Second, // default handshake timeout
-			ReadBufferSize:    64 * 1024,        // match server upgrader; avoids falling back to gorilla's 4KB default
-			WriteBufferSize:   64 * 1024,        // ditto, reduces syscall/copy overhead for large mux frames
-			// Handshake the TLS layer ourselves with uTLS so the ClientHello
-			// mimics a real Chrome fingerprint instead of Go's crypto/tls
-			// default, which passive DPI can key on. Gorilla ignores
-			// TLSClientConfig once NetDialTLSContext is set.
-			NetDialTLSContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		dialer = ws.Dialer{
+			Header: ws.HandshakeHeaderHTTP(headers),
+			Timeout:  45 * time.Second,
+			NetDial: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				// insecureSkipVerify is the inverse of the operator's tls_verify:
 				// off by default (self-signed friendly), but an on-path party can
 				// then MITM the token-bearing handshake, so tls_verify=true is
@@ -139,24 +125,9 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 	}
 
 	// Dial to the WebSocket server
-	tunnelWSConn, resp, err := dialer.Dial(wsURL, headers)
+	conn, br, _, err := dialer.Dial(ctx, wsURL)
 	if err != nil {
-		// On a bad handshake, gorilla still hands back the HTTP response the
-		// server (or an on-path proxy/WAF/DPI) sent instead of the 101
-		// Switching Protocols we expected. That status code and body are the
-		// only clue to *why* the upgrade was rejected - e.g. a 403 from a
-		// CDN's bot/DPI filter looks identical to a plain "bad handshake"
-		// otherwise. The caller owns resp.Body once returned, so read and
-		// close it here rather than leaking it.
-		if resp != nil {
-			defer resp.Body.Close()
-			body, readErr := io.ReadAll(io.LimitReader(resp.Body, 512))
-			if readErr == nil && len(bytes.TrimSpace(body)) > 0 {
-				return nil, fmt.Errorf("%w (http status: %s, body: %q)", err, resp.Status, bytes.TrimSpace(body))
-			}
-			return nil, fmt.Errorf("%w (http status: %s)", err, resp.Status)
-		}
-		return nil, err
+		return nil, fmt.Errorf("websocket dial failed: %w", err)
 	}
-	return tunnelWSConn, nil
+	return NewWebSocketConn(conn, ws.StateClientSide, br), nil
 }

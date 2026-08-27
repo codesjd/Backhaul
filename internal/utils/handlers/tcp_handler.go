@@ -94,10 +94,19 @@ func TCPConnectionHandler(ctx context.Context, proxyProtocol bool, from net.Conn
 // raw socket), but still benefit from the pooled buffer below instead of a
 // fresh allocation per connection.
 func transferData(from net.Conn, to net.Conn, logger *logrus.Logger, usage *web.Usage, remotePort int, sniffer bool) {
-	bufPtr := copyBufferPool.Get().(*[]byte)
-	defer copyBufferPool.Put(bufPtr)
+	var n int64
+	var err error
 
-	n, err := io.CopyBuffer(to, from, *bufPtr)
+	_, isWT := from.(io.WriterTo)
+	_, isRF := to.(io.ReaderFrom)
+
+	if isWT || isRF {
+		n, err = io.CopyBuffer(to, from, nil)
+	} else {
+		bufPtr := copyBufferPool.Get().(*[]byte)
+		n, err = io.CopyBuffer(to, from, *bufPtr)
+		copyBufferPool.Put(bufPtr)
+	}
 
 	if err != nil && !errors.Is(err, net.ErrClosed) {
 		// A copy that ends on a real transport error - not a clean EOF, and not

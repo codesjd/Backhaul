@@ -14,30 +14,31 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/gobwas/ws"
+	"github.com/musix/backhaul/internal/utils/network"
 )
 
 // wsPair returns the two ends of a real WebSocket connection, so the handler is
 // exercised against actual framing rather than a stand-in.
-func wsPair(t *testing.T) (client, server *websocket.Conn) {
+func wsPair(t *testing.T) (client, server *network.WebSocketConn) {
 	t.Helper()
 
-	upgrader := websocket.Upgrader{ReadBufferSize: 64 * 1024, WriteBufferSize: 64 * 1024}
-	srvCh := make(chan *websocket.Conn, 1)
+	srvCh := make(chan *network.WebSocketConn, 1)
 
 	hs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, err := upgrader.Upgrade(w, r, nil)
+		netConn, _, _, err := ws.UpgradeHTTP(r, w)
 		if err != nil {
 			return
 		}
-		srvCh <- c
+		srvCh <- network.NewWebSocketConn(netConn, ws.StateServerSide, nil)
 	}))
 	t.Cleanup(hs.Close)
 
-	c, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(hs.URL, "http"), nil)
+	netConn, br, _, err := ws.DefaultDialer.Dial(context.Background(), "ws"+strings.TrimPrefix(hs.URL, "http"))
 	if err != nil {
 		t.Fatalf("ws dial: %v", err)
 	}
+	c := network.NewWebSocketConn(netConn, ws.StateClientSide, br)
 	t.Cleanup(func() { c.Close() })
 
 	select {

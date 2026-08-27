@@ -1,12 +1,13 @@
 package utils
 
 import (
+	"github.com/musix/backhaul/internal/utils/network"
 	crand "crypto/rand"
 	"math/big"
 	"math/rand"
 	"time"
 
-	"github.com/gorilla/websocket"
+
 )
 
 // maxControlPadding bounds the random padding appended to control-channel
@@ -24,7 +25,7 @@ const heartbeatJitterFraction = 0.3
 // random amount of random bytes so control frames don't all share the same
 // on-wire size. Readers only ever look at the first byte of a control
 // message, so the padding is transparent to them.
-func WriteControlSignal(conn *websocket.Conn, signal byte) error {
+func WriteControlSignal(conn *network.WebSocketConn, signal byte) error {
 	padLenBig, err := crand.Int(crand.Reader, big.NewInt(maxControlPadding+1))
 	if err != nil {
 		return err
@@ -38,7 +39,7 @@ func WriteControlSignal(conn *websocket.Conn, signal byte) error {
 			return err
 		}
 	}
-	return conn.WriteMessage(websocket.BinaryMessage, buf)
+	return conn.WriteMessage(network.BinaryMessage, buf)
 }
 
 // JitterDuration returns base randomly shifted by up to

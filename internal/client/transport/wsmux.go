@@ -18,7 +18,7 @@ import (
 	"github.com/musix/backhaul/internal/web"
 	"github.com/xtaci/smux"
 
-	"github.com/gorilla/websocket"
+
 	"github.com/sirupsen/logrus"
 )
 
@@ -29,7 +29,7 @@ type WsMuxTransport struct {
 	ctx            context.Context
 	cancel         context.CancelFunc
 	logger         *logrus.Logger
-	controlChannel *websocket.Conn
+	controlChannel *network.WebSocketConn
 	// controlMu guards controlChannel: it is now swapped in place on a
 	// reconnect, so the dialer, a dying channelHandler and Restart can all
 	// touch it at once.
@@ -345,7 +345,7 @@ func (c *WsMuxTransport) poolMaintainer() {
 // argument rather than reading c.controlChannel on every use: a handler whose
 // connection has died must not touch the shared pointer that by then may hold
 // its replacement.
-func (c *WsMuxTransport) channelHandler(conn *websocket.Conn) {
+func (c *WsMuxTransport) channelHandler(conn *network.WebSocketConn) {
 	msgChan := make(chan byte, 1000)
 
 	// Goroutine to handle the blocking ReceiveBinaryString
@@ -433,7 +433,7 @@ const controlReconnectWindow = 30 * time.Second
 //
 // Restart, which tears everything down, stays as the fallback for a control
 // channel that cannot be re-established at all.
-func (c *WsMuxTransport) reconnectControl(old *websocket.Conn) {
+func (c *WsMuxTransport) reconnectControl(old *network.WebSocketConn) {
 	c.controlMu.Lock()
 	if c.controlChannel != old {
 		// Another goroutine already handled this drop, or a restart is under way.
@@ -508,7 +508,7 @@ func (c *WsMuxTransport) tunnelDialer() {
 	c.handleSession(tunnelWSConn)
 }
 
-func (c *WsMuxTransport) handleSession(tunnelConn *websocket.Conn) {
+func (c *WsMuxTransport) handleSession(tunnelConn *network.WebSocketConn) {
 	defer func() {
 		atomic.AddInt32(&c.poolConnections, -1)
 	}()
