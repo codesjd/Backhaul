@@ -35,6 +35,9 @@ type Usage struct {
 	indexTmpl       *template.Template
 	cachedUsageData []PortUsage
 	cachedUsageMu   sync.RWMutex
+	lastNetStats    *net.IOCountersStat
+	uploadSpeed     float64
+	downloadSpeed   float64
 }
 
 type PortUsage struct {
@@ -81,6 +84,13 @@ func NewDataStore(listenAddr string, shutdownCtx context.Context, snifferLog str
 	if sniffer {
 		u.loadInitialData()
 	}
+
+	// Initialize lastNetStats
+	stats, err := u.getNetworkStats()
+	if err == nil {
+		u.lastNetStats = stats
+	}
+
 	return u
 }
 
@@ -176,6 +186,33 @@ func (m *Usage) Monitor() {
 			}
 		}()
 	}
+
+	// Start network stats polling
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				stats, err := m.getNetworkStats()
+				if err != nil {
+					continue
+				}
+
+				m.mu.Lock()
+				if m.lastNetStats != nil {
+					m.uploadSpeed = float64(stats.BytesSent - m.lastNetStats.BytesSent)
+					m.downloadSpeed = float64(stats.BytesRecv - m.lastNetStats.BytesRecv)
+				}
+				m.lastNetStats = stats
+				m.mu.Unlock()
+			case <-m.shutdownCtx.Done():
+				return
+			}
+		}
+	}()
+
 	// Start the server
 	m.logger.Info("sniffer service listening on port: ", m.listenAddr)
 	if err := m.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -389,21 +426,6 @@ func (m *Usage) convertBytesToReadable(bytes uint64) string {
 
 func (m *Usage) getSystemStats() (*SystemStats, error) {
 
-	// Get initial network stats
-	initialStats, err := m.getNetworkStats()
-	if err != nil {
-		return nil, err
-	}
-
-	// Wait for 1 second
-	time.Sleep(1 * time.Second)
-
-	// Get updated network stats
-	finalStats, err := m.getNetworkStats()
-	if err != nil {
-		return nil, err
-	}
-
 	// Get CPU usage
 	cpuPercent, err := cpu.Percent(0, false)
 	if err != nil {
@@ -440,9 +462,11 @@ func (m *Usage) getSystemStats() (*SystemStats, error) {
 		return nil, err
 	}
 
-	// Calculate upload and download speeds
-	uploadSpeed := float64(finalStats.BytesSent - initialStats.BytesSent)
-	downloadSpeed := float64(finalStats.BytesRecv - initialStats.BytesRecv)
+	// Retrieve upload and download speeds from the struct (calculated periodically)
+	m.mu.Lock()
+	uploadSpeed := m.uploadSpeed
+	downloadSpeed := m.downloadSpeed
+	m.mu.Unlock()
 
 	stats := &SystemStats{
 		TunnelStatus:    *m.tunnelStatus,
