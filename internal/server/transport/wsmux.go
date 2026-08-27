@@ -92,6 +92,7 @@ type WsMuxConfig struct {
 	Path                 string
 	MuxKeepaliveDisabled bool
 	StripeFactor         int
+	StripeParity         int
 	Fallback             string        // decoy backend for non-tunnel requests (host:port), optional
 	TLSEngine            string        // "go" (default) or "openssl" for wssmux TLS termination
 	MaxConnAge           time.Duration // retire pool connections at this age (0 = never); see retireSession
@@ -840,7 +841,7 @@ func (s *WsMuxTransport) dispatchStriped(incomingConn LocalTCPConn) {
 	// back *before* the backoff sleep and requeue, otherwise it shrinks capacity
 	// for everyone else while doing nothing.
 
-	legs, err := s.openStripedLegs(s.config.StripeFactor)
+	legs, err := s.openStripedLegs(s.legsPerFlow())
 	if err != nil {
 		atomic.AddInt32(&s.stripedFlows, -1) // release before backoff + requeue
 		s.logger.Tracef("striped dispatch: %v, retrying shortly", err)
@@ -856,7 +857,7 @@ func (s *WsMuxTransport) dispatchStriped(incomingConn LocalTCPConn) {
 
 	gid := atomic.AddUint32(&s.stripeGroupID, 1)
 	for i, stream := range legs {
-		if err := utils.SendStripeHeader(stream, gid, uint8(i), uint8(len(legs)), incomingConn.remoteAddr); err != nil {
+		if err := utils.SendStripeHeader(stream, gid, uint8(i), uint8(len(legs)), uint8(s.config.StripeParity), incomingConn.remoteAddr); err != nil {
 			atomic.AddInt32(&s.stripedFlows, -1) // release before requeue
 			s.logger.Tracef("failed to send stripe header: %v", err)
 			for _, st := range legs {
@@ -872,11 +873,33 @@ func (s *WsMuxTransport) dispatchStriped(incomingConn LocalTCPConn) {
 	for i, st := range legs {
 		conns[i] = st
 	}
-	stripedConn := striping.New(conns, striping.DefaultChunkSize)
+	var stripedConn net.Conn
+	if s.config.StripeParity > 0 {
+		fecConn, err := striping.NewFEC(conns, striping.DefaultChunkSize, s.config.StripeFactor, s.config.StripeParity)
+		if err != nil {
+			atomic.AddInt32(&s.stripedFlows, -1)
+			s.logger.Errorf("striped dispatch: %v", err)
+			for _, st := range legs {
+				st.Close()
+			}
+			atomic.AddInt32(&s.streamCounter, -1)
+			incomingConn.conn.Close()
+			return
+		}
+		stripedConn = fecConn
+	} else {
+		stripedConn = striping.New(conns, striping.DefaultChunkSize)
+	}
 
 	defer atomic.AddInt32(&s.stripedFlows, -1) // hold the slot for the flow's lifetime
 	defer atomic.AddInt32(&s.streamCounter, -1)
 	handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, incomingConn.conn, stripedConn, s.logger, s.usageMonitor, incomingConn.conn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
+}
+
+// legsPerFlow is how many pool legs one striped flow opens: the plain
+// stripe factor, plus any FEC parity legs on top.
+func (s *WsMuxTransport) legsPerFlow() int {
+	return s.config.StripeFactor + s.config.StripeParity
 }
 
 // acquireStripedSlot reserves one in-flight striped-flow slot, blocking (with a
@@ -886,7 +909,7 @@ func (s *WsMuxTransport) dispatchStriped(incomingConn LocalTCPConn) {
 // sessionCounter*MuxCon/StripeFactor flows run at once; the budget grows as the
 // pool does. Returns false only if the transport is shutting down.
 func (s *WsMuxTransport) acquireStripedSlot() bool {
-	sf := int32(s.config.StripeFactor)
+	sf := int32(s.legsPerFlow())
 	if sf < 1 {
 		sf = 1
 	}

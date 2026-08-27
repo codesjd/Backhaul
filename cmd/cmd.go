@@ -57,6 +57,26 @@ func Run(configPath string, ctx context.Context) {
 		logger.Fatalf("client 'token' is required: set it in the [client] config (it must match the server's token)")
 	}
 
+	// mux_stripe_parity only does anything once striping is on (mux_stripe > 1)
+	// - the plain, non-striped session path never looks at it - and the
+	// Reed-Solomon library caps total shards (data+parity) at 256.
+	if configType == "server" && cfg.Server.StripeParity > 0 {
+		if cfg.Server.StripeFactor < 2 {
+			logger.Fatalf("server 'mux_stripe_parity' requires 'mux_stripe' >= 2 (it adds parity legs on top of striping)")
+		}
+		if cfg.Server.StripeFactor+cfg.Server.StripeParity > 256 {
+			logger.Fatalf("server 'mux_stripe' + 'mux_stripe_parity' must be <= 256")
+		}
+	}
+	if configType == "client" && cfg.Client.StripeParity > 0 {
+		if cfg.Client.StripeFactor < 2 {
+			logger.Fatalf("client 'mux_stripe_parity' requires 'mux_stripe' >= 2 (it adds parity legs on top of striping)")
+		}
+		if cfg.Client.StripeFactor+cfg.Client.StripeParity > 256 {
+			logger.Fatalf("client 'mux_stripe' + 'mux_stripe_parity' must be <= 256")
+		}
+	}
+
 	// Determine whether to run as a server or client
 	switch configType {
 	case "server":

@@ -101,6 +101,7 @@ type stripeGroup struct {
 	remaining  int
 	remoteAddr string
 	timer      *time.Timer
+	parity     uint8 // FEC parity legs among streams; 0 = plain striping
 }
 type WsMuxConfig struct {
 	RemoteAddr           string
@@ -126,6 +127,7 @@ type WsMuxConfig struct {
 	Path                 string
 	MuxKeepaliveDisabled bool
 	StripeFactor         int
+	StripeParity         int
 	SO_RCVBUF            int
 	SO_SNDBUF            int
 	MSS                  int
@@ -552,14 +554,14 @@ func (c *WsMuxTransport) handleSession(tunnelConn *websocket.Conn) {
 // has shown up, the group is assembled into a single striping.Conn and
 // handed to localDialer exactly like a plain stream would be.
 func (c *WsMuxTransport) handleStripedStream(stream *smux.Stream) {
-	groupID, index, total, remoteAddr, err := utils.ReceiveStripeHeader(stream)
+	groupID, index, total, parity, remoteAddr, err := utils.ReceiveStripeHeader(stream)
 	if err != nil {
 		c.logger.Errorf("failed to read stripe header: %v", err)
 		stream.Close()
 		return
 	}
-	if total == 0 || int(index) >= int(total) {
-		c.logger.Errorf("invalid stripe header: index=%d total=%d", index, total)
+	if total == 0 || int(index) >= int(total) || int(parity) >= int(total) {
+		c.logger.Errorf("invalid stripe header: index=%d total=%d parity=%d", index, total, parity)
 		stream.Close()
 		return
 	}
@@ -571,6 +573,7 @@ func (c *WsMuxTransport) handleStripedStream(stream *smux.Stream) {
 			streams:    make([]*smux.Stream, total),
 			remaining:  int(total),
 			remoteAddr: remoteAddr,
+			parity:     parity,
 		}
 		g.timer = time.AfterFunc(10*time.Second, func() {
 			c.abortStripeGroup(groupID)
@@ -601,6 +604,19 @@ func (c *WsMuxTransport) handleStripedStream(stream *smux.Stream) {
 	conns := make([]net.Conn, len(g.streams))
 	for i, st := range g.streams {
 		conns[i] = st
+	}
+	if g.parity > 0 {
+		dataShards := len(conns) - int(g.parity)
+		fecConn, err := striping.NewFEC(conns, striping.DefaultChunkSize, dataShards, int(g.parity))
+		if err != nil {
+			c.logger.Errorf("failed to build FEC striped conn: %v", err)
+			for _, cn := range conns {
+				cn.Close()
+			}
+			return
+		}
+		go c.localDialer(fecConn, g.remoteAddr)
+		return
 	}
 	go c.localDialer(striping.New(conns, striping.DefaultChunkSize), g.remoteAddr)
 }

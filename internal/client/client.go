@@ -142,6 +142,7 @@ func (c *Client) Start() {
 			MaxStreamBuffer:      c.config.MaxStreamBuffer,
 			MuxKeepaliveDisabled: c.config.MuxKeepaliveDisabled,
 			StripeFactor:         c.config.StripeFactor,
+			StripeParity:         c.config.StripeParity,
 			SO_RCVBUF:            c.config.SO_RCVBUF,
 			SO_SNDBUF:            c.config.SO_SNDBUF,
 			MSS:                  c.config.MSS,
