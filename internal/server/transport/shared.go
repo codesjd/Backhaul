@@ -1,15 +1,14 @@
 package transport
 
 import (
-	"github.com/musix/backhaul/internal/utils/network"
 	"context"
 	"crypto/subtle"
 	"errors"
+	"github.com/musix/backhaul/internal/utils/network"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
-
 
 	"github.com/sirupsen/logrus"
 )

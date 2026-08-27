@@ -1,10 +1,10 @@
 package network
 
 import (
-	"sync"
-	"strings"
 	"bufio"
-	"io/ioutil"
+	"bytes"
+	"sync"
+
 	"errors"
 	"io"
 	"net"
@@ -31,9 +31,9 @@ func (b *bufferedConn) Read(p []byte) (int, error) {
 
 type WebSocketConn struct {
 	net.Conn
-	state  ws.State
-	reader *wsutil.Reader
-	writer *wsutil.Writer
+	state   ws.State
+	reader  *wsutil.Reader
+	writer  *wsutil.Writer
 	writeMu sync.Mutex
 }
 
@@ -44,11 +44,9 @@ func NewWebSocketConn(conn net.Conn, state ws.State, br *bufio.Reader) *WebSocke
 		// create a multi reader to consume the buffered bytes then raw conn
 		// we use peek to avoid taking ownership of the bufio reader's internal lock,
 		// but since we only need the buffered bytes:
-		import_bytes := true
-		_ = import_bytes
 		wrap = &bufferedConn{
 			Conn: conn,
-			r:    io.MultiReader(strings.NewReader(string(peek)), conn),
+			r:    io.MultiReader(bytes.NewReader(peek), conn),
 		}
 	}
 
@@ -60,18 +58,20 @@ func NewWebSocketConn(conn net.Conn, state ws.State, br *bufio.Reader) *WebSocke
 		writer: wsutil.NewWriter(wrap, state, ws.OpBinary),
 	}
 	r.OnIntermediate = func(hdr ws.Header, src io.Reader) error {
-		b, err := ioutil.ReadAll(src)
-		if err != nil { return err }
+		// Drain intermediate frames (e.g. fragments of control frames)
+		payload, err := io.ReadAll(src)
+		if err != nil {
+			return err
+		}
 		if hdr.OpCode == ws.OpPing {
 			wsConn.writeMu.Lock()
 			defer wsConn.writeMu.Unlock()
-			return wsutil.WriteMessage(wrap, state, ws.OpPong, b)
+			return wsutil.WriteMessage(wrap, state, ws.OpPong, payload)
 		}
 		return nil
 	}
 	wsConn.reader = r
 	return wsConn
-
 
 }
 
@@ -96,14 +96,39 @@ func (c *WebSocketConn) WriteMessage(messageType int, data []byte) error {
 }
 
 func (c *WebSocketConn) NextReader() (int, io.Reader, error) {
-	hdr, err := c.reader.NextFrame()
-	if err != nil {
-		return 0, nil, err
+	for {
+		hdr, err := c.reader.NextFrame()
+		if err != nil {
+			return 0, nil, err
+		}
+		if hdr.OpCode == ws.OpClose {
+			return int(hdr.OpCode), nil, io.EOF
+		}
+		if hdr.OpCode == ws.OpPing {
+			c.writeMu.Lock()
+			err = wsutil.WriteMessage(c.Conn, c.state, ws.OpPong, nil)
+			c.writeMu.Unlock()
+			if err != nil {
+				return 0, nil, err
+			}
+			// Drain the ping payload
+			_, err = io.Copy(io.Discard, c.reader)
+			if err != nil {
+				return 0, nil, err
+			}
+			continue
+		}
+		if hdr.OpCode == ws.OpPong {
+			// Drain the pong payload and continue
+			_, err = io.Copy(io.Discard, c.reader)
+			if err != nil {
+				return 0, nil, err
+			}
+			continue
+		}
+		// It's OpBinary or OpText, return it to the caller
+		return int(hdr.OpCode), c.reader, nil
 	}
-	if hdr.OpCode == ws.OpClose {
-		return int(hdr.OpCode), nil, io.EOF
-	}
-	return int(hdr.OpCode), c.reader, nil
 }
 
 func (c *WebSocketConn) NetConn() net.Conn {

@@ -11,13 +11,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gobwas/ws"
 	"github.com/musix/backhaul/config"
 	"github.com/musix/backhaul/internal/utils"
 	"github.com/musix/backhaul/internal/utils/handlers"
 	"github.com/musix/backhaul/internal/utils/network"
-	"github.com/gobwas/ws"
 	"github.com/musix/backhaul/internal/web"
-
 
 	"github.com/sirupsen/logrus"
 )
@@ -242,8 +241,6 @@ func (s *WsTransport) tunnelListener() {
 	basePath := network.NormalizeBasePath(s.config.Path)
 	channelPath := basePath + "/channel"
 	tunnelPathPrefix := basePath + "/tunnel"
-	_ = ws.HTTPUpgrader{ // ws.UpgradeHTTP ignores this, so we remove it
-	}
 
 	// Built once rather than per request: this ran through fmt.Sprintf on
 	// every probe that reached the listener.

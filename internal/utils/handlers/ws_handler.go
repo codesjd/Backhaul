@@ -1,13 +1,12 @@
 package handlers
 
 import (
-	"github.com/musix/backhaul/internal/utils/network"
 	"context"
 	"errors"
+	"github.com/musix/backhaul/internal/utils/network"
 	"io"
 	"net"
 	"sync"
-
 
 	"github.com/musix/backhaul/internal/web"
 	"github.com/sirupsen/logrus"
@@ -113,8 +112,7 @@ func transferWebSocketToTCP(wsConn *network.WebSocketConn, tcpConn net.Conn, log
 		// regrows it as the message arrives - roughly eight reallocations and
 		// copies for a 64KB message, on the hot path of every tunnelled byte.
 		// Streaming through the pooled buffer allocates nothing. NextReader
-		// only ever yields text or binary frames, so the message-type check the
-		// old loop did was dead code.
+		// only ever yields text or binary frames, so
 		_, r, err := wsConn.NextReader()
 		if err != nil {
 			if errors.Is(err, network.ErrCloseSent) || errors.Is(err, io.EOF) {

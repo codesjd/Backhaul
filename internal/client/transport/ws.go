@@ -15,7 +15,6 @@ import (
 	"github.com/musix/backhaul/internal/utils/network"
 	"github.com/musix/backhaul/internal/web"
 
-
 	"github.com/sirupsen/logrus"
 )
 

@@ -11,10 +11,8 @@ import (
 	"strings"
 	"time"
 
-
-	"github.com/musix/backhaul/config"
 	"github.com/gobwas/ws"
-
+	"github.com/musix/backhaul/config"
 )
 
 func WebSocketDialer(ctx context.Context, addr string, edgeIP string, path string, timeout time.Duration, keepalive time.Duration, nodelay bool, token string, userAgent string, mode config.TransportType, retry int, SO_RCVBUF int, SO_SNDBUF int, mss int, tlsVerify bool) (*WebSocketConn, error) {
@@ -93,8 +91,8 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 		wsURL = fmt.Sprintf("ws://%s%s", addr, path)
 
 		dialer = ws.Dialer{
-			Header: ws.HandshakeHeaderHTTP(headers),
-			Timeout:  45 * time.Second,
+			Header:  ws.HandshakeHeaderHTTP(headers),
+			Timeout: 45 * time.Second,
 			NetDial: func(ctx context.Context, _, addr string) (net.Conn, error) {
 				conn, err := TcpDialer(ctx, edgeIP, "", timeout, keepalive, nodelay, 1, SO_RCVBUF, SO_SNDBUF, mss)
 				if err != nil {
@@ -112,8 +110,8 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 		}
 
 		dialer = ws.Dialer{
-			Header: ws.HandshakeHeaderHTTP(headers),
-			Timeout:  45 * time.Second,
+			Header:  ws.HandshakeHeaderHTTP(headers),
+			Timeout: 45 * time.Second,
 			NetDial: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				// insecureSkipVerify is the inverse of the operator's tls_verify:
 				// off by default (self-signed friendly), but an on-path party can

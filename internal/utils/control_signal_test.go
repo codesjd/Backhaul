@@ -9,8 +9,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-
 )
 
 // wsPair returns the two ends of a real WebSocket connection, so the handler is

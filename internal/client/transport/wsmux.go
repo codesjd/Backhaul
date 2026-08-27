@@ -18,7 +18,6 @@ import (
 	"github.com/musix/backhaul/internal/web"
 	"github.com/xtaci/smux"
 
-
 	"github.com/sirupsen/logrus"
 )
 

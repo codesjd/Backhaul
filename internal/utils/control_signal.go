@@ -1,13 +1,11 @@
 package utils
 
 import (
-	"github.com/musix/backhaul/internal/utils/network"
 	crand "crypto/rand"
+	"github.com/musix/backhaul/internal/utils/network"
 	"math/big"
 	"math/rand"
 	"time"
-
-
 )
 
 // maxControlPadding bounds the random padding appended to control-channel
