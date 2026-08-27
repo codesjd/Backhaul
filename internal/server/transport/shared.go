@@ -4,17 +4,17 @@ import (
 	"context"
 	"crypto/subtle"
 	"errors"
+	"github.com/musix/backhaul/internal/utils/network"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
 )
 
 type TunnelChannel struct { // for websocket
-	conn *websocket.Conn
+	conn *network.WebSocketConn
 	ping chan struct{}
 	mu   *sync.Mutex
 }

@@ -11,13 +11,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gobwas/ws"
 	"github.com/musix/backhaul/config"
 	"github.com/musix/backhaul/internal/utils"
 	"github.com/musix/backhaul/internal/utils/handlers"
 	"github.com/musix/backhaul/internal/utils/network"
 	"github.com/musix/backhaul/internal/web"
 
-	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
 )
 
@@ -30,7 +30,7 @@ type WsTransport struct {
 	tunnelChannel  chan TunnelChannel
 	localChannel   chan LocalTCPConn
 	reqNewConnChan chan struct{}
-	controlChannel *websocket.Conn
+	controlChannel *network.WebSocketConn
 	// controlMu guards controlChannel. The HTTP handler installs it, the
 	// channel handler reads it on every heartbeat and Restart clears it, all
 	// from different goroutines - unsynchronized that is a data race, and
@@ -152,7 +152,7 @@ func (s *WsTransport) Restart() {
 // argument rather than reading s.controlChannel on every use: the field is
 // shared with the HTTP handler and Restart, so a handler whose connection has
 // died must not touch a pointer that by then may hold something else.
-func (s *WsTransport) channelHandler(conn *websocket.Conn) {
+func (s *WsTransport) channelHandler(conn *network.WebSocketConn) {
 	// A jittered timer (instead of a fixed-period ticker) so the heartbeat
 	// cadence isn't perfectly periodic, which is an easy fingerprint for
 	// traffic-pattern based DPI. wsmux/wssmux already do this.
@@ -241,14 +241,6 @@ func (s *WsTransport) tunnelListener() {
 	basePath := network.NormalizeBasePath(s.config.Path)
 	channelPath := basePath + "/channel"
 	tunnelPathPrefix := basePath + "/tunnel"
-	upgrader := websocket.Upgrader{
-		ReadBufferSize:   64 * 1024,
-		WriteBufferSize:  64 * 1024,
-		HandshakeTimeout: 45 * time.Second,
-		CheckOrigin: func(r *http.Request) bool {
-			return true
-		},
-	}
 
 	// Built once rather than per request: this ran through fmt.Sprintf on
 	// every probe that reached the listener.
@@ -285,11 +277,12 @@ func (s *WsTransport) tunnelListener() {
 				return
 			}
 
-			conn, err := upgrader.Upgrade(w, r, nil)
+			netConn, brw, _, err := ws.UpgradeHTTP(r, w)
 			if err != nil {
 				s.logger.Errorf("failed to upgrade connection from %s: %v", r.RemoteAddr, err)
 				return
 			}
+			conn := network.NewWebSocketConn(netConn, ws.StateServerSide, brw.Reader)
 
 			if r.URL.Path == channelPath {
 				s.controlMu.Lock()
@@ -578,7 +571,7 @@ func (s *WsTransport) handleLoop() {
 					// the per-connection struct, so nothing leaks - do not
 					// "balance" it with an Unlock.
 					tunnelConnection.mu.Lock()
-					if err := tunnelConnection.conn.WriteMessage(websocket.TextMessage, []byte(localConn.remoteAddr)); err != nil {
+					if err := tunnelConnection.conn.WriteMessage(network.TextMessage, []byte(localConn.remoteAddr)); err != nil {
 						s.logger.Debugf("%v", err) // failed to send port number
 						tunnelConnection.conn.Close()
 						continue loop
@@ -620,7 +613,7 @@ func (s *WsTransport) keepAlive(conn *TunnelChannel) {
 				return
 			}
 
-			if err := conn.conn.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_Ping}); err != nil {
+			if err := conn.conn.WriteMessage(network.BinaryMessage, []byte{utils.SG_Ping}); err != nil {
 				conn.mu.Unlock()
 				conn.conn.Close()
 				return

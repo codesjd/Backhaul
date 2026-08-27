@@ -3,11 +3,11 @@ package handlers
 import (
 	"context"
 	"errors"
+	"github.com/musix/backhaul/internal/utils/network"
 	"io"
 	"net"
 	"sync"
 
-	"github.com/gorilla/websocket"
 	"github.com/musix/backhaul/internal/web"
 	"github.com/sirupsen/logrus"
 )
@@ -41,7 +41,7 @@ type onlyWriter struct {
 // socket with unread data that full close is an RST, which discards the
 // buffered tail: the same silent reply truncation that TCPConnectionHandler was
 // fixed for, still live on ws/wss because this handler never got the fix.
-func WSConnectionHandler(ctx context.Context, proxyProtocol bool, wsConn *websocket.Conn, tcpConn net.Conn, logger *logrus.Logger, usage *web.Usage, remotePort int, sniffer bool) {
+func WSConnectionHandler(ctx context.Context, proxyProtocol bool, wsConn *network.WebSocketConn, tcpConn net.Conn, logger *logrus.Logger, usage *web.Usage, remotePort int, sniffer bool) {
 	// Write Proxy Protocol V2 Header. proxy_protocol was accepted and silently
 	// ignored on ws/wss - the local service saw the tunnel's address as the
 	// client's on every request, which for anything doing per-IP rate limiting,
@@ -57,7 +57,7 @@ func WSConnectionHandler(ctx context.Context, proxyProtocol bool, wsConn *websoc
 		// Sent as a frame rather than written to the socket: the peer reads this
 		// leg with NextReader, so a raw write would land mid-frame and corrupt
 		// the stream.
-		if err := wsConn.WriteMessage(websocket.BinaryMessage, header); err != nil {
+		if err := wsConn.WriteMessage(network.BinaryMessage, header); err != nil {
 			logger.Errorf("failed to send Proxy Protocol v2 header: %v", err)
 			wsConn.Close()
 			tcpConn.Close()
@@ -75,6 +75,7 @@ func WSConnectionHandler(ctx context.Context, proxyProtocol bool, wsConn *websoc
 	go func() {
 		select {
 		case <-ctx.Done():
+			logger.Trace("WSConnectionHandler ctx cancelled!")
 			wsConn.Close()
 			tcpConn.Close()
 		case <-done:
@@ -99,7 +100,7 @@ func WSConnectionHandler(ctx context.Context, proxyProtocol bool, wsConn *websoc
 }
 
 // transferWebSocketToTCP transfers data from a WebSocket connection to a TCP connection
-func transferWebSocketToTCP(wsConn *websocket.Conn, tcpConn net.Conn, logger *logrus.Logger, usage *web.Usage, remotePort int, sniffer bool) {
+func transferWebSocketToTCP(wsConn *network.WebSocketConn, tcpConn net.Conn, logger *logrus.Logger, usage *web.Usage, remotePort int, sniffer bool) {
 	// Each direction takes its own buffer from the pool - they run
 	// concurrently, so they cannot share one.
 	bufPtr := copyBufferPool.Get().(*[]byte)
@@ -111,11 +112,10 @@ func transferWebSocketToTCP(wsConn *websocket.Conn, tcpConn net.Conn, logger *lo
 		// regrows it as the message arrives - roughly eight reallocations and
 		// copies for a 64KB message, on the hot path of every tunnelled byte.
 		// Streaming through the pooled buffer allocates nothing. NextReader
-		// only ever yields text or binary frames, so the message-type check the
-		// old loop did was dead code.
+		// only ever yields text or binary frames, so
 		_, r, err := wsConn.NextReader()
 		if err != nil {
-			if errors.Is(err, websocket.ErrCloseSent) || errors.Is(err, io.EOF) {
+			if errors.Is(err, network.ErrCloseSent) || errors.Is(err, io.EOF) {
 				logger.Trace("WebSocket reader stream closed or EOF received")
 			} else {
 				logger.Trace("unable to read from the WebSocket connection: ", err)
@@ -152,7 +152,7 @@ func transferWebSocketToTCP(wsConn *websocket.Conn, tcpConn net.Conn, logger *lo
 }
 
 // transferTCPToWebSocket transfers data from a TCP connection to a WebSocket connection
-func transferTCPToWebSocket(tcpConn net.Conn, wsConn *websocket.Conn, logger *logrus.Logger, usage *web.Usage, remotePort int, sniffer bool) {
+func transferTCPToWebSocket(tcpConn net.Conn, wsConn *network.WebSocketConn, logger *logrus.Logger, usage *web.Usage, remotePort int, sniffer bool) {
 	bufPtr := copyBufferPool.Get().(*[]byte)
 	defer copyBufferPool.Put(bufPtr)
 	buf := *bufPtr
@@ -161,8 +161,8 @@ func transferTCPToWebSocket(tcpConn net.Conn, wsConn *websocket.Conn, logger *lo
 		n, err := tcpConn.Read(buf)
 
 		if n > 0 {
-			if werr := wsConn.WriteMessage(websocket.BinaryMessage, buf[:n]); werr != nil {
-				if errors.Is(werr, websocket.ErrCloseSent) || errors.Is(werr, io.EOF) {
+			if werr := wsConn.WriteMessage(network.BinaryMessage, buf[:n]); werr != nil {
+				if errors.Is(werr, network.ErrCloseSent) || errors.Is(werr, io.EOF) {
 					logger.Trace("WebSocket writer stream closed or EOF received")
 				} else {
 					logger.Trace("unable to write to the WebSocket connection: ", werr)
@@ -187,7 +187,7 @@ func transferTCPToWebSocket(tcpConn net.Conn, wsConn *websocket.Conn, logger *lo
 			// leaving the reverse direction free to relay that reply. A full
 			// close here is what used to truncate it.
 			logger.Trace("TCP reader stream closed or EOF received")
-			if werr := wsConn.WriteMessage(websocket.BinaryMessage, wsEOFMarker); werr != nil {
+			if werr := wsConn.WriteMessage(network.BinaryMessage, wsEOFMarker); werr != nil {
 				logger.Trace("unable to send the EOF marker: ", werr)
 				tcpConn.Close()
 				wsConn.Close()

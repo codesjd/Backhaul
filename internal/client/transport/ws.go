@@ -15,7 +15,6 @@ import (
 	"github.com/musix/backhaul/internal/utils/network"
 	"github.com/musix/backhaul/internal/web"
 
-	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
 )
 
@@ -25,7 +24,7 @@ type WsTransport struct {
 	ctx            context.Context
 	cancel         context.CancelFunc
 	logger         *logrus.Logger
-	controlChannel *websocket.Conn
+	controlChannel *network.WebSocketConn
 	// controlMu guards controlChannel. The dialer installs it, the channel
 	// handler reads it on every heartbeat and Restart clears it, all from
 	// different goroutines - unsynchronized that is a data race, and Restart
@@ -249,7 +248,7 @@ func (c *WsTransport) poolMaintainer() {
 // argument rather than reading c.controlChannel on every use: the field is
 // shared with the dialer and Restart, so a handler whose connection has died
 // must not touch a pointer that by then may hold something else.
-func (c *WsTransport) channelHandler(conn *websocket.Conn) {
+func (c *WsTransport) channelHandler(conn *network.WebSocketConn) {
 	msgChan := make(chan byte, 1000)
 
 	// Goroutine to handle the blocking ReceiveBinaryString
@@ -377,7 +376,7 @@ func (c *WsTransport) tunnelDialer() {
 	}
 }
 
-func (c *WsTransport) localDialer(tunnelCon *websocket.Conn, remoteAddr string, port int) {
+func (c *WsTransport) localDialer(tunnelCon *network.WebSocketConn, remoteAddr string, port int) {
 	var sendBuf, recvBuf int
 
 	if strings.Contains(remoteAddr, "127.0.0.1") {

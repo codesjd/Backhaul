@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gobwas/ws"
 	"github.com/musix/backhaul/config" // for mode
 	"github.com/musix/backhaul/internal/utils"
 	"github.com/musix/backhaul/internal/utils/handlers"
@@ -20,7 +21,6 @@ import (
 	"github.com/musix/backhaul/internal/web"
 	"github.com/xtaci/smux"
 
-	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
 )
 
@@ -34,7 +34,7 @@ type WsMuxTransport struct {
 	tunnelChannel  chan *smux.Session
 	localChannel   chan LocalTCPConn
 	reqNewConnChan chan struct{}
-	controlChannel *websocket.Conn
+	controlChannel *network.WebSocketConn
 	usageMonitor   *web.Usage
 	restartMutex   sync.Mutex
 	streamCounter  int32
@@ -218,7 +218,7 @@ func (s *WsMuxTransport) Restart() {
 // channel can be replaced without restarting the transport, a handler for a
 // dead connection must never touch the shared pointer that now holds its
 // successor.
-func (s *WsMuxTransport) channelHandler(conn *websocket.Conn) {
+func (s *WsMuxTransport) channelHandler(conn *network.WebSocketConn) {
 	// A jittered timer (instead of a fixed-period ticker) so the heartbeat
 	// cadence isn't perfectly periodic, which is an easy fingerprint for
 	// traffic-pattern based DPI.
@@ -318,7 +318,7 @@ const controlGraceWindow = 30 * time.Second
 // the control channel, so it all stays up and only the control channel is
 // dropped. If the client hasn't reattached one within controlGraceWindow, fall
 // back to the old behaviour and rebuild the whole transport.
-func (s *WsMuxTransport) onControlLost(conn *websocket.Conn) {
+func (s *WsMuxTransport) onControlLost(conn *network.WebSocketConn) {
 	s.controlMu.Lock()
 	if s.controlChannel != conn {
 		// Already cleared, or the client has since reattached: this is a late
@@ -354,14 +354,6 @@ func (s *WsMuxTransport) tunnelListener() {
 	basePath := network.NormalizeBasePath(s.config.Path)
 	channelPath := basePath + "/channel"
 	tunnelPathPrefix := basePath + "/tunnel"
-	upgrader := websocket.Upgrader{
-		ReadBufferSize:   64 * 1024,
-		WriteBufferSize:  64 * 1024,
-		HandshakeTimeout: 45 * time.Second,
-		CheckOrigin: func(r *http.Request) bool {
-			return true
-		},
-	}
 
 	// Built once rather than per request: this ran through fmt.Sprintf on
 	// every probe that reached the listener.
@@ -398,11 +390,12 @@ func (s *WsMuxTransport) tunnelListener() {
 				return
 			}
 
-			conn, err := upgrader.Upgrade(w, r, nil)
+			netConn, brw, _, err := ws.UpgradeHTTP(r, w)
 			if err != nil {
 				s.logger.Errorf("failed to upgrade connection from %s: %v", r.RemoteAddr, err)
 				return
 			}
+			conn := network.NewWebSocketConn(netConn, ws.StateServerSide, brw.Reader)
 
 			if r.URL.Path == channelPath {
 				s.controlMu.Lock()
@@ -464,7 +457,7 @@ func (s *WsMuxTransport) tunnelListener() {
 				s.config.TunnelStatus = fmt.Sprintf("Connected (%s)", s.config.Mode)
 
 			} else if strings.HasPrefix(r.URL.Path, tunnelPathPrefix) {
-				session, err := smux.Client(conn.NetConn(), s.smuxConfig)
+				session, err := smux.Client(netConn, s.smuxConfig)
 				if err != nil {
 					s.logger.Errorf("failed to create MUX session for connection %s: %v", conn.RemoteAddr().String(), err)
 					conn.Close()

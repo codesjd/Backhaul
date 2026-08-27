@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"github.com/gobwas/ws/wsutil"
 	"io"
 	"net"
 	"net/http"
@@ -14,30 +15,31 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/gobwas/ws"
+	"github.com/musix/backhaul/internal/utils/network"
 )
 
 // wsPair returns the two ends of a real WebSocket connection, so the handler is
 // exercised against actual framing rather than a stand-in.
-func wsPair(t *testing.T) (client, server *websocket.Conn) {
+func wsPair(t *testing.T) (client, server *network.WebSocketConn) {
 	t.Helper()
 
-	upgrader := websocket.Upgrader{ReadBufferSize: 64 * 1024, WriteBufferSize: 64 * 1024}
-	srvCh := make(chan *websocket.Conn, 1)
+	srvCh := make(chan *network.WebSocketConn, 1)
 
 	hs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, err := upgrader.Upgrade(w, r, nil)
+		netConn, _, _, err := ws.UpgradeHTTP(r, w)
 		if err != nil {
 			return
 		}
-		srvCh <- c
+		srvCh <- network.NewWebSocketConn(netConn, ws.StateServerSide, nil)
 	}))
 	t.Cleanup(hs.Close)
 
-	c, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(hs.URL, "http"), nil)
+	netConn, br, _, err := ws.DefaultDialer.Dial(context.Background(), "ws"+strings.TrimPrefix(hs.URL, "http"))
 	if err != nil {
 		t.Fatalf("ws dial: %v", err)
 	}
+	c := network.NewWebSocketConn(netConn, ws.StateClientSide, br)
 	t.Cleanup(func() { c.Close() })
 
 	select {
@@ -269,4 +271,56 @@ func TestWSConnectionHandlerWritesProxyProtocol(t *testing.T) {
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("payload after the header is %q, want %q", got, payload)
 	}
+}
+
+func TestWSConnectionHandlerIgnoresPings(t *testing.T) {
+	wsClient, wsServer := wsPair(t)
+
+	tcpConn1, tcpConn2 := net.Pipe()
+	defer tcpConn1.Close()
+	defer tcpConn2.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	logger := testLogger()
+	usage := testUsage(t)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		WSConnectionHandler(ctx, false, wsClient, tcpConn1, logger, usage, 1234, false)
+	}()
+
+	// Send a PING frame from the server directly to the client connection
+	err := wsutil.WriteMessage(wsServer.NetConn(), ws.StateServerSide, ws.OpPing, []byte("ping"))
+	if err != nil {
+		t.Fatalf("failed to write ping: %v", err)
+	}
+
+	// Wait briefly to allow the handler to process the ping
+	time.Sleep(100 * time.Millisecond)
+
+	// Now send a real data frame
+	payload := []byte("hello data")
+	err = wsServer.WriteMessage(network.BinaryMessage, payload)
+	if err != nil {
+		t.Fatalf("failed to write data: %v", err)
+	}
+
+	// Ensure the TCP pipe receives ONLY the data frame, and the connection remains open
+	buf := make([]byte, 1024)
+	tcpConn2.SetReadDeadline(time.Now().Add(1 * time.Second))
+	n, err := tcpConn2.Read(buf)
+	if err != nil {
+		t.Fatalf("failed to read from tcp pipe: %v", err)
+	}
+
+	if string(buf[:n]) != string(payload) {
+		t.Fatalf("expected payload %q, got %q", payload, buf[:n])
+	}
+
+	cancel()
+	wg.Wait()
 }
