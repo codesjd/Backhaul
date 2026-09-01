@@ -53,9 +53,22 @@ func NewWebSocketConn(conn net.Conn, state ws.State, br *bufio.Reader) *WebSocke
 	r := wsutil.NewReader(wrap, state)
 
 	wsConn := &WebSocketConn{
-		Conn:   wrap,
-		state:  state,
-		writer: wsutil.NewWriter(wrap, state, ws.OpBinary),
+		Conn:  wrap,
+		state: state,
+		// Sized to match handlers.copyBufferSize, the largest payload
+		// WriteMessage is ever handed. wsutil.NewWriter's 4KB default was
+		// smaller than that, so every full-sized write took gobwas's
+		// WriteThrough path: a separate socket write for the header, one for
+		// the payload as a non-final fragment, and a third from Flush for an
+		// empty continuation frame carrying only fin. That is three writes and
+		// two frames per message - three TCP segments under TCP_NODELAY, two of
+		// them a handful of bytes, and three separate TLS records on wss.
+		// Giving the writer room for a whole buffer keeps it on the copy path,
+		// where flushFragment emits header and payload in a single write.
+		//
+		// Keep this at or above copyBufferSize: if the copy buffer grows past
+		// it, the fragmented path silently comes back.
+		writer: wsutil.NewWriterSize(wrap, state, ws.OpBinary, 64*1024),
 	}
 	r.OnIntermediate = func(hdr ws.Header, src io.Reader) error {
 		// Drain intermediate frames (e.g. fragments of control frames)
