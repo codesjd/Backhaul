@@ -55,7 +55,7 @@ func NewWebSocketConn(conn net.Conn, state ws.State, br *bufio.Reader) *WebSocke
 	wsConn := &WebSocketConn{
 		Conn:   wrap,
 		state:  state,
-		writer: wsutil.NewWriter(wrap, state, ws.OpBinary),
+		writer: wsutil.NewWriterSize(wrap, state, ws.OpBinary, 64*1024),
 	}
 	r.OnIntermediate = func(hdr ws.Header, src io.Reader) error {
 		// Drain intermediate frames (e.g. fragments of control frames)
