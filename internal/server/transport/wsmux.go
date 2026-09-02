@@ -95,8 +95,6 @@ type WsMuxConfig struct {
 	StripeFactor         int
 	StripeParity         int
 	StripePorts          []string
-	PromoteBytes         uint64
-	PromoteRate          uint64
 	Fallback             string        // decoy backend for non-tunnel requests (host:port), optional
 	TLSEngine            string        // "go" (default) or "openssl" for wssmux TLS termination
 	MaxConnAge           time.Duration // retire pool connections at this age (0 = never); see retireSession
