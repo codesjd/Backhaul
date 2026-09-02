@@ -46,15 +46,17 @@ type WsMuxTransport struct {
 	// connection died at the same moment".
 	admittedSessions int32
 	stripedFlows     int32 // in-flight striped flows, bounded by the pool's stream budget
+	plainFlows       int32 // in-flight plain flows, bounded by the pool's stream budget
 
 	// sessions is a live registry of pool sessions, used only when
 	// StripeFactor > 1 so the striped dispatcher can pick several sessions
 	// to open legs of the same logical connection on. The non-striped path
 	// (StripeFactor <= 1, the default) never touches this.
-	sessionsMu     sync.Mutex
-	sessions       []*smux.Session
-	stripeRotation uint32
-	stripeGroupID  uint32
+	sessionsMu      sync.Mutex
+	sessions        []*smux.Session
+	stripeRotation  uint32
+	stripeGroupID   uint32
+	elephantTracker *ElephantTracker
 
 	fallbackProxy http.Handler
 
@@ -94,6 +96,8 @@ type WsMuxConfig struct {
 	StripeFactor         int
 	StripeParity         int
 	StripePorts          []string
+	PromoteBytes         uint64
+	PromoteRate          uint64
 	Fallback             string        // decoy backend for non-tunnel requests (host:port), optional
 	TLSEngine            string        // "go" (default) or "openssl" for wssmux TLS termination
 	MaxConnAge           time.Duration // retire pool connections at this age (0 = never); see retireSession
@@ -121,19 +125,20 @@ func NewWSMuxServer(parentCtx context.Context, config *WsMuxConfig, logger *logr
 			MaxReceiveBuffer:  config.MaxReceiveBuffer,
 			MaxStreamBuffer:   config.MaxStreamBuffer,
 		},
-		config:         config,
-		parentctx:      parentCtx,
-		ctx:            ctx,
-		cancel:         cancel,
-		logger:         logger,
-		tunnelChannel:  make(chan *smux.Session, config.ChannelSize),
-		localChannel:   make(chan LocalTCPConn, config.ChannelSize),
-		reqNewConnChan: make(chan struct{}, config.ChannelSize),
-		streamCounter:  0,
-		sessionCounter: 0,
-		controlChannel: nil, // will be set when a control connection is established
-		usageMonitor:   web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), ctx, config.SnifferLog, config.Sniffer, &config.TunnelStatus, logger),
-		fallbackProxy:  fallbackProxy,
+		config:          config,
+		parentctx:       parentCtx,
+		ctx:             ctx,
+		cancel:          cancel,
+		logger:          logger,
+		tunnelChannel:   make(chan *smux.Session, config.ChannelSize),
+		localChannel:    make(chan LocalTCPConn, config.ChannelSize),
+		reqNewConnChan:  make(chan struct{}, config.ChannelSize),
+		streamCounter:   0,
+		sessionCounter:  0,
+		controlChannel:  nil, // will be set when a control connection is established
+		elephantTracker: NewElephantTracker(config.PromoteBytes),
+		usageMonitor:    web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), ctx, config.SnifferLog, config.Sniffer, &config.TunnelStatus, logger),
+		fallbackProxy:   fallbackProxy,
 	}
 
 	return server
@@ -791,13 +796,18 @@ func (s *WsMuxTransport) dispatchLoop() {
 }
 
 func (s *WsMuxTransport) shouldStripe(incomingConn LocalTCPConn) bool {
+	remotePort := ""
+	if _, port, err := net.SplitHostPort(incomingConn.remoteAddr); err == nil {
+		remotePort = port
+	} else {
+		remotePort = incomingConn.remoteAddr
+	}
+
+	if s.elephantTracker != nil && s.elephantTracker.IsElephant(incomingConn.remoteAddr) {
+		return true
+	}
+
 	if len(s.config.StripePorts) > 0 {
-		remotePort := ""
-		if _, port, err := net.SplitHostPort(incomingConn.remoteAddr); err == nil {
-			remotePort = port
-		} else {
-			remotePort = incomingConn.remoteAddr
-		}
 		for _, p := range s.config.StripePorts {
 			if p == remotePort {
 				return true
@@ -818,8 +828,15 @@ func (s *WsMuxTransport) dispatchPlain(incomingConn LocalTCPConn) {
 		return
 	}
 
+	if !s.acquirePlainSlot() {
+		incomingConn.conn.Close()
+		atomic.AddInt32(&s.streamCounter, -1)
+		return
+	}
+
 	legs, err := s.openStripedLegs(1)
 	if err != nil {
+		atomic.AddInt32(&s.plainFlows, -1)
 		s.logger.Tracef("plain dispatch: %v, retrying shortly", err)
 		time.Sleep(100 * time.Millisecond)
 		incomingConn.timeCreated = time.Now().UnixMilli()
@@ -829,17 +846,13 @@ func (s *WsMuxTransport) dispatchPlain(incomingConn LocalTCPConn) {
 
 	stream := legs[0]
 
+	var prefix []byte
 	if s.config.MuxVersion >= 2 {
-		if err := utils.SendFlowKind(stream, utils.FlowPlain); err != nil {
-			s.logger.Tracef("failed to send flow kind: %v", err)
-			stream.Close()
-			incomingConn.timeCreated = time.Now().UnixMilli()
-			s.requeueOrDrop(incomingConn)
-			return
-		}
+		prefix = []byte{utils.FlowPlain}
 	}
 
-	if err := utils.SendBinaryString(stream, incomingConn.remoteAddr); err != nil {
+	if err := utils.SendBinaryStringWithPrefix(stream, prefix, incomingConn.remoteAddr); err != nil {
+		atomic.AddInt32(&s.plainFlows, -1)
 		s.logger.Tracef("failed to send address over stream: %v", err)
 		stream.Close()
 		incomingConn.timeCreated = time.Now().UnixMilli()
@@ -847,8 +860,17 @@ func (s *WsMuxTransport) dispatchPlain(incomingConn LocalTCPConn) {
 		return
 	}
 
-	handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, incomingConn.conn, stream, s.logger, s.usageMonitor, incomingConn.conn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
-	atomic.AddInt32(&s.streamCounter, -1)
+	defer atomic.AddInt32(&s.plainFlows, -1)
+	defer atomic.AddInt32(&s.streamCounter, -1)
+
+	trackedConn := &trackingConn{
+		Conn: incomingConn.conn,
+		onClose: func(written, read int64) {
+			s.elephantTracker.RecordBytes(incomingConn.remoteAddr, written+read)
+		},
+	}
+
+	handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, trackedConn, stream, s.logger, s.usageMonitor, incomingConn.conn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
 }
 
 // dispatchStriped opens the striped legs for one incoming connection, sends the
@@ -900,20 +922,13 @@ func (s *WsMuxTransport) dispatchStriped(incomingConn LocalTCPConn) {
 	}
 
 	gid := atomic.AddUint32(&s.stripeGroupID, 1)
+	var prefix []byte
+	if s.config.MuxVersion >= 2 {
+		prefix = []byte{utils.FlowStriped}
+	}
+
 	for i, stream := range legs {
-		if s.config.MuxVersion >= 2 {
-			if err := utils.SendFlowKind(stream, utils.FlowStriped); err != nil {
-				atomic.AddInt32(&s.stripedFlows, -1) // release before requeue
-				s.logger.Tracef("failed to send flow kind: %v", err)
-				for _, st := range legs {
-					st.Close()
-				}
-				incomingConn.timeCreated = time.Now().UnixMilli()
-				s.requeueOrDrop(incomingConn)
-				return
-			}
-		}
-		if err := utils.SendStripeHeader(stream, gid, uint8(i), uint8(len(legs)), uint8(s.config.StripeParity), incomingConn.remoteAddr); err != nil {
+		if err := utils.SendStripeHeaderWithPrefix(stream, prefix, gid, uint8(i), uint8(len(legs)), uint8(s.config.StripeParity), incomingConn.remoteAddr); err != nil {
 			atomic.AddInt32(&s.stripedFlows, -1) // release before requeue
 			s.logger.Tracef("failed to send stripe header: %v", err)
 			for _, st := range legs {
@@ -949,7 +964,15 @@ func (s *WsMuxTransport) dispatchStriped(incomingConn LocalTCPConn) {
 
 	defer atomic.AddInt32(&s.stripedFlows, -1) // hold the slot for the flow's lifetime
 	defer atomic.AddInt32(&s.streamCounter, -1)
-	handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, incomingConn.conn, stripedConn, s.logger, s.usageMonitor, incomingConn.conn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
+
+	trackedConn := &trackingConn{
+		Conn: incomingConn.conn,
+		onClose: func(written, read int64) {
+			s.elephantTracker.RecordBytes(incomingConn.remoteAddr, written+read)
+		},
+	}
+
+	handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, trackedConn, stripedConn, s.logger, s.usageMonitor, incomingConn.conn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
 }
 
 // legsPerFlow is how many pool legs one striped flow opens: the plain
@@ -1143,5 +1166,31 @@ func (s *WsMuxTransport) handleSessionError(incomingConn *LocalTCPConn, err erro
 	case s.reqNewConnChan <- struct{}{}:
 	default:
 		s.logger.Warn("request new connection channel is full")
+	}
+}
+
+func (s *WsMuxTransport) acquirePlainSlot() bool {
+	for {
+		active := atomic.LoadInt32(&s.plainFlows)
+		budget := atomic.LoadInt32(&s.sessionCounter) * int32(s.config.MuxCon)
+		if budget < 1 {
+			budget = 1 // always admit at least one flow while the pool warms up
+		}
+		if (active + 1) <= budget {
+			if atomic.CompareAndSwapInt32(&s.plainFlows, active, active+1) {
+				return true
+			}
+			continue // lost the CAS race, re-read and retry
+		}
+		// Budget full: ask for a replacement session so the budget grows.
+		select {
+		case s.reqNewConnChan <- struct{}{}:
+		default:
+		}
+		select {
+		case <-s.ctx.Done():
+			return false
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 }
