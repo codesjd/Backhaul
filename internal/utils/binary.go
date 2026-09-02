@@ -259,3 +259,85 @@ func ReceiveBinaryByte(conn net.Conn) (byte, error) {
 	// Convert the message buffer to a string and return it
 	return messageBuf[0], nil
 }
+
+const (
+	FlowPlain   byte = 0x00
+	FlowStriped byte = 0x01
+	FlowPromote byte = 0x02
+)
+
+func SendFlowPlain(conn net.Conn, flowID uint64, remoteAddr string) error {
+	const headerSize = 1 + 8 + 2
+	buf := make([]byte, headerSize+len(remoteAddr))
+	buf[0] = FlowPlain
+	binary.BigEndian.PutUint64(buf[1:9], flowID)
+	binary.BigEndian.PutUint16(buf[9:11], uint16(len(remoteAddr)))
+	copy(buf[11:], remoteAddr)
+	if _, err := conn.Write(buf); err != nil {
+		return fmt.Errorf("failed to send plain flow header: %w", err)
+	}
+	return nil
+}
+
+func ReceiveFlowPlain(conn net.Conn) (flowID uint64, remoteAddr string, err error) {
+	const headerSize = 8 + 2
+	head := make([]byte, headerSize)
+	if _, err = io.ReadFull(conn, head); err != nil {
+		return 0, "", fmt.Errorf("failed to read plain flow header: %w", err)
+	}
+	flowID = binary.BigEndian.Uint64(head[0:8])
+	addrLen := binary.BigEndian.Uint16(head[8:10])
+	addrBuf := make([]byte, addrLen)
+	if addrLen > 0 {
+		if _, err = io.ReadFull(conn, addrBuf); err != nil {
+			return 0, "", fmt.Errorf("failed to read plain flow header address: %w", err)
+		}
+	}
+	return flowID, string(addrBuf), nil
+}
+
+func SendFlowPromote(conn net.Conn, flowID uint64, groupID uint32, index, total, parity uint8) error {
+	const headerSize = 1 + 8 + 4 + 1 + 1 + 1
+	buf := make([]byte, headerSize)
+	buf[0] = FlowPromote
+	binary.BigEndian.PutUint64(buf[1:9], flowID)
+	binary.BigEndian.PutUint32(buf[9:13], groupID)
+	buf[13] = index
+	buf[14] = total
+	buf[15] = parity
+	if _, err := conn.Write(buf); err != nil {
+		return fmt.Errorf("failed to send promote flow header: %w", err)
+	}
+	return nil
+}
+
+func ReceiveFlowPromote(conn net.Conn) (flowID uint64, groupID uint32, index, total, parity uint8, err error) {
+	const headerSize = 8 + 4 + 1 + 1 + 1
+	head := make([]byte, headerSize)
+	if _, err = io.ReadFull(conn, head); err != nil {
+		return 0, 0, 0, 0, 0, fmt.Errorf("failed to read promote flow header: %w", err)
+	}
+	flowID = binary.BigEndian.Uint64(head[0:8])
+	groupID = binary.BigEndian.Uint32(head[8:12])
+	index = head[12]
+	total = head[13]
+	parity = head[14]
+	return flowID, groupID, index, total, parity, nil
+}
+
+func WriteCount(conn net.Conn, count uint64) error {
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], count)
+	if _, err := conn.Write(buf[:]); err != nil {
+		return fmt.Errorf("failed to write count: %w", err)
+	}
+	return nil
+}
+
+func ReadCount(conn net.Conn) (uint64, error) {
+	var buf [8]byte
+	if _, err := io.ReadFull(conn, buf[:]); err != nil {
+		return 0, fmt.Errorf("failed to read count: %w", err)
+	}
+	return binary.BigEndian.Uint64(buf[:]), nil
+}
