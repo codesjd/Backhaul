@@ -1,0 +1,24 @@
+<<<<<<< SEARCH
+	endpoints []wsEndpoint
+	dialSeq   int32
+}
+=======
+	endpoints []wsEndpoint
+	dialSeq   int32
+
+	promotableFlowsMu sync.Mutex
+	promotableFlows   map[uint64]*handlers.PumpSwapper
+}
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+		controlFlow:     make(chan struct{}, 100),
+		userAgent:       network.RandomUserAgent(),
+		stripeGroups:    make(map[uint32]*stripeGroup),
+	}
+=======
+		controlFlow:     make(chan struct{}, 100),
+		userAgent:       network.RandomUserAgent(),
+		stripeGroups:    make(map[uint32]*stripeGroup),
+		promotableFlows: make(map[uint64]*handlers.PumpSwapper),
+	}
+>>>>>>> REPLACE

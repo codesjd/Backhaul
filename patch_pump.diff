@@ -1,0 +1,45 @@
+<<<<<<< SEARCH
+		if writingToNew {
+			// Fast path
+			io.Copy(dest, app)
+			if cw, ok := dest.(interface{ CloseWrite() error }); ok {
+				cw.CloseWrite()
+			} else {
+				dest.Close()
+			}
+			if cw, ok := app.(interface{ CloseWrite() error }); ok {
+				cw.CloseWrite()
+			} else {
+				app.Close()
+			}
+			return
+		}
+
+		var toRead int = len(buf)
+		if limit < ^uint64(0) {
+			if limit > total {
+				rem := int(limit - total)
+				if rem < toRead {
+					toRead = rem
+				}
+			} else {
+				continue
+			}
+		}
+
+		n, readErr := app.Read(buf[:toRead])
+=======
+		var toRead int = len(buf)
+		if limit < ^uint64(0) && !writingToNew {
+			if limit > total {
+				rem := int(limit - total)
+				if rem < toRead {
+					toRead = rem
+				}
+			} else {
+				continue
+			}
+		}
+
+		n, readErr := app.Read(buf[:toRead])
+>>>>>>> REPLACE
