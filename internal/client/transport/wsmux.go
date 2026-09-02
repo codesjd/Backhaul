@@ -531,9 +531,22 @@ func (c *WsMuxTransport) handleSession(tunnelConn *network.WebSocketConn) {
 				return
 			}
 
-			if c.config.StripeFactor > 1 {
-				go c.handleStripedStream(stream)
-				continue
+			if c.config.MuxVersion >= 2 {
+				kind, err := utils.ReadFlowKind(stream)
+				if err != nil {
+					c.logger.Errorf("unable to read flow kind from stream connection %s: %v", tunnelConn.RemoteAddr().String(), err)
+					stream.Close()
+					continue
+				}
+				if kind == utils.FlowStriped {
+					go c.handleStripedStream(stream)
+					continue
+				}
+			} else {
+				if c.config.StripeFactor > 1 {
+					go c.handleStripedStream(stream)
+					continue
+				}
 			}
 
 			remoteAddr, err := utils.ReceiveBinaryString(stream)

@@ -259,3 +259,24 @@ func ReceiveBinaryByte(conn net.Conn) (byte, error) {
 	// Convert the message buffer to a string and return it
 	return messageBuf[0], nil
 }
+
+const (
+	FlowPlain   byte = 0x00
+	FlowStriped byte = 0x01
+)
+
+func SendFlowKind(conn net.Conn, kind byte) error {
+	buf := [1]byte{kind}
+	if _, err := conn.Write(buf[:]); err != nil {
+		return fmt.Errorf("failed to send flow kind: %w", err)
+	}
+	return nil
+}
+
+func ReadFlowKind(conn net.Conn) (byte, error) {
+	var buf [1]byte
+	if _, err := io.ReadFull(conn, buf[:]); err != nil {
+		return 0, fmt.Errorf("failed to read flow kind: %w", err)
+	}
+	return buf[0], nil
+}

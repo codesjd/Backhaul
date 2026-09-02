@@ -93,6 +93,7 @@ type WsMuxConfig struct {
 	MuxKeepaliveDisabled bool
 	StripeFactor         int
 	StripeParity         int
+	StripePorts          []string
 	Fallback             string        // decoy backend for non-tunnel requests (host:port), optional
 	TLSEngine            string        // "go" (default) or "openssl" for wssmux TLS termination
 	MaxConnAge           time.Duration // retire pool connections at this age (0 = never); see retireSession
@@ -450,9 +451,7 @@ func (s *WsMuxTransport) tunnelListener() {
 					go s.handleLoop()
 				}
 
-				if s.config.StripeFactor > 1 {
-					go s.stripedDispatchLoop()
-				}
+				go s.dispatchLoop()
 
 				s.config.TunnelStatus = fmt.Sprintf("Connected (%s)", s.config.Mode)
 
@@ -708,26 +707,21 @@ func (s *WsMuxTransport) handleLoop() {
 			atomic.AddInt32(&s.sessionCounter, 1)
 			atomic.AddInt32(&s.admittedSessions, 1)
 
-			if s.config.StripeFactor > 1 {
-				s.registerSession(session)
-				go func(sess *smux.Session) {
-					<-sess.CloseChan()
-					s.unregisterSession(sess)
-					atomic.AddInt32(&s.sessionCounter, -1)
-				}(session)
-				if s.config.MaxConnAge > 0 {
-					go s.rotateStripedSession(session)
-				}
-				continue
+			s.registerSession(session)
+			go func(sess *smux.Session) {
+				<-sess.CloseChan()
+				s.unregisterSession(sess)
+				atomic.AddInt32(&s.sessionCounter, -1)
+			}(session)
+			if s.config.MaxConnAge > 0 {
+				go s.rotateStripedSession(session)
 			}
-
-			go s.handleSession(session)
 		}
 	}
 }
 
 // registerSession/unregisterSession maintain the live-session pool the
-// striped dispatcher picks legs from. Only used when StripeFactor > 1.
+// striped dispatcher picks legs from.
 func (s *WsMuxTransport) registerSession(session *smux.Session) {
 	s.sessionsMu.Lock()
 	s.sessions = append(s.sessions, session)
@@ -777,27 +771,84 @@ func (s *WsMuxTransport) openStripedLegs(n int) ([]*smux.Stream, error) {
 	return streams, nil
 }
 
-// stripedDispatchLoop replaces the per-session handleSession loop when
-// StripeFactor > 1: for each incoming local connection it grabs one stream
-// from several distinct pool sessions instead of one stream from one
-// session, so the flow isn't pinned to a single underlying TCP connection.
-func (s *WsMuxTransport) stripedDispatchLoop() {
+// dispatchLoop grabs streams from pool sessions to handle incoming local connections.
+// It decides per-flow whether to use multiple legs (striped) or a single leg (plain).
+func (s *WsMuxTransport) dispatchLoop() {
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
 
 		case incomingConn := <-s.localChannel:
-			// Set up each flow in its own goroutine. Opening the legs and writing
-			// the per-leg stripe headers can block on smux flow control when the
-			// pool is busy carrying bulk data; doing it inline would serialize
-			// every new flow's startup behind that one blocking write (the
-			// non-striped path avoids this by dispatching per session). Handing
-			// off keeps a slow setup from inflating the time-to-first-byte of
-			// every other pending connection.
-			go s.dispatchStriped(incomingConn)
+			// Set up each flow in its own goroutine.
+			if s.shouldStripe(incomingConn) {
+				go s.dispatchStriped(incomingConn)
+			} else {
+				go s.dispatchPlain(incomingConn)
+			}
 		}
 	}
+}
+
+func (s *WsMuxTransport) shouldStripe(incomingConn LocalTCPConn) bool {
+	if len(s.config.StripePorts) > 0 {
+		remotePort := ""
+		if _, port, err := net.SplitHostPort(incomingConn.remoteAddr); err == nil {
+			remotePort = port
+		} else {
+			remotePort = incomingConn.remoteAddr
+		}
+		for _, p := range s.config.StripePorts {
+			if p == remotePort {
+				return true
+			}
+		}
+		return false
+	}
+	return s.config.StripeFactor > 1
+}
+
+// dispatchPlain opens a single leg for one incoming connection, sends the
+// plain header, and pumps the flow.
+func (s *WsMuxTransport) dispatchPlain(incomingConn LocalTCPConn) {
+	if time.Now().UnixMilli()-incomingConn.timeCreated > 3000 { // 3000ms
+		s.logger.Debugf("timeouted local connection: %d ms", time.Now().UnixMilli()-incomingConn.timeCreated)
+		incomingConn.conn.Close()
+		atomic.AddInt32(&s.streamCounter, -1)
+		return
+	}
+
+	legs, err := s.openStripedLegs(1)
+	if err != nil {
+		s.logger.Tracef("plain dispatch: %v, retrying shortly", err)
+		time.Sleep(100 * time.Millisecond)
+		incomingConn.timeCreated = time.Now().UnixMilli()
+		s.requeueOrDrop(incomingConn)
+		return
+	}
+
+	stream := legs[0]
+
+	if s.config.MuxVersion >= 2 {
+		if err := utils.SendFlowKind(stream, utils.FlowPlain); err != nil {
+			s.logger.Tracef("failed to send flow kind: %v", err)
+			stream.Close()
+			incomingConn.timeCreated = time.Now().UnixMilli()
+			s.requeueOrDrop(incomingConn)
+			return
+		}
+	}
+
+	if err := utils.SendBinaryString(stream, incomingConn.remoteAddr); err != nil {
+		s.logger.Tracef("failed to send address over stream: %v", err)
+		stream.Close()
+		incomingConn.timeCreated = time.Now().UnixMilli()
+		s.requeueOrDrop(incomingConn)
+		return
+	}
+
+	handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, incomingConn.conn, stream, s.logger, s.usageMonitor, incomingConn.conn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
+	atomic.AddInt32(&s.streamCounter, -1)
 }
 
 // dispatchStriped opens the striped legs for one incoming connection, sends the
@@ -850,6 +901,18 @@ func (s *WsMuxTransport) dispatchStriped(incomingConn LocalTCPConn) {
 
 	gid := atomic.AddUint32(&s.stripeGroupID, 1)
 	for i, stream := range legs {
+		if s.config.MuxVersion >= 2 {
+			if err := utils.SendFlowKind(stream, utils.FlowStriped); err != nil {
+				atomic.AddInt32(&s.stripedFlows, -1) // release before requeue
+				s.logger.Tracef("failed to send flow kind: %v", err)
+				for _, st := range legs {
+					st.Close()
+				}
+				incomingConn.timeCreated = time.Now().UnixMilli()
+				s.requeueOrDrop(incomingConn)
+				return
+			}
+		}
 		if err := utils.SendStripeHeader(stream, gid, uint8(i), uint8(len(legs)), uint8(s.config.StripeParity), incomingConn.remoteAddr); err != nil {
 			atomic.AddInt32(&s.stripedFlows, -1) // release before requeue
 			s.logger.Tracef("failed to send stripe header: %v", err)
@@ -948,105 +1011,6 @@ func (s *WsMuxTransport) requeueOrDrop(incomingConn LocalTCPConn) {
 	}
 }
 
-func (s *WsMuxTransport) handleSession(session *smux.Session) {
-	counter := make(chan struct{}, s.config.MuxCon)
-	defer session.Close() // runs after retireSession below has drained the session
-	defer close(counter)
-
-	// Retire this session before it gets old enough for the CDN's own max-age
-	// reset to land on it. The age is jittered because the initial pool is
-	// dialled all at once - on a fixed age every connection would rotate in the
-	// same second, which is both a reconnect storm and a nice periodic
-	// signature. A nil channel (rotation disabled) blocks forever in the select.
-	var rotate <-chan time.Time
-	if s.config.MaxConnAge > 0 {
-		rotateTimer := time.NewTimer(utils.JitterDuration(s.config.MaxConnAge))
-		defer rotateTimer.Stop()
-		rotate = rotateTimer.C
-	}
-	// replaced closes once a replacement pool connection has actually been
-	// admitted. Nil until rotation starts, so the select ignores it.
-	var replaced chan struct{}
-
-	for {
-		// +1 for mux connection counter
-		counter <- struct{}{}
-
-		select {
-		case <-s.ctx.Done():
-			return
-
-		case <-rotate:
-			<-counter // hand back the slot reserved above; no connection used it
-			rotate = nil
-
-			// Make before break: order the replacement, but keep serving on this
-			// connection until it is actually up. That is the point of waiting -
-			// if the client cannot dial (edge IP blackholed, CDN refusing the
-			// upgrade) an aging connection still carries traffic until the CDN
-			// resets it, while a closed one carries nothing.
-			replaced = make(chan struct{})
-			go func(ch chan struct{}) {
-				if s.awaitReplacement(session) {
-					close(ch)
-				}
-			}(replaced)
-			continue
-
-		case <-replaced:
-			<-counter // hand back the slot reserved above; no connection used it
-			atomic.AddInt32(&s.sessionCounter, -1)
-			s.retireSession(session)
-			return
-
-		case incomingConn := <-s.localChannel:
-			if time.Now().UnixMilli()-incomingConn.timeCreated > 3000 { // 3000ms
-				s.logger.Debugf("timeouted local connection: %d ms", time.Now().UnixMilli()-incomingConn.timeCreated)
-				incomingConn.conn.Close()
-
-				// Decrement the counter
-				atomic.AddInt32(&s.streamCounter, -1)
-				<-counter
-				continue
-			}
-
-			stream, err := session.OpenStream()
-			if err != nil {
-				s.handleSessionError(&incomingConn, err)
-				return
-			}
-
-			// Send the target port over the tunnel connection
-			if err := utils.SendBinaryString(stream, incomingConn.remoteAddr); err != nil {
-				s.logger.Tracef("failed to send address over stream: %v", err)
-				// Close the stream that never served traffic - leaving it open
-				// leaks the smux stream. Requeue non-blocking (a full
-				// localChannel would otherwise park this goroutine forever and
-				// permanently burn a MuxCon slot), dropping the conn if full.
-				stream.Close()
-				select {
-				case s.localChannel <- incomingConn:
-				default:
-					incomingConn.conn.Close()
-					atomic.AddInt32(&s.streamCounter, -1)
-				}
-				<-counter // release the mux slot reserved at the top of the loop
-				continue
-			}
-
-			// Handle data exchange between connections
-			go func() {
-				handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, incomingConn.conn, stream, s.logger, s.usageMonitor, incomingConn.conn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
-				atomic.AddInt32(&s.streamCounter, -1)
-				<-counter // read signal from the channel
-			}()
-		}
-	}
-}
-
-// rotateRetryInterval is how long rotation waits before re-checking for the
-// replacement connection it asked for. Deliberately unhurried: the connection
-// is only aging, and the client may be unable to dial at all for minutes.
 const rotateRetryInterval = 30 * time.Second
 
 // requestReplacement asks the client to bring up one more pool connection.
