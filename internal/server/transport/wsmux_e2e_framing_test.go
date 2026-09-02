@@ -10,8 +10,6 @@ import (
 )
 
 func TestWsMuxPlainFramingE2E(t *testing.T) {
-	// A simple test ensuring that the new framing works for plain flows.
-	// We'll set MuxVersion = 2 and ensure shouldStripe is false.
 	logger := logrus.New()
 	logger.SetLevel(logrus.FatalLevel)
 
@@ -29,6 +27,5 @@ func TestWsMuxPlainFramingE2E(t *testing.T) {
 		timeCreated: time.Now().UnixMilli(),
 	}
 
-	// Should not be striped initially
 	assert.False(t, server.shouldStripe(localConn))
 }

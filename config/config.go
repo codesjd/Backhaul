@@ -33,7 +33,6 @@ type ServerConfig struct {
 	StripeFactor         int           `toml:"mux_stripe"`
 	StripeParity         int           `toml:"mux_stripe_parity"` // Reed-Solomon parity legs added on top of mux_stripe (0 disables FEC); tolerates that many pool legs dying mid-flow without losing the flow. Only meaningful with mux_stripe > 1.
 	StripePorts          []string      `toml:"stripe_ports"`
-	PromoteBytes         uint64        `toml:"promote_bytes"`
 	Sniffer              bool          `toml:"sniffer"`
 	WebPort              int           `toml:"web_port"`
 	SnifferLog           string        `toml:"sniffer_log"`
@@ -77,7 +76,6 @@ type ClientConfig struct {
 	StripeFactor         int           `toml:"mux_stripe"`
 	StripeParity         int           `toml:"mux_stripe_parity"` // Reed-Solomon parity legs added on top of mux_stripe (0 disables FEC); tolerates that many pool legs dying mid-flow without losing the flow. Only meaningful with mux_stripe > 1.
 	StripePorts          []string      `toml:"stripe_ports"`
-	PromoteBytes         uint64        `toml:"promote_bytes"`
 	Sniffer              bool          `toml:"sniffer"`
 	WebPort              int           `toml:"web_port"`
 	SnifferLog           string        `toml:"sniffer_log"`

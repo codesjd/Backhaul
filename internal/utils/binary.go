@@ -260,60 +260,43 @@ func ReceiveBinaryByte(conn net.Conn) (byte, error) {
 	return messageBuf[0], nil
 }
 
+func SendFlowPlain(conn net.Conn, message string) error {
+	const headerSize = 1 + 2
+	buf := make([]byte, headerSize+len(message))
+	buf[0] = FlowPlain
+	binary.BigEndian.PutUint16(buf[1:3], uint16(len(message)))
+	copy(buf[3:], message)
+	if _, err := conn.Write(buf); err != nil {
+		return fmt.Errorf("failed to send FlowPlain: %w", err)
+	}
+	return nil
+}
+
+func SendFlowStriped(conn net.Conn, groupID uint32, index, total, parity uint8, remoteAddr string) error {
+	const headerSize = 1 + 4 + 1 + 1 + 1 + 2
+	buf := make([]byte, headerSize+len(remoteAddr))
+	buf[0] = FlowStriped
+	binary.BigEndian.PutUint32(buf[1:5], groupID)
+	buf[5] = index
+	buf[6] = total
+	buf[7] = parity
+	binary.BigEndian.PutUint16(buf[8:10], uint16(len(remoteAddr)))
+	copy(buf[10:], remoteAddr)
+	if _, err := conn.Write(buf); err != nil {
+		return fmt.Errorf("failed to send FlowStriped: %w", err)
+	}
+	return nil
+}
+
 const (
 	FlowPlain   byte = 0x00
 	FlowStriped byte = 0x01
 )
 
-func SendFlowKind(conn net.Conn, kind byte) error {
-	buf := [1]byte{kind}
-	if _, err := conn.Write(buf[:]); err != nil {
-		return fmt.Errorf("failed to send flow kind: %w", err)
-	}
-	return nil
-}
-
 func ReadFlowKind(conn net.Conn) (byte, error) {
 	var buf [1]byte
 	if _, err := io.ReadFull(conn, buf[:]); err != nil {
-		return 0, fmt.Errorf("failed to read flow kind: %w", err)
+		return 0, err
 	}
 	return buf[0], nil
-}
-
-func SendBinaryStringWithPrefix(conn interface{}, prefix []byte, message string) error {
-	const headerSize = 2
-	buf := make([]byte, len(prefix)+headerSize+len(message))
-	copy(buf, prefix)
-	binary.BigEndian.PutUint16(buf[len(prefix):len(prefix)+headerSize], uint16(len(message)))
-	copy(buf[len(prefix)+headerSize:], message)
-
-	switch c := conn.(type) {
-	case net.Conn:
-		if _, err := c.Write(buf); err != nil {
-			return fmt.Errorf("failed to send message: %w", err)
-		}
-	default:
-		return fmt.Errorf("unsupported connection type: %T", conn)
-	}
-	return nil
-}
-
-func SendStripeHeaderWithPrefix(conn net.Conn, prefix []byte, groupID uint32, index, total, parity uint8, remoteAddr string) error {
-	const headerSize = 4 + 1 + 1 + 1 + 2
-	buf := make([]byte, len(prefix)+headerSize+len(remoteAddr))
-	copy(buf, prefix)
-
-	offset := len(prefix)
-	binary.BigEndian.PutUint32(buf[offset:offset+4], groupID)
-	buf[offset+4] = index
-	buf[offset+5] = total
-	buf[offset+6] = parity
-	binary.BigEndian.PutUint16(buf[offset+7:offset+9], uint16(len(remoteAddr)))
-	copy(buf[offset+9:], remoteAddr)
-
-	if _, err := conn.Write(buf); err != nil {
-		return fmt.Errorf("failed to send stripe header: %w", err)
-	}
-	return nil
 }

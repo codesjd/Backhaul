@@ -538,7 +538,16 @@ func (c *WsMuxTransport) handleSession(tunnelConn *network.WebSocketConn) {
 					stream.Close()
 					continue
 				}
-				if kind == utils.FlowStriped {
+				if kind == utils.FlowPlain {
+					remoteAddr, err := utils.ReceiveBinaryString(stream)
+					if err != nil {
+						c.logger.Errorf("unable to read flow plain header: %v", err)
+						stream.Close()
+						continue
+					}
+					go c.localDialer(stream, remoteAddr)
+					continue
+				} else if kind == utils.FlowStriped {
 					go c.handleStripedStream(stream)
 					continue
 				}
