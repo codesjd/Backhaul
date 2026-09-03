@@ -33,6 +33,7 @@ type ServerConfig struct {
 	StripeFactor         int           `toml:"mux_stripe"`
 	StripeParity         int           `toml:"mux_stripe_parity"` // Reed-Solomon parity legs added on top of mux_stripe (0 disables FEC); tolerates that many pool legs dying mid-flow without losing the flow. Only meaningful with mux_stripe > 1.
 	StripePorts          []string      `toml:"stripe_ports"`
+	PromoteBytes         uint64        `toml:"promote_bytes"` // wsmux/wssmux: once a single plain flow has moved this many bytes, migrate it in-flight onto a striped group (mid-stream promotion). Requires mux_version = 2 on both ends. 0 (default) disables promotion. Helps a single long-running bulk flow; leave 0 for many-connection proxy workloads.
 	Sniffer              bool          `toml:"sniffer"`
 	WebPort              int           `toml:"web_port"`
 	SnifferLog           string        `toml:"sniffer_log"`
