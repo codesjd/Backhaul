@@ -535,9 +535,41 @@ func (c *WsMuxTransport) handleSession(tunnelConn *network.WebSocketConn) {
 				return
 			}
 
-			if c.config.StripeFactor > 1 {
-				go c.handleStripedStream(stream)
-				continue
+			if c.config.MuxVersion >= 2 {
+				kind, err := utils.ReadFlowKind(stream)
+				if err != nil {
+					c.logger.Errorf("unable to read flow kind from stream connection %s: %v", tunnelConn.RemoteAddr().String(), err)
+					stream.Close()
+					continue
+				}
+				if kind == utils.FlowPlain {
+					flowID, remoteAddr, err := utils.ReceiveFlowPlain(stream)
+					if err != nil {
+						c.logger.Errorf("unable to read plain flow header: %v", err)
+						stream.Close()
+						continue
+					}
+					// A non-zero flowID marks the flow as promotable: run it
+					// through the promotable pump so a later FlowPromote can
+					// migrate it mid-stream. flowID 0 is a plain flow.
+					if flowID != 0 {
+						go c.localDialerPlain(stream, flowID, remoteAddr)
+					} else {
+						go c.localDialer(stream, remoteAddr)
+					}
+					continue
+				} else if kind == utils.FlowStriped {
+					go c.handleStripedStream(stream)
+					continue
+				} else if kind == utils.FlowPromote {
+					go c.handlePromoteStream(stream)
+					continue
+				}
+			} else {
+				if c.config.StripeFactor > 1 {
+					go c.handleStripedStream(stream)
+					continue
+				}
 			}
 
 			remoteAddr, err := utils.ReceiveBinaryString(stream)

@@ -46,6 +46,7 @@ type WsMuxTransport struct {
 	// connection died at the same moment".
 	admittedSessions int32
 	stripedFlows     int32 // in-flight striped flows, bounded by the pool's stream budget
+	plainFlows       int32
 
 	// sessions is a live registry of pool sessions, used only when
 	// StripeFactor > 1 so the striped dispatcher can pick several sessions
@@ -93,6 +94,7 @@ type WsMuxConfig struct {
 	MuxKeepaliveDisabled bool
 	StripeFactor         int
 	StripeParity         int
+	StripePorts          []string
 	Fallback             string        // decoy backend for non-tunnel requests (host:port), optional
 	TLSEngine            string        // "go" (default) or "openssl" for wssmux TLS termination
 	MaxConnAge           time.Duration // retire pool connections at this age (0 = never); see retireSession
@@ -453,9 +455,7 @@ func (s *WsMuxTransport) tunnelListener() {
 					go s.handleLoop()
 				}
 
-				if s.config.StripeFactor > 1 {
-					go s.stripedDispatchLoop()
-				}
+				go s.dispatchLoop()
 
 				s.controlMu.Lock()
 				s.config.TunnelStatus = fmt.Sprintf("Connected (%s)", s.config.Mode)
@@ -713,20 +713,15 @@ func (s *WsMuxTransport) handleLoop() {
 			atomic.AddInt32(&s.sessionCounter, 1)
 			atomic.AddInt32(&s.admittedSessions, 1)
 
-			if s.config.StripeFactor > 1 {
-				s.registerSession(session)
-				go func(sess *smux.Session) {
-					<-sess.CloseChan()
-					s.unregisterSession(sess)
-					atomic.AddInt32(&s.sessionCounter, -1)
-				}(session)
-				if s.config.MaxConnAge > 0 {
-					go s.rotateStripedSession(session)
-				}
-				continue
+			s.registerSession(session)
+			go func(sess *smux.Session) {
+				<-sess.CloseChan()
+				s.unregisterSession(sess)
+				atomic.AddInt32(&s.sessionCounter, -1)
+			}(session)
+			if s.config.MaxConnAge > 0 {
+				go s.rotateStripedSession(session)
 			}
-
-			go s.handleSession(session)
 		}
 	}
 }
@@ -786,22 +781,124 @@ func (s *WsMuxTransport) openStripedLegs(n int) ([]*smux.Stream, error) {
 // StripeFactor > 1: for each incoming local connection it grabs one stream
 // from several distinct pool sessions instead of one stream from one
 // session, so the flow isn't pinned to a single underlying TCP connection.
-func (s *WsMuxTransport) stripedDispatchLoop() {
+func (s *WsMuxTransport) dispatchLoop() {
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
-
 		case incomingConn := <-s.localChannel:
-			// Set up each flow in its own goroutine. Opening the legs and writing
-			// the per-leg stripe headers can block on smux flow control when the
-			// pool is busy carrying bulk data; doing it inline would serialize
-			// every new flow's startup behind that one blocking write (the
-			// non-striped path avoids this by dispatching per session). Handing
-			// off keeps a slow setup from inflating the time-to-first-byte of
-			// every other pending connection.
-			go s.dispatchStriped(incomingConn)
+			if s.shouldStripe(incomingConn) {
+				go s.dispatchStriped(incomingConn)
+			} else {
+				go s.dispatchPlain(incomingConn)
+			}
 		}
+	}
+}
+
+func (s *WsMuxTransport) shouldStripe(incomingConn LocalTCPConn) bool {
+	if len(s.config.StripePorts) > 0 {
+		remotePort := ""
+		if _, port, err := net.SplitHostPort(incomingConn.remoteAddr); err == nil {
+			remotePort = port
+		} else {
+			remotePort = incomingConn.remoteAddr
+		}
+		for _, p := range s.config.StripePorts {
+			if p == remotePort {
+				return true
+			}
+		}
+		return false
+	}
+	return s.config.StripeFactor > 1
+}
+
+func (s *WsMuxTransport) acquirePlainSlot() bool {
+	for {
+		active := atomic.LoadInt32(&s.plainFlows)
+		budget := atomic.LoadInt32(&s.sessionCounter) * int32(s.config.MuxCon)
+		if budget < 1 {
+			budget = 1 // always admit at least one flow while the pool warms up
+		}
+		if (active + 1) <= budget {
+			if atomic.CompareAndSwapInt32(&s.plainFlows, active, active+1) {
+				return true
+			}
+			continue // lost the CAS race, re-read and retry
+		}
+		// Budget full: ask for a replacement session so the budget grows.
+		select {
+		case s.reqNewConnChan <- struct{}{}:
+		default:
+		}
+		select {
+		case <-s.ctx.Done():
+			return false
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func (s *WsMuxTransport) dispatchPlain(incomingConn LocalTCPConn) {
+	if time.Now().UnixMilli()-incomingConn.timeCreated > 3000 { // 3000ms
+		s.logger.Debugf("timeouted local connection: %d ms", time.Now().UnixMilli()-incomingConn.timeCreated)
+		incomingConn.conn.Close()
+		atomic.AddInt32(&s.streamCounter, -1)
+		return
+	}
+
+	if !s.acquirePlainSlot() {
+		incomingConn.conn.Close()
+		atomic.AddInt32(&s.streamCounter, -1)
+		return
+	}
+
+	legs, err := s.openStripedLegs(1)
+	if err != nil {
+		atomic.AddInt32(&s.plainFlows, -1)
+		s.logger.Tracef("plain dispatch: %v, retrying shortly", err)
+		time.Sleep(100 * time.Millisecond)
+		incomingConn.timeCreated = time.Now().UnixMilli()
+		s.requeueOrDrop(incomingConn)
+		return
+	}
+
+	stream := legs[0]
+
+	var flowID uint64
+	promotable := s.config.MuxVersion >= 2 && s.config.PromoteBytes > 0
+
+	if s.config.MuxVersion >= 2 {
+		// A non-zero flowID signals the client this flow is promotable and must
+		// be run through the promotable pump; flowID 0 means a plain flow.
+		if promotable {
+			flowID = uint64(time.Now().UnixNano())
+		}
+		if err := utils.SendFlowPlain(stream, flowID, incomingConn.remoteAddr); err != nil {
+			atomic.AddInt32(&s.plainFlows, -1)
+			stream.Close()
+			s.requeueOrDrop(incomingConn)
+			return
+		}
+	} else {
+		if err := utils.SendBinaryString(stream, incomingConn.remoteAddr); err != nil {
+			atomic.AddInt32(&s.plainFlows, -1)
+			stream.Close()
+			s.requeueOrDrop(incomingConn)
+			return
+		}
+	}
+
+	defer atomic.AddInt32(&s.plainFlows, -1)
+	defer atomic.AddInt32(&s.streamCounter, -1)
+	if promotable {
+		// dispatchPromotable blocks until the flow (and any mid-stream
+		// promotion) completes, so the counters above are released only when
+		// the flow is truly done.
+		s.dispatchPromotable(incomingConn.conn, stream, flowID, incomingConn.remoteAddr)
+	} else {
+		handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, incomingConn.conn, stream, s.logger, s.usageMonitor, incomingConn.conn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
 	}
 }
 
@@ -855,7 +952,13 @@ func (s *WsMuxTransport) dispatchStriped(incomingConn LocalTCPConn) {
 
 	gid := atomic.AddUint32(&s.stripeGroupID, 1)
 	for i, stream := range legs {
-		if err := utils.SendStripeHeader(stream, gid, uint8(i), uint8(len(legs)), uint8(s.config.StripeParity), incomingConn.remoteAddr); err != nil {
+		var err error
+		if s.config.MuxVersion >= 2 {
+			err = utils.SendFlowStriped(stream, gid, uint8(i), uint8(len(legs)), uint8(s.config.StripeParity), incomingConn.remoteAddr)
+		} else {
+			err = utils.SendStripeHeader(stream, gid, uint8(i), uint8(len(legs)), uint8(s.config.StripeParity), incomingConn.remoteAddr)
+		}
+		if err != nil {
 			atomic.AddInt32(&s.stripedFlows, -1) // release before requeue
 			s.logger.Tracef("failed to send stripe header: %v", err)
 			for _, st := range legs {
@@ -1233,6 +1336,10 @@ func (s *WsMuxTransport) dispatchPromotable(appConn net.Conn, plainStream net.Co
 			}
 		}
 	}()
+
+	// Block until the flow (and any promotion) is fully done, so the caller's
+	// pool-slot accounting is released only when the flow actually finishes.
+	<-swapper.DoneWait()
 }
 
 func (s *WsMuxTransport) promoteFlow(flowID uint64, remoteAddr string, swapper *handlers.PumpSwapper, plainStream net.Conn) {

@@ -133,6 +133,7 @@ func (s *Server) Start() {
 			MuxKeepaliveDisabled: s.config.MuxKeepaliveDisabled,
 			StripeFactor:         s.config.StripeFactor,
 			StripeParity:         s.config.StripeParity,
+			StripePorts:          s.config.StripePorts,
 			Sniffer:              s.config.Sniffer,
 			WebPort:              s.config.WebPort,
 			SnifferLog:           s.config.SnifferLog,

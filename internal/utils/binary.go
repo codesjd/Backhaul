@@ -296,6 +296,22 @@ func ReceiveFlowPlain(conn net.Conn) (flowID uint64, remoteAddr string, err erro
 	return flowID, string(addrBuf), nil
 }
 
+func SendFlowStriped(conn net.Conn, groupID uint32, index, total, parity uint8, remoteAddr string) error {
+	const headerSize = 1 + 4 + 1 + 1 + 1 + 2
+	buf := make([]byte, headerSize+len(remoteAddr))
+	buf[0] = FlowStriped
+	binary.BigEndian.PutUint32(buf[1:5], groupID)
+	buf[5] = index
+	buf[6] = total
+	buf[7] = parity
+	binary.BigEndian.PutUint16(buf[8:10], uint16(len(remoteAddr)))
+	copy(buf[10:], remoteAddr)
+	if _, err := conn.Write(buf); err != nil {
+		return fmt.Errorf("failed to send FlowStriped: %w", err)
+	}
+	return nil
+}
+
 func SendFlowPromote(conn net.Conn, flowID uint64, groupID uint32, index, total, parity uint8) error {
 	const headerSize = 1 + 8 + 4 + 1 + 1 + 1
 	buf := make([]byte, headerSize)
@@ -340,4 +356,12 @@ func ReadCount(conn net.Conn) (uint64, error) {
 		return 0, fmt.Errorf("failed to read count: %w", err)
 	}
 	return binary.BigEndian.Uint64(buf[:]), nil
+}
+
+func ReadFlowKind(conn net.Conn) (byte, error) {
+	var buf [1]byte
+	if _, err := io.ReadFull(conn, buf[:]); err != nil {
+		return 0, err
+	}
+	return buf[0], nil
 }
