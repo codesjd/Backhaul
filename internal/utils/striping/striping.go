@@ -552,10 +552,8 @@ func (c *Conn) AbortWrite() {
 	atomic.StoreInt32(&c.writeBroken, 1)
 }
 
-// Close flushes queued writes to the legs before tearing them down, so the
-// tail of the stream isn't dropped when Close follows the last Write. A
-// broken leg takes the abrupt path via fail instead.
-func (c *Conn) Close() error {
+// CloseWrite flushes queued writes to the legs before sending EOF.
+func (c *Conn) CloseWrite() error {
 	c.flushOnce.Do(func() {
 		close(c.flush)
 		done := make(chan struct{})
@@ -579,6 +577,14 @@ func (c *Conn) Close() error {
 			c.sendEndMarkers()
 		}
 	})
+	return nil
+}
+
+// Close flushes queued writes to the legs before tearing them down, so the
+// tail of the stream isn't dropped when Close follows the last Write. A
+// broken leg takes the abrupt path via fail instead.
+func (c *Conn) Close() error {
+	_ = c.CloseWrite()
 	return c.teardown()
 }
 

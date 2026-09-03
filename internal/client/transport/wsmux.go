@@ -54,6 +54,9 @@ type WsMuxTransport struct {
 	// dialSeq so traffic spreads over every CDN at once instead of one.
 	endpoints []wsEndpoint
 	dialSeq   int32
+
+	promotableFlowsMu sync.Mutex
+	promotableFlows   map[uint64]*handlers.PumpSwapper
 }
 
 // wsEndpoint is a single tunnel entry point: the domain dialed (which also
@@ -160,6 +163,7 @@ func NewWSMuxClient(parentCtx context.Context, config *WsMuxConfig, logger *logr
 		controlFlow:     make(chan struct{}, 100),
 		userAgent:       network.RandomUserAgent(),
 		stripeGroups:    make(map[uint32]*stripeGroup),
+		promotableFlows: make(map[uint64]*handlers.PumpSwapper),
 	}
 
 	client.endpoints = buildEndpoints(config.RemoteAddrs, config.EdgeIPs, config.RemoteAddr, config.EdgeIP)
@@ -539,16 +543,26 @@ func (c *WsMuxTransport) handleSession(tunnelConn *network.WebSocketConn) {
 					continue
 				}
 				if kind == utils.FlowPlain {
-					remoteAddr, err := utils.ReceiveBinaryString(stream)
+					flowID, remoteAddr, err := utils.ReceiveFlowPlain(stream)
 					if err != nil {
-						c.logger.Errorf("unable to read flow plain header: %v", err)
+						c.logger.Errorf("unable to read plain flow header: %v", err)
 						stream.Close()
 						continue
 					}
-					go c.localDialer(stream, remoteAddr)
+					// A non-zero flowID marks the flow as promotable: run it
+					// through the promotable pump so a later FlowPromote can
+					// migrate it mid-stream. flowID 0 is a plain flow.
+					if flowID != 0 {
+						go c.localDialerPlain(stream, flowID, remoteAddr)
+					} else {
+						go c.localDialer(stream, remoteAddr)
+					}
 					continue
 				} else if kind == utils.FlowStriped {
 					go c.handleStripedStream(stream)
+					continue
+				} else if kind == utils.FlowPromote {
+					go c.handlePromoteStream(stream)
 					continue
 				}
 			} else {
@@ -695,4 +709,133 @@ func (c *WsMuxTransport) localDialer(stream net.Conn, remoteAddr string) {
 	c.logger.Debugf("connected to local address %s successfully", remoteAddr)
 
 	handlers.TCPConnectionHandler(c.ctx, false, stream, localConnection, c.logger, c.usageMonitor, int(port), c.config.Sniffer)
+}
+
+func (c *WsMuxTransport) localDialerPlain(stream *smux.Stream, flowID uint64, remoteAddr string) {
+	port, resolvedAddr, err := network.ResolveRemoteAddr(remoteAddr)
+	if err != nil {
+		c.logger.Infof("failed to resolve remote port: %v", err)
+		stream.Close()
+		return
+	}
+
+	var sendBuf, recvBuf int
+	if strings.Contains(resolvedAddr, "127.0.0.1") {
+		sendBuf, recvBuf = 32*1024, 32*1024 // localhost
+	} else if c.config.AggressivePool {
+		sendBuf = 32 * 1024
+		recvBuf = 32 * 1024
+	}
+
+	localConnection, err := network.TcpDialer(c.ctx, resolvedAddr, "", c.config.DialTimeOut, c.config.KeepAlive, true, 1, recvBuf, sendBuf, 0)
+	if err != nil {
+		c.logger.Errorf("local dialer: %v", err)
+		stream.Close()
+		return
+	}
+
+	swapper := handlers.PromotablePump(c.ctx, false, localConnection, stream, c.logger, c.usageMonitor, port, c.config.Sniffer)
+	if swapper == nil {
+		return
+	}
+
+	c.promotableFlowsMu.Lock()
+	c.promotableFlows[flowID] = swapper
+	c.promotableFlowsMu.Unlock()
+
+	<-swapper.DoneWait()
+
+	c.promotableFlowsMu.Lock()
+	delete(c.promotableFlows, flowID)
+	c.promotableFlowsMu.Unlock()
+}
+
+func (c *WsMuxTransport) handlePromoteStream(stream *smux.Stream) {
+	flowID, groupID, index, total, parity, err := utils.ReceiveFlowPromote(stream)
+	if err != nil {
+		c.logger.Errorf("failed to read promote header: %v", err)
+		stream.Close()
+		return
+	}
+
+	c.promotableFlowsMu.Lock()
+	swapper, ok := c.promotableFlows[flowID]
+	c.promotableFlowsMu.Unlock()
+
+	if !ok {
+		c.logger.Errorf("promotion leg for unknown flow %d", flowID)
+		stream.Close()
+		return
+	}
+
+	c.stripeGroupsMu.Lock()
+	g, ok := c.stripeGroups[groupID]
+	if !ok {
+		g = &stripeGroup{
+			streams:    make([]*smux.Stream, total),
+			remaining:  int(total),
+			remoteAddr: "", // not needed for promotion
+			parity:     parity,
+		}
+		g.timer = time.AfterFunc(10*time.Second, func() {
+			c.abortStripeGroup(groupID)
+		})
+		c.stripeGroups[groupID] = g
+	}
+
+	var complete bool
+	if g.streams[index] != nil {
+		c.stripeGroupsMu.Unlock()
+		stream.Close()
+		return
+	}
+	g.streams[index] = stream
+	g.remaining--
+	complete = g.remaining == 0
+	if complete {
+		delete(c.stripeGroups, groupID)
+	}
+	c.stripeGroupsMu.Unlock()
+
+	if !complete {
+		return
+	}
+
+	g.timer.Stop()
+	conns := make([]net.Conn, len(g.streams))
+	for i, st := range g.streams {
+		conns[i] = st
+	}
+
+	var clientStriped net.Conn
+	if g.parity > 0 {
+		dataShards := len(conns) - int(g.parity)
+		fecConn, err := striping.NewFEC(conns, striping.DefaultChunkSize, dataShards, int(g.parity))
+		if err != nil {
+			c.logger.Errorf("failed to build FEC striped conn: %v", err)
+			for _, cn := range conns {
+				cn.Close()
+			}
+			return
+		}
+		clientStriped = fecConn
+	} else {
+		clientStriped = striping.New(conns, striping.DefaultChunkSize)
+	}
+
+	// Server promised D, read from leg 0
+	peer, err := utils.ReadCount(g.streams[0])
+	if err != nil {
+		clientStriped.Close()
+		return
+	}
+
+	own := swapper.FreezeUp()
+
+	if err := utils.WriteCount(g.streams[0], own); err != nil {
+		clientStriped.Close()
+		return
+	}
+
+	swapper.Install(clientStriped, peer)
 }

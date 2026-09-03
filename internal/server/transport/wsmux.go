@@ -98,6 +98,7 @@ type WsMuxConfig struct {
 	Fallback             string        // decoy backend for non-tunnel requests (host:port), optional
 	TLSEngine            string        // "go" (default) or "openssl" for wssmux TLS termination
 	MaxConnAge           time.Duration // retire pool connections at this age (0 = never); see retireSession
+	PromoteBytes         uint64        // bytes transferred before upgrading to a striped connection
 }
 
 func NewWSMuxServer(parentCtx context.Context, config *WsMuxConfig, logger *logrus.Logger) *WsMuxTransport {
@@ -347,7 +348,9 @@ func (s *WsMuxTransport) onControlLost(conn *network.WebSocketConn) {
 	s.controlMu.Unlock()
 
 	conn.Close()
+	s.controlMu.Lock()
 	s.config.TunnelStatus = fmt.Sprintf("Reconnecting (%s)", s.config.Mode)
+	s.controlMu.Unlock()
 	s.logger.Warnf("control channel lost, holding the pool for up to %s for the client to reattach", controlGraceWindow)
 }
 
@@ -454,7 +457,9 @@ func (s *WsMuxTransport) tunnelListener() {
 
 				go s.dispatchLoop()
 
+				s.controlMu.Lock()
 				s.config.TunnelStatus = fmt.Sprintf("Connected (%s)", s.config.Mode)
+				s.controlMu.Unlock()
 
 			} else if strings.HasPrefix(r.URL.Path, tunnelPathPrefix) {
 				session, err := smux.Client(netConn, s.smuxConfig)
@@ -861,8 +866,16 @@ func (s *WsMuxTransport) dispatchPlain(incomingConn LocalTCPConn) {
 
 	stream := legs[0]
 
+	var flowID uint64
+	promotable := s.config.MuxVersion >= 2 && s.config.PromoteBytes > 0
+
 	if s.config.MuxVersion >= 2 {
-		if err := utils.SendFlowPlain(stream, incomingConn.remoteAddr); err != nil {
+		// A non-zero flowID signals the client this flow is promotable and must
+		// be run through the promotable pump; flowID 0 means a plain flow.
+		if promotable {
+			flowID = uint64(time.Now().UnixNano())
+		}
+		if err := utils.SendFlowPlain(stream, flowID, incomingConn.remoteAddr); err != nil {
 			atomic.AddInt32(&s.plainFlows, -1)
 			stream.Close()
 			s.requeueOrDrop(incomingConn)
@@ -879,7 +892,14 @@ func (s *WsMuxTransport) dispatchPlain(incomingConn LocalTCPConn) {
 
 	defer atomic.AddInt32(&s.plainFlows, -1)
 	defer atomic.AddInt32(&s.streamCounter, -1)
-	handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, incomingConn.conn, stream, s.logger, s.usageMonitor, incomingConn.conn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
+	if promotable {
+		// dispatchPromotable blocks until the flow (and any mid-stream
+		// promotion) completes, so the counters above are released only when
+		// the flow is truly done.
+		s.dispatchPromotable(incomingConn.conn, stream, flowID, incomingConn.remoteAddr)
+	} else {
+		handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, incomingConn.conn, stream, s.logger, s.usageMonitor, incomingConn.conn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
+	}
 }
 
 // dispatchStriped opens the striped legs for one incoming connection, sends the
@@ -1104,27 +1124,51 @@ func (s *WsMuxTransport) handleSession(session *smux.Session) {
 				return
 			}
 
-			// Send the target port over the tunnel connection
-			if err := utils.SendBinaryString(stream, incomingConn.remoteAddr); err != nil {
-				s.logger.Tracef("failed to send address over stream: %v", err)
-				// Close the stream that never served traffic - leaving it open
-				// leaks the smux stream. Requeue non-blocking (a full
-				// localChannel would otherwise park this goroutine forever and
-				// permanently burn a MuxCon slot), dropping the conn if full.
-				stream.Close()
-				select {
-				case s.localChannel <- incomingConn:
-				default:
-					incomingConn.conn.Close()
-					atomic.AddInt32(&s.streamCounter, -1)
+			var flowID uint64
+			var promotable bool
+
+			if s.config.MuxVersion >= 2 && s.config.PromoteBytes > 0 {
+				promotable = true
+				flowID = uint64(time.Now().UnixNano())
+				if err := utils.SendFlowPlain(stream, flowID, incomingConn.remoteAddr); err != nil {
+					s.logger.Tracef("failed to send plain flow header: %v", err)
+					stream.Close()
+					select {
+					case s.localChannel <- incomingConn:
+					default:
+						incomingConn.conn.Close()
+						atomic.AddInt32(&s.streamCounter, -1)
+					}
+					<-counter
+					continue
 				}
-				<-counter // release the mux slot reserved at the top of the loop
-				continue
+			} else {
+				// Send the target port over the tunnel connection (legacy mode)
+				if err := utils.SendBinaryString(stream, incomingConn.remoteAddr); err != nil {
+					s.logger.Tracef("failed to send address over stream: %v", err)
+					// Close the stream that never served traffic - leaving it open
+					// leaks the smux stream. Requeue non-blocking (a full
+					// localChannel would otherwise park this goroutine forever and
+					// permanently burn a MuxCon slot), dropping the conn if full.
+					stream.Close()
+					select {
+					case s.localChannel <- incomingConn:
+					default:
+						incomingConn.conn.Close()
+						atomic.AddInt32(&s.streamCounter, -1)
+					}
+					<-counter // release the mux slot reserved at the top of the loop
+					continue
+				}
 			}
 
 			// Handle data exchange between connections
 			go func() {
-				handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, incomingConn.conn, stream, s.logger, s.usageMonitor, incomingConn.conn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
+				if promotable {
+					s.dispatchPromotable(incomingConn.conn, stream, flowID, incomingConn.remoteAddr)
+				} else {
+					handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, incomingConn.conn, stream, s.logger, s.usageMonitor, incomingConn.conn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
+				}
 				atomic.AddInt32(&s.streamCounter, -1)
 				<-counter // read signal from the channel
 			}()
@@ -1268,4 +1312,90 @@ func (s *WsMuxTransport) handleSessionError(incomingConn *LocalTCPConn, err erro
 	default:
 		s.logger.Warn("request new connection channel is full")
 	}
+}
+
+func (s *WsMuxTransport) dispatchPromotable(appConn net.Conn, plainStream net.Conn, flowID uint64, remoteAddr string) {
+	swapper := handlers.PromotablePump(s.ctx, s.config.ProxyProtocol, appConn, plainStream, s.logger, s.usageMonitor, appConn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
+
+	if swapper == nil {
+		return // failed proxy protocol
+	}
+
+	go func() {
+		for {
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-swapper.DoneWait(): // Need a wait channel
+				return
+			case <-time.After(100 * time.Millisecond):
+				if swapper.UpBytes() >= s.config.PromoteBytes {
+					s.promoteFlow(flowID, remoteAddr, swapper, plainStream)
+					return
+				}
+			}
+		}
+	}()
+
+	// Block until the flow (and any promotion) is fully done, so the caller's
+	// pool-slot accounting is released only when the flow actually finishes.
+	<-swapper.DoneWait()
+}
+
+func (s *WsMuxTransport) promoteFlow(flowID uint64, remoteAddr string, swapper *handlers.PumpSwapper, plainStream net.Conn) {
+	// 2. Open legs
+	legs, err := s.openStripedLegs(s.legsPerFlow())
+	if err != nil {
+		s.logger.Tracef("failed to open striped legs for promotion: %v", err)
+		return // abort, flow continues on plain
+	}
+
+	gid := atomic.AddUint32(&s.stripeGroupID, 1)
+	for i, stream := range legs {
+		if err := utils.SendFlowPromote(stream, flowID, gid, uint8(i), uint8(len(legs)), uint8(s.config.StripeParity)); err != nil {
+			s.logger.Tracef("failed to send promote header: %v", err)
+			for _, st := range legs {
+				st.Close()
+			}
+			return
+		}
+	}
+
+	conns := make([]net.Conn, len(legs))
+	for i, st := range legs {
+		conns[i] = st
+	}
+
+	var serverStriped net.Conn
+	if s.config.StripeParity > 0 {
+		fecConn, err := striping.NewFEC(conns, striping.DefaultChunkSize, s.config.StripeFactor, s.config.StripeParity)
+		if err != nil {
+			s.logger.Errorf("promotion striped dispatch: %v", err)
+			for _, st := range legs {
+				st.Close()
+			}
+			return
+		}
+		serverStriped = fecConn
+	} else {
+		serverStriped = striping.New(conns, striping.DefaultChunkSize)
+	}
+
+	own := swapper.FreezeUp() // server is sending to Client (download direction for user)
+
+	// Write own on leg 0 of the new stripe groups
+	if err := utils.WriteCount(legs[0], own); err != nil {
+		serverStriped.Close()
+		return
+	}
+
+	// 5. Server reads peer off leg 0
+	peer, err := utils.ReadCount(legs[0])
+	if err != nil {
+		serverStriped.Close()
+		return
+	}
+
+	// 7. Resume: switch swapper
+	swapper.Install(serverStriped, peer)
 }

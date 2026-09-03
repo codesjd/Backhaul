@@ -584,14 +584,10 @@ func (c *FECConn) AbortWrite() {
 	atomic.StoreInt32(&c.writeBroken, 1)
 }
 
-// Close flushes any partial trailing row, then the end-of-stream marker, to
-// every leg (best-effort, including already-dead ones) before tearing down.
-func (c *FECConn) Close() error {
+func (c *FECConn) CloseWrite() error {
 	c.flushOnce.Do(func() {
 		c.wmu.Lock()
 		if c.curRowLen > 0 {
-			// Zero-pad the tail before encoding; rowLen (already tracked as
-			// curRowLen) tells the peer how many of those bytes are real.
 			for i := c.curRowLen; i < c.rowFullSize; i++ {
 				c.curRow[i] = 0
 			}
@@ -615,6 +611,13 @@ func (c *FECConn) Close() error {
 			c.sendEndMarkers(total)
 		}
 	})
+	return nil
+}
+
+// Close flushes any partial trailing row, then the end-of-stream marker, to
+// every leg (best-effort, including already-dead ones) before tearing down.
+func (c *FECConn) Close() error {
+	_ = c.CloseWrite()
 	return c.teardown()
 }
 
